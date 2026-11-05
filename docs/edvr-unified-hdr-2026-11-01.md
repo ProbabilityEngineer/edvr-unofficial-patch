@@ -24,6 +24,27 @@ conversions in the device hook and a `near` macro collision in temporal tests).
 The implementation and flight notes below describe the original HDR work,
 not a validation receipt for this RC6 backport.
 
+### HDR investigation (`private/rc6-hdr-output-fix`)
+
+This branch starts at successful CI revision `28c50afb`, separately from
+`private/rc6-hdr-engine-hooks`. Keep the owner's display preset, game gamma,
+and vanilla DXMT unchanged; assume the HDR defect is in EDVR.
+
+Apple's [color-space guidance](https://developer.apple.com/documentation/metal/using-color-spaces-to-display-hdr-content)
+shows PQ BT.2020 content tagged `itur_2100_PQ` on an EDR-enabled Metal layer.
+The XDR preset's **SDR** gamma 2.2 is not the HDR transfer function; 1600 nits
+is a peak capability, not diffuse white.
+
+For context, DXMT `647b0020` scales linear HDR light by current / potential EDR
+headroom before re-encoding PQ. A local query returned 1.2 / 16 = 0.075,
+outside the reported flight. This does not establish flight attenuation or
+a DXMT defect, and is not authorization to compensate for it in EDVR.
+
+Audit EDVR's tone replacement, Elite gamma/exposure inputs, scene-copy
+261-to-500-nit unit conversion, and final output encoding. Verify both 1:1 and
+0.75-scale routing without assuming the same copy shader executes. No HDR
+pixel correction is implemented or validated by these notes.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.
