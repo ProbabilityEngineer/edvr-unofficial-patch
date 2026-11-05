@@ -3,13 +3,14 @@
 // THE HDR SHADERS, AS EDHDR PROVED THEM.
 //
 // fix.hdr runs the four shaders the separate EDHDR proxy ran, and this header
-// carries their HLSL verbatim -- byte for byte, not a paraphrase. Their
+// retains their HDR display transform. The tone entry now also supports the
+// captured no-bloom variant and corrects the exposure-bias subtraction. Their
 // constants were fitted against RenoDX's installed Elite preset as an oracle
 // (edelite-hdr/docs/FP16-INTERNAL-RESOURCE-SPEC.md) and the comment in the
 // tone shader says plainly not to retune them by eye. A rewrite here would
 // throw away the only validation they have, so when EDHDR's copy changes the
-// way to update this one is to copy the file again and re-record its hash
-// below.
+// way to update this one is to compare the changes while preserving EDVR's
+// verified variant/input and exposure corrections.
 //
 // Provenance, ~/GitHub/edelite-hdr/src, sha256 of each file as copied:
 //   tone_hdr_ps.hlsl   c807279f5abfaf8f4416ebd58fe9aba44383ae2de2679a073d38702a68b81056
@@ -18,16 +19,15 @@
 //   outdecode_vs.hlsl  5f32b67d8272764475eba0eefb8d03fc3696aebc87180e107a16b52d64f31ccc
 //
 // Entry point is "m" in all four, which is EDHDR's convention and not this
-// repository's "main": the text is unedited, so the compile calls in
+// repository's "main": the compile calls in
 // hdr_output.cpp name "m".
 //
 // These are compiled by d3dcompiler_47 when the device attaches, not built
 // into the DLL by tools/temporal_shader_build the way every other fixed
 // shader here is (shader_swap.h, "Fixed HLSL belongs in the build"). That is
 // a deliberate exception for the first cut of fix.hdr and it is written down
-// in docs/edvr-unified-hdr-2026-11-01.md: four shaders at device attach is
-// not the first-Present storm that rule was made for, and keeping the text
-// unedited is what makes the port checkable against EDHDR. Moving them into
+// in docs/edvr-unified-hdr-2026-11-01.md: the fixed variants at device attach
+// are not the first-Present storm that rule was made for. Moving them into
 // the build tool is one Variant entry each.
 
 namespace edvr {
@@ -139,9 +139,14 @@ inline constexpr char kHdrToneReplacementPs[] = R"HLSL(
 // which is not a valid coverage value, and downstream consumers discard on
 // alpha ~= 0. This pass has no HDR effect on alpha.
 SamplerState      s1 : register(s1);
+#ifndef HDR_TONE_NO_BLOOM
+#define HDR_TONE_NO_BLOOM 0
+#endif
+#if !HDR_TONE_NO_BLOOM
 SamplerState      s2 : register(s2);
-Texture2D<float4> t1 : register(t1);
 Texture2D<float4> t2 : register(t2);
+#endif
+Texture2D<float4> t1 : register(t1);
 cbuffer           cb2 : register(b2) { float4 cb2[16]; };
 
 // --- Working-oracle values from ED_RENO's installed ReShade preset ---
@@ -190,7 +195,9 @@ float autoExposure(float v0z) {
     float vz = clamp(v0z, 1e-4, 1e4);
     float r = (cb2[8].z != 0.0) ? 1.4 : 0.0;   // 116
     r += cb2[8].x;                             // 132
-    r += log2(vz * 8.0);                       // 140-152
+    // Both the captured 6BE69EF3 no-bloom DXBC and the D7E646E3
+    // transpilation subtract the bias from log2(8*vz), not add it.
+    r = log2(vz * 8.0) - r;                    // 140-152
     r -= 3.0;                                  // 160
     float g = cb2[7].w + cb2[7].w;             // 167
     r *= cb2[8].y;                             // 176
@@ -244,13 +251,16 @@ float4 m(float3 v0 : TEXCOORD1) : SV_Target {
     float E = cb2[2].x;                                  // engine exposure
 
     float3 s = t1.Sample(s1, v0.xy).rgb;                 // full-res scene
-    float3 b = t2.Sample(s2, v0.xy).rgb;                 // quarter-res bloom
-
     s = clamp(s * E, 0.0, FP16_HEADROOM * E);            // tokens 47-73
-    b = clamp(b * E, 0.0, FP16_HEADROOM * E);            // tokens 91-109
-
     float f = autoExposure(v0.z);                        // tokens 116-267
 
+#if HDR_TONE_NO_BLOOM
+    // CRC 6BE69EF3: t1/s1 and b2 only for the scene-referred chain.
+    // No bloom blend and no post-blend clamp before channel gain.
+    float3 sceneLin = f * s;
+#else
+    float3 b = t2.Sample(s2, v0.xy).rgb;
+    b = clamp(b * E, 0.0, FP16_HEADROOM * E);
     // Bloom / scene blend, tokens 414-446.
     float w  = cb2[1].w;
     float bw = (w >= 0.0) ? w        : 1.0;
@@ -258,6 +268,7 @@ float4 m(float3 v0 : TEXCOORD1) : SV_Target {
     float3 sceneLin = f * (bw * b + sw * s);
 
     sceneLin  = clamp(sceneLin, 0.0, FP16_HEADROOM * E); // tokens 456-466
+#endif
     sceneLin *= cb2[6].y;                                // token 473, channel gain
 
     // ---- RenoDX display transform, keeping its gamma encode ----

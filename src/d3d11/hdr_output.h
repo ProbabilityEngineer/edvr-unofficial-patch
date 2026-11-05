@@ -130,7 +130,7 @@ bool hdrOutputViewFormat(ID3D11Resource* resource, DXGI_FORMAT asked, DXGI_FORMA
 const void* hdrOutputViewDescFor(ID3D11Resource* resource, const void* desc, void* scratch,
                                  size_t descBytes);
 
-// Compile the four shaders and remember the device. Called once from the
+// Compile the HDR shaders (including both tone variants) and remember the device. Called once from the
 // device hook's attach, not from the first Present: the tone and copy
 // substitutions have to be ready before the game creates its pixel shaders
 // during loading.

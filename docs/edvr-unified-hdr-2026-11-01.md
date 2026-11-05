@@ -42,8 +42,8 @@ a DXMT defect, and is not authorization to compensate for it in EDVR.
 
 Audit EDVR's tone replacement, Elite gamma/exposure inputs, scene-copy
 261-to-500-nit unit conversion, and final output encoding. Verify both 1:1 and
-0.75-scale routing without assuming the same copy shader executes. No HDR
-pixel correction is implemented or validated by these notes.
+0.75-scale routing without assuming the same copy shader executes. These
+initial investigation notes preceded the local candidate described below.
 
 #### Confirmed matching defects in the reported flights
 
@@ -67,6 +67,29 @@ bloom and must be adapted to the actual variant's input contract.
 These establish incomplete EDVR HDR processing, not the numerical cause of
 the user's gamma compensation. No claim is made yet about corrected image
 brightness, and no live configuration or shader-capture file was modified.
+
+#### Local correction candidate
+
+HDR matching now uses standard FNV locally, leaving EDVR's global shader
+identities intact. The captured tone and copy blobs both select their intended
+replacement through the production matcher. The no-bloom tone variant is
+compiled separately: scene `t1/s1`, constants `b2`, input `TEXCOORD1`, no
+`t2/s2`, bloom blend, or post-blend clamp. Its display transform and luminance
+constants remain the imported HDR ones.
+
+Disassembly also exposed an exposure transcription error: the engine subtracts
+`cb2[8].x + (cb2[8].z != 0 ? 1.4 : 0)` from `log2(8*v0.z)`, whereas the
+imported helper added it. RenoDX's `tonemap_0xD7E646E3.ps_5_0.hlsl` confirms
+the same subtraction for bloom. The shared helper now follows that operation.
+
+Local checks: 54 portable rule/identity checks; 73 checks under CrossOver
+hardware, including compiling/reflecting both tone variants and GPU execution
+of the production exposure helper against the captured instruction arithmetic.
+x64 and ARM64EC HDR source/test syntax checks pass. `build.bat` runs the same
+Windows shader checks on WARP; full Windows CI has not run for this candidate.
+There is no gameplay validation yet: corrected brightness, scale-path routing,
+and the remaining imported display-transform assumptions are not established
+by these tests. No DXMT, display preset, game gamma, or live settings changed.
 
 ## Original status
 
