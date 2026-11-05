@@ -61,6 +61,23 @@ proof artifact, not a release asset. The branch push trigger works before this
 workflow reaches `main`. GitHub does not offer its manual **Run workflow**
 control for a new workflow until the workflow file is on the default branch.
 
+### Flat graphics-only test DLL (not validated)
+
+For an explicitly unvalidated flat test flight, `build.bat --wait-lock
+--compile-only --graphics-only` compiles the production `d3d11.dll` and stops
+before building other runtime DLLs, running the full test suite, or building
+the installer. The output is `build/compile-build/d3d11.dll`; the small PE
+export/import check still runs. Required code generation and pinned build
+dependencies are unchanged.
+
+The existing **Native Windows build** workflow accepts the manual boolean
+input `graphics_only=true` for this path, with a 20-minute Windows job limit.
+It uploads an `edvr-d3d11-compile-only-*` artifact and diagnostics, not validated
+build outputs or release packages. It does not produce a full-build receipt.
+The default workflow and receipt-guarded `--dll-only` promotion are unchanged.
+Use this only when testing changes confined to the graphics proxy; it is not
+a complete installation or Windows validation.
+
 ### Linux: compile-only builds under Wine
 
 For a test flight on a Steam Deck or another Linux machine that runs Elite

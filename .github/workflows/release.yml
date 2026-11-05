@@ -12,6 +12,11 @@ on:
       - 'v*'
   pull_request:
   workflow_dispatch:
+    inputs:
+      graphics_only:
+        description: 'Unvalidated d3d11.dll only: no full tests, installer or packages'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -95,10 +100,14 @@ jobs:
           python3 tools/check_agent_material.py
 
   build:
+    name: ${{ inputs.graphics_only && 'Graphics compile only (unvalidated)' || 'build' }}
     needs: changes
     if: needs.changes.outputs.build == 'true'
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: ${{ inputs.graphics_only && 20 || 180 }}
+    env:
+      EDVR_GRAPHICS_CI: ${{ inputs.graphics_only && '1' || '0' }}
+      EDVR_BUILD_DIR: ${{ inputs.graphics_only && 'build/compile-build' || 'build' }}
     defaults:
       run:
         shell: powershell
@@ -136,6 +145,7 @@ jobs:
           Write-Output "Runner image: $image"
 
       - name: Select package version
+        if: ${{ !inputs.graphics_only }}
         run: |
           $headCommit = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve checkout HEAD' }
@@ -238,7 +248,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/edvr-compile-store
-          key: edvr-cc-${{ steps.image.outputs.key }}-${{ github.ref_name }}-${{ github.sha }}
+          key: edvr-cc-${{ steps.image.outputs.key }}-${{ github.ref_name }}-${{ github.sha }}${{ inputs.graphics_only && '-graphics' || '' }}
           restore-keys: |
             edvr-cc-${{ steps.image.outputs.key }}-${{ github.ref_name }}-
             edvr-cc-${{ steps.image.outputs.key }}-
@@ -248,25 +258,31 @@ jobs:
         run: |
           # Verifies every restored output against the sha256 its manifest recorded, then
           # sets its time back; the shader headers and rig times verify themselves.
-          python tools\compile_cache.py --unpack "$env:RUNNER_TEMP\edvr-compile-store" --root build `
+          python tools\compile_cache.py --unpack "$env:RUNNER_TEMP\edvr-compile-store" --root "$env:EDVR_BUILD_DIR" `
             --extra gen\temporal_shader_bytecode.h --extra gen\openxr_stereo_shader_bytecode.h --extra rig_times.json
           if ($LASTEXITCODE -ne 0) { throw 'Compile cache unpack failed' }
 
-      - name: Run full Windows validation build
+      - name: Build requested target
         id: build
         run: |
           $batch = Join-Path $env:GITHUB_WORKSPACE 'build.bat'
           if (-not (Test-Path -LiteralPath $batch)) { throw "Missing $batch" }
           $stdout = Join-Path $env:RUNNER_TEMP 'edvr-build.stdout.log'
           $stderr = Join-Path $env:RUNNER_TEMP 'edvr-build.stderr.log'
-          $command = 'call "{0}" --wait-lock --jobs 4 > "{1}" 2> "{2}"' -f $batch, $stdout, $stderr
+          $flags = if ($env:EDVR_GRAPHICS_CI -eq '1') { '--compile-only --graphics-only' } else { '--jobs 4' }
+          $command = 'call "{0}" --wait-lock {1} > "{2}" 2> "{3}"' -f $batch, $flags, $stdout, $stderr
           & $env:ComSpec /d /s /c $command
           $code = $LASTEXITCODE
           if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Tail 150 }
           if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Tail 150 }
-          if ($code -ne 0) { throw "Full build failed with exit code $code" }
-          $receipt = Join-Path $env:GITHUB_WORKSPACE 'build\full_build_receipt.json'
-          if (-not (Test-Path -LiteralPath $receipt)) { throw 'Full build did not write its receipt' }
+          if ($code -ne 0) { throw "Build failed with exit code $code" }
+          if ($env:EDVR_GRAPHICS_CI -eq '1') {
+            if (-not (Test-Path -LiteralPath 'build\compile-build\d3d11.dll')) { throw 'Graphics compile did not produce d3d11.dll' }
+            'COMPILE-ONLY d3d11.dll: not Windows validated, no test rigs or installer.' >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            $receipt = Join-Path $env:GITHUB_WORKSPACE 'build\full_build_receipt.json'
+            if (-not (Test-Path -LiteralPath $receipt)) { throw 'Full build did not write its receipt' }
+          }
 
       - name: Read the compile cache's hits and misses
         if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
@@ -275,7 +291,7 @@ jobs:
           if (Test-Path -LiteralPath $log) {
             python tools\compile_cache.py --summary $log --markdown $env:GITHUB_STEP_SUMMARY
           }
-          $phases = 'build\phase_times.json'
+          $phases = Join-Path $env:EDVR_BUILD_DIR 'phase_times.json'
           if (Test-Path -LiteralPath $phases) { Get-Content -LiteralPath $phases }
 
       - name: Pack the compile cache
@@ -283,7 +299,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome != 'skipped' && github.ref_type != 'tag' && steps.compile_cache.outputs.cache-hit != 'true' }}
         run: |
           # Taken even when a rig failed: the outputs of a compile that succeeded are good.
-          python tools\compile_cache.py --pack "$env:RUNNER_TEMP\edvr-compile-store" --root build `
+          python tools\compile_cache.py --pack "$env:RUNNER_TEMP\edvr-compile-store" --root "$env:EDVR_BUILD_DIR" `
             --extra gen\temporal_shader_bytecode.h --extra gen\openxr_stereo_shader_bytecode.h --extra rig_times.json
           if ($LASTEXITCODE -ne 0) { throw 'Compile cache pack failed' }
 
@@ -295,6 +311,7 @@ jobs:
           key: ${{ steps.compile_cache.outputs.cache-primary-key }}
 
       - name: Package the validated build
+        if: ${{ !inputs.graphics_only }}
         run: |
           $batch = Join-Path $env:GITHUB_WORKSPACE 'package.bat'
           $stdout = Join-Path $env:RUNNER_TEMP 'edvr-package.stdout.log'
@@ -333,13 +350,14 @@ jobs:
             ${{ runner.temp }}/edvr-package.stdout.log
             ${{ runner.temp }}/edvr-package.stderr.log
             build/phase_times.json
+            build/compile-build/phase_times.json
             build/rig_times.json
             build/obj/**/*.log
             build/flat_mono_resolve_shard2_run/flat-pixel-fixture/**
             build/sharp_weapons_test_run/**
 
       - name: Upload validated build outputs
-        if: success()
+        if: ${{ success() && !inputs.graphics_only }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: edvr-build-${{ github.run_id }}-${{ github.run_attempt }}
@@ -354,7 +372,7 @@ jobs:
             build/edvr-installer.exe
 
       - name: Upload release packages
-        if: success()
+        if: ${{ success() && !inputs.graphics_only }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: edvr-packages-${{ github.run_id }}-${{ github.run_attempt }}
@@ -362,3 +380,13 @@ jobs:
           path: |
             dist/edvr-*.zip
             dist/SHA256SUMS
+
+      - name: Upload unvalidated graphics test DLL
+        if: ${{ success() && inputs.graphics_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: edvr-d3d11-compile-only-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            build/compile-build/d3d11.dll
+            build/compile-build/*LICENSE*

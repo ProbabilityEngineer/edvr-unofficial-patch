@@ -25,6 +25,8 @@ REM  --compile-only is the Linux test-flight path, run under Wine by
 REM  tools\linux_toolchain.py: the same production DLLs, into
 REM  build\compile-build, with no Python gates, no receipt check, no rigs and
 REM  no installer. It is never validation and never a release asset.
+REM  --compile-only --graphics-only stops after d3d11.dll for a flat test flight.
+REM  It does not build other runtime DLLs or write a validation receipt.
 REM
 REM  Only one top-level build runs at a time on this machine (tools\
 REM  build_lock.py): a second invocation is refused immediately with a
@@ -52,6 +54,7 @@ if /I "%~1"=="--clean" goto arg_clean
 if /I "%~1"=="--jobs" goto arg_jobs
 if /I "%~1"=="--dll-only" goto arg_dll_only
 if /I "%~1"=="--compile-only" goto arg_compile_only
+if /I "%~1"=="--graphics-only" goto arg_graphics_only
 if /I "%~1"=="--rig" goto arg_rig
 if /I "%~1"=="--wait-lock" goto arg_wait_lock
 echo [edvr] unknown argument: %~1
@@ -77,12 +80,20 @@ goto parse_args
 set "EDVR_COMPILE_ONLY=1"
 shift
 goto parse_args
+:arg_graphics_only
+set "EDVR_GRAPHICS_ONLY=1"
+shift
+goto parse_args
 :arg_rig
 set "EDVR_RIG=%~2"
 shift
 shift
 goto parse_args
 :args_done
+if defined EDVR_GRAPHICS_ONLY if not defined EDVR_COMPILE_ONLY (
+    echo [edvr] ERROR: --graphics-only requires --compile-only
+    exit /b 1
+)
 if defined EDVR_DLL_ONLY if defined DO_CLEAN (
     echo [edvr] ERROR: --dll-only cannot be combined with --clean
     exit /b 1
@@ -761,6 +772,7 @@ if errorlevel 1 ( echo [edvr] ERROR: link failed & exit /b 1 )
 
 echo [edvr] built %BUILD%\d3d11.dll
 python tools\build_phases.py --mark "%PHASES%" "d3d11.dll"
+if defined EDVR_GRAPHICS_ONLY goto graphics_compile_only_finish
 copy /y "%BUILD%\d3d11.dll" "%BUILD%\edvr_openxr_graphics.dll" >nul || exit /b 1
 echo [edvr] built %BUILD%\edvr_openxr_graphics.dll
 
@@ -928,6 +940,14 @@ if defined EDVR_COMPILE_ONLY goto compile_only_finish
 echo [edvr] DLL-only build passed: production DLLs and loader are ready to install.
 echo [edvr] Test rigs and the self-contained installer were skipped; use a full build
 echo        before distributing an installer or accepting new source changes.
+exit /b 0
+
+:graphics_compile_only_finish
+python tools\openxr_pe.py --graphics "%BUILD%\d3d11.dll" --forbid-import d3dcompiler_47.dll || exit /b 1
+python tools\build_phases.py --report "%PHASES%"
+echo [edvr] GRAPHICS COMPILE-ONLY: %BUILD%\d3d11.dll
+echo [edvr] NOT Windows validated and NOT a release asset. No test rigs,
+echo        other runtime DLL builds, installer or packaging ran.
 exit /b 0
 
 :compile_only_finish
