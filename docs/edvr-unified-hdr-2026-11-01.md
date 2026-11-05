@@ -45,6 +45,29 @@ Audit EDVR's tone replacement, Elite gamma/exposure inputs, scene-copy
 0.75-scale routing without assuming the same copy shader executes. No HDR
 pixel correction is implemented or validated by these notes.
 
+#### Confirmed matching defects in the reported flights
+
+All three 22:34–22:40 logs have zero `HDR replacement` messages, while the
+final PQ encoder runs. The output draw uses copy PS `DED8796049C7BB4A`.
+Its captured 268-byte DXBC has CRC `D6A846C8` and standard FNV-1a-64
+`3C4D865B7031B44C`: exactly the HDR copy constants. However, `blobIs` calls
+EDVR's `fnv1a64`, whose historical offset basis is `1469598103934665603`,
+not the standard `14695981039346656037`. On those same bytes it produces
+`DED8796049C7BB4A`, so the exact copy shader is rejected. Do not change the
+global EDVR hash: existing shader identities depend on that convention.
+
+The selected tone PS in these logs is `FEE777E92850B390`, captured as 2244
+bytes with CRC `6BE69EF3`. The imported shader comments identify this CRC as
+the no-bloom tone variant, but `hdrOutputReplacementPs` only supports the
+3192-byte `D7E646E3` variant. Fixing the hash convention alone therefore will
+not provide the required tone replacement for the observed scene path.
+The bloom variant cannot simply be assigned to it: the replacement samples
+bloom and must be adapted to the actual variant's input contract.
+
+These establish incomplete EDVR HDR processing, not the numerical cause of
+the user's gamma compensation. No claim is made yet about corrected image
+brightness, and no live configuration or shader-capture file was modified.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.
