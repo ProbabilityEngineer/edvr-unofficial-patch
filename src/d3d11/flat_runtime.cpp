@@ -6153,8 +6153,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     drawPacketVs=k.vs;drawPacketPs=k.ps;
     drawPacketJitterBefore=s.jitterRefusals;drawPacketOverlayBefore=s.overlayRefusedWindow;
     if (auditing) {
-        const bool relevant = (k.vs == flat_mono_detail::kCopyVs &&
-                               k.ps == flat_mono_detail::kCopyPs) ||
+        const bool relevant = flat_mono_detail::outputCopyPair(k.vs, k.ps) ||
                               (s.prefix.output && k.color == s.prefix.output);
         if (relevant) ingress.relevant.fetch_add(1, std::memory_order_relaxed);
         const bool firstAccepted = ingress.firstAcceptedWitness.load(std::memory_order_relaxed) == 0 &&
@@ -7113,7 +7112,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             // A plain copy reading the HUD's target names the copy the tone may read (the HDR route's post chain).
             // Its source is read from the context, not the binding shadow: when this copy is the HDR route's trigger, the
             // resolve ran inside this scope (treatHdr) and the shadow no longer names the draw's bindings (13:23 flight).
-            else if (k.ps == flat_mono_detail::kCopyPs) {
+            else if (flat_mono_detail::outputCopyPs(k.ps)) {
                 if (trailDraw) flatUiTrailNoteBranch(s.prefix.frame, FlatUiTrailBranch::kCopy);
                 FlatComputeInternalScope readGuard;
                 Ptr<ID3D11ShaderResourceView> copySrv;
@@ -7239,6 +7238,8 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     FlatMonoResolveFrame f{}; f.color = original; f.depth = s.depthView.Get(); f.renderWidth = selected.renderWidth; f.renderHeight = selected.renderHeight;
     f.outputWidth = selected.outputWidth; f.outputHeight = selected.outputHeight; f.frame = s.prefix.frame; f.mode = s.engine;
+    D3D11_SHADER_RESOURCE_VIEW_DESC copyView{};original->GetDesc(&copyView);
+    f.fp16=copyView.Format==DXGI_FORMAT_R16G16B16A16_FLOAT;
     f.jitterCycle=s.phase.phaseCount;
     // The refusal census on the copy route too (render below the output: DLSS or FSR upscaling), as on the HDR route.
     f.refusalView = s.refusalView ? 1u : 0u;
@@ -7489,13 +7490,13 @@ bool FlatRuntimeDrawScope::recover(const char* temporalReason) {
     if(inResource)inResource.As(&texture);
     D3D11_TEXTURE2D_DESC desc{};if(texture)texture->GetDesc(&desc);
     UINT count=1;D3D11_VIEWPORT vp{};ctx->RSGetViewports(&count,&vp);
-    const bool valid=lookupShaderHash(vs.Get())==flat_mono_detail::kCopyVs &&
-        lookupShaderHash(ps.Get())==flat_mono_detail::kCopyPs && !ds && outResource.Get()==s.output.Get() &&
+    const bool valid=flat_mono_detail::outputCopyPair(lookupShaderHash(vs.Get()),lookupShaderHash(ps.Get())) && !ds && outResource.Get()==s.output.Get() &&
         original && texture && desc.Width==s.phaseWidth && desc.Height==s.phaseHeight &&
         count==1 && vp.TopLeftX==0 && vp.TopLeftY==0 && vp.Width==float(s.prefix.width) &&
         vp.Height==float(s.prefix.height) && vp.MinDepth==0 && vp.MaxDepth==1;
     FlatMonoResolveFrame f{};f.color=original;f.renderWidth=desc.Width;f.renderHeight=desc.Height;
     f.outputWidth=s.prefix.width;f.outputHeight=s.prefix.height;f.mode=s.engine;
+    if(original){D3D11_SHADER_RESOURCE_VIEW_DESC copyView{};original->GetDesc(&copyView);f.fp16=copyView.Format==DXGI_FORMAT_R16G16B16A16_FLOAT;}
     f.jitterX=s.phase.currentX;f.jitterY=s.phase.currentY;
     Ptr<ID3D11ShaderResourceView> outputView;const char* reason="unverified-copy-handoff";
     if(valid && flatMonoResolveSpatialFallback(s.device.Get(),ctx,f,&outputView,&reason)) {

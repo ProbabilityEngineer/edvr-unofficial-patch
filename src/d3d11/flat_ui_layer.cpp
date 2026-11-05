@@ -475,7 +475,7 @@ bool flatUiLayerSourceToneCandidate(ID3D11DeviceContext* ctx, uint64_t frame, ui
 }
 
 // Sean's 2026-10-15 decision: an unknown pair that passes the full physical shape grants flat UI proof, as a named pair does. The
-// shape is the strict one (sourceTonePhysicalShape with LDR format 28: the HDR at t1 a physical HUD target, a 3D LUT at t0, the
+// shape is the strict one (sourceTonePhysicalShape with UNORM or typed FP16 output: the HDR at t1 a physical HUD target, a 3D LUT at t0, the
 // full viewport, one RTV, no DSV or blend), and the bloom at PS t2 is a bound 2D view. The admission is the named pair's own proof.
 bool flatUiLayerShapeToneCandidate(ID3D11DeviceContext* ctx, uint64_t frame, uint32_t renderW, uint32_t renderH,
                                    uint64_t vs, uint64_t ps, const void* cachedOutput, uint32_t outW, uint32_t outH,
@@ -496,10 +496,10 @@ bool flatUiLayerShapeToneCandidate(ID3D11DeviceContext* ctx, uint64_t frame, uin
     const auto result = g_shapeToneLog.record(vs, ps);
     if (result == FlatUiShapeToneLog::Result::NewPair)
         Log::get().note("flat ui layer: tone pair admitted by its physical shape -- frame %llu VS %016llX PS %016llX: the physical HUD "
-                        "target at t1, LDR RTV %p fmt 28 R=%ux%u, a 2D at t2, full viewport. Flat UI proof only; the pair is not in "
+                        "target at t1, post-tone RTV %p fmt %d R=%ux%u, a 2D at t2, full viewport. Flat UI proof only; the pair is not in "
                         "any table (2026-10-15 rule).",
                         static_cast<unsigned long long>(frame), static_cast<unsigned long long>(vs),
-                        static_cast<unsigned long long>(ps), shape.rtvRes, renderW, renderH);
+                        static_cast<unsigned long long>(ps), shape.rtvRes, static_cast<int>(shape.rtvFmt), renderW, renderH);
     else if (result == FlatUiShapeToneLog::Result::CapacityReached)
         Log::get().note("flat ui layer: tone pairs admitted by shape capacity=%u exhausted; later new pairs are admitted without a line",
                         FlatUiShapeToneLog::kCapacity);

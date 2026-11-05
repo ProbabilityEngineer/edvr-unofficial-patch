@@ -152,6 +152,26 @@ void testKey() {
           "the label: 100%, 125%, 150%, 200%, off");
 }
 
+void testFrameFormats() {
+    check(uiLayerFrameView(DXGI_FORMAT_R8G8B8A8_TYPELESS) == DXGI_FORMAT_R8G8B8A8_UNORM &&
+              uiLayerFrameView(DXGI_FORMAT_B8G8R8A8_TYPELESS) == DXGI_FORMAT_B8G8R8A8_UNORM,
+          "the original 8-bit frame views remain accepted");
+    check(uiLayerFrameView(DXGI_FORMAT_R16G16B16A16_FLOAT) == DXGI_FORMAT_UNKNOWN &&
+              uiLayerFrameView(DXGI_FORMAT_R16G16B16A16_TYPELESS) == DXGI_FORMAT_UNKNOWN,
+          "VR does not admit FP16 frames without the flat output gate");
+    check(uiLayerFrameView(DXGI_FORMAT_R16G16B16A16_FLOAT, true) == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+              uiLayerFrameView(DXGI_FORMAT_R16G16B16A16_TYPELESS, true) == DXGI_FORMAT_R16G16B16A16_FLOAT,
+          "flat FP16 output has a typed FLOAT view, including a typeless resource");
+    check(uiLayerFrameView(DXGI_FORMAT_R16G16B16A16_UNORM, true) == DXGI_FORMAT_UNKNOWN &&
+              uiLayerFrameView(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, true) == DXGI_FORMAT_UNKNOWN,
+          "flat FP16 admission does not widen to UNORM16 or sRGB frames");
+    check(uiLayerCompositeFormatIndex(DXGI_FORMAT_R8G8B8A8_UNORM) == 0 &&
+              uiLayerCompositeFormatIndex(DXGI_FORMAT_B8G8R8A8_UNORM) == 1 &&
+              uiLayerCompositeFormatIndex(DXGI_FORMAT_R16G16B16A16_FLOAT) == 2 &&
+              uiLayerCompositeFormatIndex(DXGI_FORMAT_R16G16B16A16_UNORM) == -1,
+          "the composite caches use separate RGBA8, BGRA8 and FP16 format slots");
+}
+
 void testSize() {
     // Sean's rig 2026-09-23: the eye renders 1995x1970 at HMD Quality 0.65,
     // DLSS returns 3070x3032.
@@ -1755,21 +1775,79 @@ void testFlatLayerRules() {
     check(flatUiMapToneSlotOf(0xF9CFC798F21E9AEAull, 0x0D4329BDF65DE8F7ull) == ~0u,
           "EDHM 0D43 UI source tone: the map table remains unchanged");
     check(flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 28, 1720, 720, 26, true, true, true) &&
+              flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 10, 1720, 720, 26, true, true, true) &&
               !flatUiSourceToneShape(1720, 720, 3440, 1440, 1720, 720, 28, 1720, 720, 26, true, true, true) &&
               !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 28, 1720, 720, 26, true, true, false) &&
-              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 27, 1720, 720, 26, true, true, true) &&
-              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 28, 1720, 720, 26, false, true, true),
-          "E894 UI source tone: full-size LDR RTV, R11 HUD source, LUT and viewport are required");
-    check(flatUiUnknownSourceToneShape(1720, 720, 1720, 720, 1720, 720, 29, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 9, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 11, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 26, 1720, 720, 26, true, true, true) &&
               !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 29, 1720, 720, 26, true, true, true) &&
-              !flatUiUnknownSourceToneShape(1720, 720, 1720, 720, 1720, 720, 10, 1720, 720, 26, true, true, true),
-          "unknown UI source tone: diagnostics can name an LDR view variant without widening admission");
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 10, 1720, 720, 26, false, true, true),
+          "E894 UI source tone: exact UNORM or FP16 output, full size, R11 HUD input, LUT and viewport are required");
+    check(flatUiUnknownSourceToneShape(1720, 720, 1720, 720, 1720, 720, 29, 1720, 720, 26, true, true, true) &&
+              flatUiUnknownSourceToneShape(1720, 720, 1720, 720, 1720, 720, 10, 1720, 720, 26, true, true, true) &&
+              !flatUiSourceToneShape(1720, 720, 1720, 720, 1720, 720, 29, 1720, 720, 26, true, true, true) &&
+              !flatUiUnknownSourceToneShape(1720, 720, 1720, 720, 1720, 720, 26, 1720, 720, 26, true, true, true),
+          "unknown UI source tone: diagnostics name FP16 and 8-bit views without admitting other HDR formats");
     static int kE894Hud = 0, kE894Other = 0;
     check(flatUiSourceToneDirectHud(&kE894Hud, &kE894Hud, &kE894Hud) &&
               !flatUiSourceToneDirectHud(&kE894Hud, &kE894Other, &kE894Hud) &&
               !flatUiSourceToneDirectHud(&kE894Hud, &kE894Hud, &kE894Other) &&
               !flatUiSourceToneDirectHud(nullptr, nullptr, nullptr),
           "E894 UI source tone: proof bootstraps only from the direct, physically verified HUD target");
+    // Startup can write the physically verified post-tone output as FP16. The first admitted tone
+    // proves H and a treated display-sized copy arms the door; the next frame can take H without
+    // a resolution change. Resetting both states models a real resize and repeats that contract.
+    {
+        const char* backends[] = {"FSR3", "MFX3", "MFX4"};
+        for (const char* backend : backends) {
+            FlatUiToneProof proof;
+            UiLayerDoorState door;
+            int hud = 0, resizedHud = 0;
+            const uint32_t renderW = 1752, renderH = 1132, displayW = 3840, displayH = 2160;
+            const uint32_t resizedRenderW = 1600, resizedRenderH = 1000, resizedDisplayW = 3200, resizedDisplayH = 2000;
+            const auto admitted = [](uint32_t width, uint32_t height, uint32_t format) {
+                return flatUiSourceToneShape(width, height, width, height, width, height,
+                                             format, width, height, 26, true, true, true);
+            };
+            check(!flatUiToneProven(proof, 2, &hud) && !uiLayerArmed(door, 2),
+                  "cold startup: no tone proof or door before the first admitted frame");
+            if (admitted(renderW, renderH, 10) && flatUiSourceToneDirectHud(&hud, &hud, &hud)) {
+                flatUiToneProofHud(proof, 2, &hud);
+                check(flatUiToneProofTone(proof, 2, &hud) == &hud,
+                      "cold FP16 post-tone read proves the physical HUD target");
+            }
+            if (flatUiLayerDoorArms(true, displayW, displayH, displayW, displayH)) {
+                door.doorSeq = door.treatedSeq = 2;
+                door.fullW = displayW;
+                door.fullH = displayH;
+            }
+            flatUiToneProofHud(proof, 3, &hud);
+            check(flatUiToneProven(proof, 3, &hud) && uiLayerArmed(door, 3),
+                  (std::string(backend) + ": cold FP16 startup takes H on the next frame without resize").c_str());
+
+            for (uint32_t resizedFormat : {28u, 10u}) {
+                proof = FlatUiToneProof{};
+                door = UiLayerDoorState{};
+                check(!flatUiToneProven(proof, 20, &resizedHud) && !uiLayerArmed(door, 20),
+                      "resize reset: old tone proof and door cannot arm the new target");
+                if (admitted(resizedRenderW, resizedRenderH, resizedFormat) &&
+                    flatUiSourceToneDirectHud(&resizedHud, &resizedHud, &resizedHud)) {
+                    flatUiToneProofHud(proof, 20, &resizedHud);
+                    check(flatUiToneProofTone(proof, 20, &resizedHud) == &resizedHud,
+                          "resized post-tone read proves the new physical HUD target");
+                }
+                if (flatUiLayerDoorArms(true, resizedDisplayW, resizedDisplayH, resizedDisplayW, resizedDisplayH)) {
+                    door.doorSeq = door.treatedSeq = 20;
+                    door.fullW = resizedDisplayW;
+                    door.fullH = resizedDisplayH;
+                }
+                flatUiToneProofHud(proof, 21, &resizedHud);
+                check(flatUiToneProven(proof, 21, &resizedHud) && uiLayerArmed(door, 21),
+                      (std::string(backend) + ": resized UNORM or FP16 frame takes H on the next frame").c_str());
+            }
+        }
+    }
     // The first map-tone candidate's log reason (flatUiToneMatchWhy): what a tone read proves, and the three ways it does not.
     {
         static int kTargetA = 0, kTargetB = 0;
@@ -3409,6 +3487,96 @@ void composite(Gpu& g, const Tex& frame, const uint32_t region[4], const float u
     g.ctx->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
 }
 
+// A FLOAT view of either FP16 resource family, like the flat resolver's
+// MFX output. The rig uses the production composite bytecode through composite().
+Tex makeFp16Tex(Gpu& g, bool typeless, bool output) {
+    Tex t;
+    t.w = t.h = 4;
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = d.Height = 4;
+    d.MipLevels = d.ArraySize = 1;
+    d.Format = typeless ? DXGI_FORMAT_R16G16B16A16_TYPELESS : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    d.SampleDesc.Count = 1;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | (output ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_RENDER_TARGET);
+    if (FAILED(g.dev->CreateTexture2D(&d, nullptr, &t.tex))) return t;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    g.dev->CreateShaderResourceView(t.tex.Get(), &sd, &t.srv);
+    if (output) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        g.dev->CreateUnorderedAccessView(t.tex.Get(), &ud, &t.uav);
+    } else {
+        D3D11_RENDER_TARGET_VIEW_DESC rd{};
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        g.dev->CreateRenderTargetView(t.tex.Get(), &rd, &t.rtv);
+    }
+    return t;
+}
+
+std::vector<uint16_t> readBackFp16(Gpu& g, const Tex& t) {
+    D3D11_TEXTURE2D_DESC d{};
+    t.tex->GetDesc(&d);
+    d.BindFlags = 0;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> stage;
+    if (FAILED(g.dev->CreateTexture2D(&d, nullptr, &stage))) return {};
+    g.ctx->CopyResource(stage.Get(), t.tex.Get());
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(g.ctx->Map(stage.Get(), 0, D3D11_MAP_READ, 0, &m))) return {};
+    std::vector<uint16_t> pixels(static_cast<size_t>(t.w) * t.h * 4);
+    for (uint32_t y = 0; y < t.h; ++y)
+        std::memcpy(pixels.data() + static_cast<size_t>(y) * t.w * 4,
+                    static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch,
+                    static_cast<size_t>(t.w) * 8);
+    g.ctx->Unmap(stage.Get(), 0);
+    return pixels;
+}
+
+void testFp16Composite(Gpu& g) {
+    Tex frame = makeFp16Tex(g, true, false);
+    Tex layer = makeFp16Tex(g, false, false);
+    Tex out = makeFp16Tex(g, false, true);
+    Tex mult = makeFp16Tex(g, false, false);
+    if (!frame.rtv || !frame.srv || !layer.rtv || !layer.srv || !out.uav || !mult.rtv || !mult.srv) {
+        check(false, "WARP creates typed FLOAT views for FP16 and typeless FP16 resources");
+        return;
+    }
+    const float base[4] = {40, 40, 40, 0.25f};
+    const uint32_t region[4] = {0, 0, 4, 4};
+    const float uv[4] = {0, 0, 1, 1};
+    g.ctx->ClearRenderTargetView(frame.rtv.Get(), base);
+    const auto result = [&](const float rgba[4], uint32_t mode, const Tex* multiply) {
+        g.ctx->ClearRenderTargetView(layer.rtv.Get(), rgba);
+        composite(g, frame, region, uv, layer, out, mode, multiply);
+        return readBackFp16(g, out);
+    };
+    const auto pixelIs = [&](const std::vector<uint16_t>& p, uint16_t rgb, const char* what) {
+        bool equal = p.size() == 4u * 4u * 4u;
+        for (size_t i = 0; equal && i < p.size(); i += 4)
+            equal = p[i] == rgb && p[i + 1] == rgb && p[i + 2] == rgb && p[i + 3] == 0x3400u;
+        check(equal, what);
+    };
+    const float halfHud[4] = {2, 2, 2, 0.5f};
+    pixelIs(result(halfHud, 2u, nullptr), 0x4d80u,
+            "FP16 composite keeps 2 + 40 * 0.5 = 22 and the frame's 0.25 alpha");
+    const float empty[4] = {0, 0, 0, 1};
+    pixelIs(result(empty, 2u, nullptr), 0x5100u,
+            "transparent FP16 layer preserves the frame's 40.0 RGB");
+    const float opaque[4] = {2, 2, 2, 0};
+    pixelIs(result(opaque, 2u, nullptr), 0x4000u,
+            "opaque FP16 layer replaces the frame without changing its alpha");
+    const float tint[4] = {0.25f, 0.25f, 0.25f, 1};
+    g.ctx->ClearRenderTargetView(mult.rtv.Get(), tint);
+    pixelIs(result(empty, 2u, &mult), 0x4900u,
+            "FP16 composite applies multiply transmittance to HDR frame color (40 * 0.25 = 10)");
+}
+
 ComPtr<ID3D11BlendState> state(Gpu& g, const UiBlendRt& b) {
     const D3D11_BLEND_DESC d = uiLayerBlendDesc(b);
     ComPtr<ID3D11BlendState> s;
@@ -4184,6 +4352,7 @@ int main(int argc, char** argv) {
     testSeedKeepsDepthRule();
     testSeedReasonTally();
     testKey();
+    testFrameFormats();
     testSize();
     testMap();
     testScissor();
@@ -4224,6 +4393,7 @@ int main(int argc, char** argv) {
         testRedirect(g, 1.0f);
         testRedirect(g, 1.25f);
         testComposite(g);
+        testFp16Composite(g);
         testAfterUiOrder(g);
         testDownsample(g);
         testSeededStencil(g);

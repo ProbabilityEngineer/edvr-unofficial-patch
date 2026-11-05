@@ -4807,7 +4807,7 @@ FLATU_TRIGGER_RE = re.compile(FLATU_TS + r"flat hdr route: first trigger at fram
 FLATU_WINDOW_RE = re.compile(FLATU_TS + r"flat copy structure 5s: (?P<rest>.*)$")
 FLATU_FIRST_RE = re.compile(
     FLATU_TS + r"flat copy structure: first admission at frame=(?P<frame>\d+) \((?:experimental\.temporal_aa_before_post=auto|the HDR route is on)\): the game's final copy reads a "
-    r"(?P<w>\d+)x(?P<h>\d+) R8G8B8A8 image written by one pass, VS=(?P<vs>[0-9A-F]+) PS=(?P<ps>[0-9A-F]+), after the scene HDR's first consumer "
+    r"(?P<w>\d+)x(?P<h>\d+) (?:R8G8B8A8|R16G16B16A16_FLOAT) image written by one pass, VS=(?P<vs>[0-9A-F]+) PS=(?P<ps>[0-9A-F]+), after the scene HDR's first consumer "
     r"\(VS=(?P<tvs>[0-9A-F]+) PS=(?P<tps>[0-9A-F]+)\), .*?\(the whitelist said (?P<wl>[\w-]+)\); the scene is (?P<sw>\d+)x(?P<sh>\d+) on a "
     r"(?P<ow>\d+)x(?P<oh>\d+) output(?P<menu> \(the 3D menu\))?, route=(?P<route>[\w-]+);")
 FLATU_DECLINED_RE = re.compile(
@@ -25579,6 +25579,9 @@ def self_test_flat_upscale():
     if not fi or (fi["frame"], fi["src"], fi["scene"], fi["output"], fi["whitelist"], fi["route"], fi["menu"]) != \
             (1919, (2880, 1620), (2880, 1620), (3840, 2160), "no-known-tone-pass", "trained-upscale", False):
         fail("the first admission parsed as %r" % (fi,))
+    fp16_first = parse_flat_upscale(base.replace(" R8G8B8A8 image written by one pass", " R16G16B16A16_FLOAT image written by one pass"))["first"]
+    if not fi or fp16_first != fi:
+        fail("an EDHDR FP16 copy admission lost its frame/route evidence: %r" % (fp16_first,))
     stand = [(s["what"], s["reason"]) for s in f["stand"]]
     if stand != [("entered", "no-3d-scene"), ("resumed", None)] or f["warns"] or f["refusals"] != {"no-3d-scene": 1482} or f["old_advice"]:
         fail("the stand-down, warning and refusal lines parsed as %r %r %r" % (stand, f["warns"], f["refusals"]))

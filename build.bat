@@ -723,6 +723,8 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\fsr3_engine.cpp" ^
     "src\d3d11\sharpen_pass.cpp" ^
     "src\d3d11\flat_sharpen.cpp" "src\d3d11\flat_ui_layer.cpp" "src\d3d11\flat_star_glow.cpp" ^
+    "src\d3d11\hdr_output.cpp" ^
+    "src\d3d11\hdr_fullscreen_mode.cpp" ^
     "src\d3d11\loader_panel.cpp" ^
     "src\d3d11\splash_dim.cpp" ^
     "src\d3d11\billboard_fix.cpp" ^
@@ -4128,6 +4130,22 @@ if not exist "%OBJ%\flatclear" mkdir "%OBJ%\flatclear"
 if errorlevel 1 ( echo [edvr] ERROR: flat_clear_test build failed & exit /b 1 )
 "%OBJ%\flatclear\flat_clear_test.exe" --dry-run || exit /b 1
 "%OBJ%\flatclear\flat_clear_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_hdr_output_test
+echo [edvr] === hdr_output_test.exe ===
+REM fix.hdr's two decisions (src\d3d11\hdr_output_rules.h; docs\edvr-unified-hdr-2026-11-01.md): which of Elite's textures are created
+REM wide and what format a view over a widened one gets. Both fail silently when wrong -- a widening predicate that misses leaves the
+REM HDR clamped to SDR while every other log line still says the feature ran -- so the rig holds the tone target at its real size, both
+REM bind classes, every exclusion, and the views that cannot be mapped exactly. No Windows API: the rig includes only the pure header.
+if not exist "%OBJ%\hdroutput" mkdir "%OBJ%\hdroutput"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\hdroutput\\" /Fe"%OBJ%\hdroutput\hdr_output_test.exe" ^
+    "tools\hdr_output_test\hdr_output_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: hdr_output_test build failed & exit /b 1 )
+"%OBJ%\hdroutput\hdr_output_test.exe" --dry-run || exit /b 1
+"%OBJ%\hdroutput\hdr_output_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_orbital_width_test

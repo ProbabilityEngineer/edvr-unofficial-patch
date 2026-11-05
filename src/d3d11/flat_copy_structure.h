@@ -10,7 +10,7 @@
 //
 // WHAT IT ADMITS. At the final copy (the exact copy pair into the output, unchanged: the reducer's own checks) a frame is
 // admitted when the copy's source S is
-//   - an R8G8B8A8 image rendered this frame by one full-viewport pass with no depth, and not written outside a draw after it
+//   - an R8G8B8A8 or FP16 (EDHDR, resource 9/10 with a FLOAT view) image rendered this frame by one full-viewport pass with no depth, and not written outside a draw after it
 //     (no Clear, Copy, Update or Map: the prefix model marks such a target bad),
 //   - the scene's own size R (the size of the R11G11B10F target the scene was drawn into), a uniform scale of the output
 //     D between half and twice, for a mode that has a route at that size (EDVR's `dlaa` has none below the output),
@@ -194,10 +194,14 @@ struct FlatCopyDiag {
 };
 
 namespace flat_copy_detail {
+// The bound FLOAT view must still pass resolver validation; 9 is the compatible typeless resource.
+inline bool copySourceFormatOk(uint32_t format) {return format==27 || format==9 || format==10;}
+inline const char* copySourceFormatName(uint32_t format) {return format==27?"R8G8B8A8":"R16G16B16A16_FLOAT";}
+
 // The copy draw's own checks, which flatSelectMonoFrame makes only after the reducer has found a tone pass.
 inline bool plainCopy(const FlatRuntimePrefix& p, const FlatContractObservation& k, const FlatContractRecord& copy) {
     using namespace flat_mono_detail;
-    return oneDraw(copy) && k.kind == kFlatContractOutput && k.rtv && !k.depth && !k.dsv && k.format == p.format &&
+    return outputFormatSupported(p.format) && oneDraw(copy) && k.kind == kFlatContractOutput && k.rtv && !k.depth && !k.dsv && k.format == p.format &&
            k.width == p.width && k.height == p.height && fullViewport(k, p.width, p.height) &&
            k.srvView[0] && k.srvResource[0] && k.srvResource[0] != p.output;
 }
@@ -290,7 +294,7 @@ inline FlatMonoFrame flatCopyAdmit(FlatRuntimePrefix& p, const FlatHdrFrame& f, 
     g.srcWidth = sk.width; g.srcHeight = sk.height; g.srcFormat = sk.format; g.srcDraws = src->writes.draws;
     g.srcVs = sk.vs; g.srcPs = sk.ps;
     if (!oneDraw(src->writes)) return decline("the-copy-source-is-not-written-by-one-pass");
-    if (sk.format != 27) return decline("the-copy-source-is-not-r8g8b8a8");
+    if (!flat_copy_detail::copySourceFormatOk(sk.format)) return decline("the-copy-source-is-not-r8g8b8a8");
     // An explicit write into S after its pass (a Clear, a Copy, an Update or a Map: the prefix model marks the target bad) is what
     // the whitelist's tone count refuses (flatRuntimeWritten zeroes it); the unknown tone pass has no count to lose, so it is
     // said here. For an R8G8B8A8 target the mark means nothing else (the model's other conflicts are for HDR and image-source
@@ -437,11 +441,11 @@ inline int flatCopyFormatWindow(char* out, size_t size, bool structureOn, const 
 inline int flatCopyFormatFirstAdmission(char* out, size_t size, uint64_t frame, const FlatCopyDiag& g, const char* routeName) {
     return std::snprintf(out, size,
         "flat copy structure: first admission at frame=%llu (the HDR route is on): the game's final "
-        "copy reads a %ux%u R8G8B8A8 image written by one pass, VS=%016llX PS=%016llX, after the scene HDR's first consumer "
+        "copy reads a %ux%u %s image written by one pass, VS=%016llX PS=%016llX, after the scene HDR's first consumer "
         "(VS=%016llX PS=%016llX), with no other R-sized image pass in between; no whitelisted tone pass wrote it (the "
         "whitelist said %s); the scene is %ux%u on a %ux%u output%s, route=%s; admitted by structure, so bloom, depth of "
         "field and the tone variant do not matter",
-        static_cast<unsigned long long>(frame), g.srcWidth, g.srcHeight, static_cast<unsigned long long>(g.srcVs),
+        static_cast<unsigned long long>(frame), g.srcWidth, g.srcHeight, flat_copy_detail::copySourceFormatName(g.srcFormat), static_cast<unsigned long long>(g.srcVs),
         static_cast<unsigned long long>(g.srcPs), static_cast<unsigned long long>(g.triggerVs),
         static_cast<unsigned long long>(g.triggerPs), flatMonoReasonName(g.whitelist),
         g.sceneWidth, g.sceneHeight, g.outputWidth, g.outputHeight, g.menu ? " (the 3D menu)" : "",

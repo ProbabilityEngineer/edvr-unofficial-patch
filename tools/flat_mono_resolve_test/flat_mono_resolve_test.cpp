@@ -61,6 +61,7 @@ std::vector<std::string> worldLines;
 std::vector<std::string> resolveInputLines;
 uint32_t observedInW=0,observedInH=0,observedOutW=0,observedOutH=0;
 // What the stub backends were handed on the HDR route (section 81): the flag and the formats of the textures it names.
+uint16_t observedFp16Color=0;
 bool observedHdr=false;DXGI_FORMAT observedColourFormat=DXGI_FORMAT_UNKNOWN,observedOutFormat=DXGI_FORMAT_UNKNOWN;
 uint32_t observedBackendCenter=0,observedBackendOutside=0;
 bool observedBackendPixels=false;
@@ -262,6 +263,8 @@ bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned slot,ID3D11Texture2D* colour,I
     observedInW=w;observedInH=h;observedOutW=outW;observedOutH=outH;
     observedHdr=hdr;observedColourFormat=DXGI_FORMAT_UNKNOWN;observedOutFormat=DXGI_FORMAT_UNKNOWN;
     {D3D11_TEXTURE2D_DESC d{};colour->GetDesc(&d);observedColourFormat=d.Format;out->GetDesc(&d);observedOutFormat=d.Format;}
+    if(observedColourFormat==DXGI_FORMAT_R16G16B16A16_FLOAT){uint16_t channels[4]{};
+        check(readPixel(c,colour,channels,sizeof(channels)),"FSR FP16 input readable");observedFp16Color=channels[0];}
     if(hdr) observedBackendPixels=readPixel(c,colour,&observedBackendCenter,4,8,8) &&
                                   readPixel(c,colour,&observedBackendOutside,4,1,1);
     infiniteSeen=infinite;check(nearZ==expectedNear && std::abs(fov-1.5707963f)<1e-5f,"FSR actual near and FOV");

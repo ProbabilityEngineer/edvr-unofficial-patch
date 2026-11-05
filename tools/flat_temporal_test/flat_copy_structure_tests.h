@@ -131,10 +131,13 @@ struct Build {
     uint32_t sceneDraws = 10;            // pool (4) and other draws into H; the scene facts need kFlatSceneMinDraws
     bool consumerWritesS = true;         // the first consumer of H is S's writer (star-off); else a bloom level reads it first
     uint32_t sFormat = 27;
+    uint32_t outputFormat = 28;
+    uint64_t copyPs = edvr::flat_mono_detail::kCopyPs;
     bool sDepth = false;                 // S drawn with a depth buffer bound
     uint32_t sW = 0, sH = 0;             // S's size (0: the scene's)
     bool sFullViewport = true;
     uint32_t sWriters = 1;               // draws into S
+    uint32_t llmFormat = 27; // FP16 working passes are not counted as an SDR AA chain
     uint32_t llmBefore = 0;              // R-sized R8G8B8A8 passes between the first consumer and S (a game AA chain)
     bool consumer = true;                // a pass reads H at all
     bool sBeforeConsumer = false;        // S is written before anything reads H
@@ -161,6 +164,7 @@ inline Built build(const Build& b) {
     Built out;
     out.stream = std::make_unique<hdr_route_test::Stream>(b.sc);
     auto& s = *out.stream;
+    s.prefix->format=b.outputFormat;
     const uint32_t w = b.sW ? b.sW : b.sc.hW, h = b.sH ? b.sH : b.sc.hH;
     const void* S = s.sc.tone;
     const auto writeS = [&](const void* t1 = nullptr) {
@@ -179,13 +183,13 @@ inline Built build(const Build& b) {
     for (uint32_t i = 0; i < b.llmBefore; ++i) {
         // a game AA filter: reads the previous LDR image, writes a new R-sized R8G8B8A8 target
         const void* t = tok(0x7000 + 16 * i);
-        s.draw(s.make(t, nullptr, w, h, 27, 0x03, 0x04 + i, false, false), nullptr, i ? tok(0x7000 + 16 * (i - 1)) : s.sc.h);
+        s.draw(s.make(t, nullptr, w, h, b.llmFormat, 0x03, 0x04 + i, false, false), nullptr, i ? tok(0x7000 + 16 * (i - 1)) : s.sc.h);
     }
     if (!b.sBeforeConsumer)
         for (uint32_t i = 0; i < b.sWriters; ++i) writeS(b.consumer && b.consumerWritesS && i == 0 ? s.sc.h : nullptr);
     if (b.sExplicitWrite) flatRuntimeWritten(*s.prefix, S);   // the prefix model's own call for a Clear/Copy/Update/Map into a drawn target
-    FlatRuntimeDraw c = s.make(s.sc.output, nullptr, b.sc.outW, b.sc.outH, 28, flat_mono_detail::kCopyVs,
-                               flat_mono_detail::kCopyPs, false, false);
+    FlatRuntimeDraw c = s.make(s.sc.output, nullptr, b.sc.outW, b.sc.outH, b.outputFormat, flat_mono_detail::kCopyVs,
+                               b.copyPs, false, false);
     out.copy = withSrv(c, b.copyReads ? b.copyReads : S);
     out.whitelist = flatRuntimeObserve(*s.prefix, out.copy);
     // The detector sees the copy draw too, as in the runtime: handed its four slots when its cheap gate asks, the copy reading S.
@@ -520,10 +524,71 @@ inline int flatCopyStructureTests() {
                diag.srcWidth == 3840 && diag.srcFormat == 27 && diag.srcDraws == 1 && !diag.menu,
                "the canonical unknown chain: the whitelist refuses (no-known-tone-pass), the structure admits S, H, its depth and camera");
 
+        // ---- the FP16 copy source (EDHDR's presentation): the 0.65x flight's shape ---------------------------------
+        // The failing session's own chain: S is the FP16 image (typeless 9 in the field, typed 10 the swapchain's
+        // shape), the scene below the output. Both are admitted to the same selection the SDR chain gets, in every
+        // backend with a route at the size; a wrong family still declines by name.
+        for (const uint32_t sFormat : {9u, 10u}) {
+            for (const FlatMonoResolveMode mode :
+                 {FlatMonoResolveMode::Dlss, FlatMonoResolveMode::Fsr, FlatMonoResolveMode::Taa}) {
+                Build fp16;
+                fp16.sFormat = sFormat;
+                Built fbuilt = build(fp16);
+                FlatCopyDiag fdiag;
+                const FlatMonoFrame fsel = admit(fbuilt, policy(true, mode, true), &fdiag);
+                char what[160];
+                std::snprintf(what, sizeof(what), "an FP16 S (fmt %u) is admitted like the SDR chain in mode %s",
+                              sFormat, edvr::flatMonoResolveModeName(mode));
+                expect(fbuilt.whitelist.reason == FlatMonoReason::NoTonePass && fdiag.outcome == FlatCopyOutcome::Admitted &&
+                       fsel.selected() && fsel.color == fbuilt.stream->sc.tone && fsel.hdr == fbuilt.stream->sc.h &&
+                       fsel.renderWidth == 3840 && fsel.renderHeight == 2160 && fdiag.srcFormat == sFormat, what);
+            }
+        }
+        {
+            // Below the output, the upscaling shape: admitted as the copy route's own (latched, so the route check reads it).
+            Build below;
+            below.sc.hW = 1920; below.sc.hH = 1080; below.sFormat = 9;
+            Built bb = build(below);
+            FlatCopyDiag bd;
+            const FlatMonoFrame out = admit(bb, policy(true, FlatMonoResolveMode::Fsr, true), &bd);
+            expect(bd.outcome == FlatCopyOutcome::Admitted && out.selected() && out.renderWidth == 1920 &&
+                   out.renderHeight == 1080 && bd.srcFormat == 9,
+                   "an FP16 S below the output is admitted for the trained upscale");
+        }
+        {
+            // The HDR working set stays invisible to the AA chain rule: an
+            // R-sized FP16 pass between the trigger and an FP16 S (Elite's own
+            // bloom/depth-of-field shape, as the corpus holds it in SDR) does
+            // not decline the frame; only the SDR family is counted.
+            Build working;
+            working.sFormat = 10; working.llmFormat = 10; working.llmBefore = 1; working.consumerWritesS = false;
+            Built wb = build(working);
+            FlatCopyDiag wd;
+            const FlatMonoFrame wout = admit(wb, policy(true, FlatMonoResolveMode::Fsr, true), &wd);
+            expect(wd.outcome == FlatCopyOutcome::Admitted && wout.selected() && wd.ldrTargetsBefore == 0,
+                   "an FP16 working pass between the trigger and S is not a game AA chain: admitted, nothing counted");
+        }
+
+        // Actual EDHDR topology: FP16 output plus its exact GameScale copy PS.
+        for (const uint32_t sourceFormat : {9u,10u}) {
+            Build fp;fp.sFormat=sourceFormat;fp.outputFormat=10;fp.copyPs=edvr::flat_mono_detail::kEdhdrCopyPs;
+            for (const auto mode : {FlatMonoResolveMode::Fsr,FlatMonoResolveMode::Dlss}) {
+                Built live=build(fp);FlatCopyDiag diag;
+                const auto selected=admit(live,policy(true,mode,true),&diag);
+                expect(selected.selected() && diag.outcome==FlatCopyOutcome::Admitted && live.whitelist.reason==FlatMonoReason::NoTonePass,
+                       "FP16 output and exact EDHDR GameScale copy reach structural scene admission");
+            }
+            fp.copyPs^=1;Built unknown=build(fp);FlatCopyDiag diag;
+            expect(!admit(unknown,policy(true,FlatMonoResolveMode::Fsr,true),&diag).selected(),
+                   "a near-miss EDHDR copy shader is never admitted");
+            fp.copyPs=edvr::flat_mono_detail::kEdhdrCopyPs;fp.outputFormat=9;Built typelessOutput=build(fp);
+            expect(!admit(typelessOutput,policy(true,FlatMonoResolveMode::Fsr,true),&diag).selected(),
+                   "FP16 source support does not authorize a typeless swapchain output");
+        }
         struct Row { const char* name; Build b; const char* why; };
         std::vector<Row> rows;
         auto add = [&](const char* name, const char* why, void (*edit)(Build&)) { Row r{name, Build{}, why}; edit(r.b); rows.push_back(r); };
-        add("S is not R8G8B8A8", "the-copy-source-is-not-r8g8b8a8", [](Build& b) { b.sFormat = 9; });
+        add("S is not a supported copy family", "the-copy-source-is-not-r8g8b8a8", [](Build& b) { b.sFormat = 28; });
         add("S is drawn with a depth buffer", "the-copy-source-was-drawn-with-a-depth-buffer", [](Build& b) { b.sDepth = true; });
         add("S is a different size than the scene", "the-copy-source-is-not-the-scene-size", [](Build& b) { b.sW = 1920; b.sH = 1080; });
         add("S has two writers", "the-copy-source-is-not-written-by-one-pass", [](Build& b) { b.sWriters = 2; });

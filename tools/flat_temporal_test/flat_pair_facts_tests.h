@@ -42,7 +42,7 @@ inline int flatPairFactsTests() {
     for (const auto& m : engine_velocity_family::kSelfMarking) { h.push_back(m.vs); h.push_back(m.ps); }
     for (uint64_t x : {flat_mono_detail::kToneVs, flat_mono_detail::kToneVsNoConst, flat_mono_detail::kToneVsCbZ, flat_mono_detail::kTonePs,
                        flat_mono_detail::kToneDofCompositePs, flat_mono_detail::kToneBloomCompositePs, flat_mono_detail::kToneEdhmGradePs,
-                       flat_mono_detail::kCopyVs, flat_mono_detail::kCopyPs, kFlatUiMapToneVs, kFlatUiMapTonePs, kFlatUiScannerTonePs, kFlatUiSourceToneVsSteady,
+                       flat_mono_detail::kCopyVs, flat_mono_detail::kCopyPs, flat_mono_detail::kEdhdrCopyPs, kFlatUiMapToneVs, kFlatUiMapTonePs, kFlatUiScannerTonePs, kFlatUiSourceToneVsSteady,
                        kFlatUiSourceToneVsTransition, kFlatUiSourceTonePs, kFlatUiSourceTonePsEdhm, kFlatUiMapCanvasVs, kFlatUiMapCanvasPs,
                        kFlatUiMapSpriteVs, kFlatUiMapSpritePsA, kFlatUiMapSpritePsB, kUiVsPanel, kUiVsLoader, kUiVsHolo, kUiVsFlightHud,
                        kUiVsSprite, kUiVsGuiVector, kUiVsGuiText})

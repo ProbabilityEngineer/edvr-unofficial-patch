@@ -169,6 +169,9 @@ struct FlatMonoResolveFrame {
     // is nothing for the caller to swap into a binding. False, the default, is the copy route and every byte of it
     // unchanged.
     bool hdr = false;
+    // Tone-mapped FP16 copy source (EDHDR), distinct from pre-tonemap HDR scene radiance.
+    // Retain FP16 color/history and return the result to the game's copy; depth and motion keep their own formats.
+    bool fp16 = false;
     // Optional late-colour-overlay isolation. `color` remains the live HDR
     // destination and raw post-overlay image. The backend and prep consume
     // only cleanColor. The finish keeps the world under the coverage (the

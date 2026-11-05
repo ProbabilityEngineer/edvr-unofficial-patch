@@ -139,9 +139,13 @@ constexpr uint32_t kUiLayerCompositeGroupX = 32, kUiLayerCompositeGroupY = 8;
 // The composite's format allowlist: the 8-bit families, read and written
 // through their plain UNORM view (the space the game's UI composites blend
 // in, measured 2026-09-06: RGBA8_TYPELESS viewed as UNORM). sRGB-typed
-// frames and every other family are refused, not guessed at.
-inline DXGI_FORMAT uiLayerFrameView(DXGI_FORMAT f) {
+// frames are refused. Flat post-resolve FP16 frames retain the same stored-color
+// composite domain; callers must opt in, leaving the VR format contract unchanged.
+inline DXGI_FORMAT uiLayerFrameView(DXGI_FORMAT f, bool flatFp16 = false) {
     switch (f) {
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            return flatFp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_UNKNOWN;
         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
         case DXGI_FORMAT_R8G8B8A8_UNORM:
             return DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -151,6 +155,13 @@ inline DXGI_FORMAT uiLayerFrameView(DXGI_FORMAT f) {
         default:
             return DXGI_FORMAT_UNKNOWN;
     }
+}
+
+// Capability caches must distinguish FP16 from both 8-bit families.
+inline int uiLayerCompositeFormatIndex(DXGI_FORMAT view) {
+    return view == DXGI_FORMAT_R8G8B8A8_UNORM ? 0 :
+           view == DXGI_FORMAT_B8G8R8A8_UNORM ? 1 :
+           view == DXGI_FORMAT_R16G16B16A16_FLOAT ? 2 : -1;
 }
 
 // The render-target views the layer accepts draws from: the game's 8-bit

@@ -215,7 +215,7 @@ cbuffer P : register(b0) {
     float4 uv;         // the layer's rectangle for that region: u0, v0, u1, v1
     float2 layerSize;  // the layer, texels
     uint2  outSize;    // the region's size, which is the output's
-    uint   mode;       // 0 the composite, 1 the ui_layer debug view
+    uint   mode;       // bit 0: debug view; bit 1: preserve flat FP16 range
     uint   useMult;    // 1: a multiply drew into M this frame
     uint2  pad;
 };
@@ -247,9 +247,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     float4 l = wsum > 0 ? acc / wsum : float4(0, 0, 0, 1);
     float3 m = (useMult != 0 && wsum > 0) ? accM / wsum : float3(1, 1, 1);
-    float3 c = mode == 1 ? l.rgb + float3(0.0, 0.08, 0.25) * (1.0 - l.a * dot(m, 1.0 / 3.0))
+    float3 c = (mode & 1u) != 0 ? l.rgb + float3(0.0, 0.08, 0.25) * (1.0 - l.a * dot(m, 1.0 / 3.0))
                          : l.rgb + f.rgb * l.a * m;
-    Out[id.xy] = float4(saturate(c), f.a);
+    Out[id.xy] = float4((mode & 2u) != 0 ? c : saturate(c), f.a);
 }
 )HLSL";
 

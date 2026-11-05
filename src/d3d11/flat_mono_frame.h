@@ -151,6 +151,15 @@ constexpr uint64_t kToneBloomCompositePs = 0x9270C355389DA302ull;
 constexpr uint64_t kToneEdhmGradePs = 0xEAA5F18F10533BD1ull;
 constexpr uint64_t kCopyVs = 0x20F383BBAC05C031ull;
 constexpr uint64_t kCopyPs = 0xDED8796049C7BB4Aull;
+// EDHDR GameScale copy from the installed, unchanged PE 6AD23C51: 944-byte
+// copyscale/m/ps_5_0 blob, compiled with flags 0 by the bottle's d3dcompiler_47.
+// It samples only t0 at the stock fullscreen VS coordinates, preserves alpha,
+// and applies the existing display-white color scale. Never alias an unknown PS.
+constexpr uint64_t kEdhdrCopyPs = 0xEA2A60D2BB6AB7E1ull;
+inline bool outputFormatSupported(uint32_t format) { return format == 28 || format == 10; }
+inline bool outputCopyPs(uint64_t ps) { return ps == kCopyPs || ps == kEdhdrCopyPs; }
+inline bool outputCopyPair(uint64_t vs, uint64_t ps) { return vs == kCopyVs && outputCopyPs(ps); }
+
 
 inline bool knownToneVs(uint64_t vs) {
     return vs == kToneVs || vs == kToneVsNoConst || vs == kToneVsCbZ;
@@ -291,7 +300,7 @@ inline FlatMonoFrame flatSelectMonoFrame(const FlatMonoFrameInput& in) {
         in.worldCount > 224 || in.handoffCount > 32 ||
         (in.worldCount && !in.world) || (in.handoffCount && !in.handoff))
         return refuse(FlatMonoReason::InvalidInput);
-    if (!in.output || !in.outputWidth || !in.outputHeight || in.outputFormat != 28)
+    if (!in.output || !in.outputWidth || !in.outputHeight || !outputFormatSupported(in.outputFormat))
         return refuse(FlatMonoReason::UnknownOutput);
     if (in.droppedViews || in.droppedTargets || in.droppedWorld ||
         in.droppedHandoff || in.droppedLargeCb)
@@ -302,7 +311,7 @@ inline FlatMonoFrame flatSelectMonoFrame(const FlatMonoFrameInput& in) {
     const FlatContractRecord* copy = nullptr;
     for (uint32_t i = 0; i < count; ++i) {
         const auto& r = record(in, i);
-        if (r.key.color != in.output || r.key.vs != kCopyVs || r.key.ps != kCopyPs) continue;
+        if (r.key.color != in.output || !outputCopyPair(r.key.vs, r.key.ps)) continue;
         if (copy || r.draws != 1) return refuse(FlatMonoReason::AmbiguousOutputCopy);
         copy = &r;
     }

@@ -515,7 +515,7 @@ inline int flatOffscreenTests() {
                     {&runtime, "if(s.projectionFrames)++s.projectionDraws;", "the projection draw count is the F10 audit's"},
                     {&runtime, "if(sceneExtent && k.color!=s.prefix.output && (k.format==9 || k.format==23 || k.format==26 || k.format==60)) {", "the coverage classification needs a scene-extent target of a screen format"},
                     {&runtime, "if (pairFact.uiMayAsk) {", "the UI layer's decision needs a pair a family can name"},
-                    {&runtime, "else if (k.ps == flat_mono_detail::kCopyPs) {", "the UI layer's plain-copy branch needs the copy's pixel shader"},
+                    {&runtime, "else if (flat_mono_detail::outputCopyPs(k.ps)) {", "the UI layer's plain-copy branch needs an exact known copy pixel shader"},
                     {&runtime, "else if (count == 3 && instances == 1 && (kind == 'D' || kind == 'N')) {", "the UI layer's tone probes need a fullscreen triangle"},
                     {&runtime, "const bool trailDraw = (count == 3 && instances == 1 && (kind == 'D' || kind == 'N')) || tone ||", "the back-off trail notes a fullscreen triangle or a tone"},
                     {&runtime, "if (!uiTake && !copy) flatUiLayerNoteSceneDraw(ctx, count, instances, kind);", "the UI layer's scene-draw note is made for every draw it leaves"},
@@ -530,7 +530,7 @@ inline int flatOffscreenTests() {
                     {&model, "if (k.format == 26 && k.vs == kMenuCopyVs && k.ps == kMenuCopyPs) {", "the menu copy is format 26"},
                     {&model, "const bool imageCopy = k.format == 26 && k.vs == kHdrImageCopyVs && k.ps == kHdrImageCopyPs;", "the image copy is format 26"},
                     {&model, "if (k.format == 26) {", "the HDR camera rules are format 26"},
-                    {&model, "if (k.format == 9) {", "the image intermediate rules are format 9"},
+                    {&model, "if (k.format == 9 && (k.depth || k.dsv)) {", "format-9 image intermediate rules require depth; depthless FP16 tone passes stay independent"},
                     {&hdr, "if (!flatHdrCouldConsume(f, k)) return false;", "the detector fires only where flatHdrCouldConsume says it could"},
                     {&hdr, "if (f.triggered || !f.candidateCount || !k.color || k.depth || k.dsv) return false;", "a consumer is a colour-only draw with a candidate H"},
                 };

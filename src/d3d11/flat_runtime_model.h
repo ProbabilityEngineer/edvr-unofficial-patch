@@ -978,7 +978,7 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         else flatRuntimeNoteBad(target, cause);
     };
     const auto& k = d.key;
-    const bool copy = k.vs == kCopyVs && k.ps == kCopyPs && k.color == p.output;
+    const bool copy = outputCopyPair(k.vs, k.ps) && k.color == p.output;
     if (copy) {
         p.selectedConflict = FlatRuntimeWitness{};
         ++p.copies;
@@ -1263,7 +1263,9 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         t->imageSourceBad = true;
         bad(*t, FlatRuntimeConflict::ImageCopySource, t->writes);
     }
-    if (k.format == 9) {
+    // A wholly depthless FP16 tone draw is not a depth-bearing image source.
+    // Partial/mismatched depth bindings still run the existing refusal checks.
+    if (k.format == 9 && (k.depth || k.dsv)) {
         const auto& first = t->writes;
         if (!k.depth || !k.dsv || !k.depthFormat ||
             k.depthWidth != k.width || k.depthHeight != k.height ||

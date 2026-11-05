@@ -40,13 +40,15 @@ struct UiLayerSmaa {
     Ptr<ID3D11SamplerState> linear, point;
     Ptr<ID3D11Texture2D> area, search;
     Ptr<ID3D11ShaderResourceView> areaSrv, searchSrv;
-    // Per layer size: the metrics (1/w, 1/h, w, h), the edges (R8G8), the weights and the blended output (R8G8B8A8).
+    // Per layer size and colour format: metrics, edges (R8G8), weights (RGBA8), and the blended output (RGBA8 or FP16).
     Ptr<ID3D11Buffer> metrics;
     Ptr<ID3D11Texture2D> edges, weights, out;
     Ptr<ID3D11UnorderedAccessView> edgesUav, weightsUav, outUav;
     Ptr<ID3D11ShaderResourceView> edgesSrv, weightsSrv, outSrv;
     uint32_t w = 0, h = 0;               // the size the targets stand at; 0: none
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     uint32_t failedW = 0, failedH = 0;   // the size a creation failed at; 0: none
+    DXGI_FORMAT failedFormat = DXGI_FORMAT_UNKNOWN;
 
     // The size-bound targets go (the layer was released or re-made); what failed at a size stays remembered.
     void releaseTargets() {
@@ -61,6 +63,7 @@ struct UiLayerSmaa {
         weightsSrv.Reset();
         outSrv.Reset();
         w = h = 0;
+        format = DXGI_FORMAT_UNKNOWN;
     }
     // Every child of the device goes, and the failure with them: a new device may make what the last could not.
     void releaseAll() {
@@ -75,6 +78,7 @@ struct UiLayerSmaa {
         areaSrv.Reset();
         searchSrv.Reset();
         failedW = failedH = 0;
+        failedFormat = DXGI_FORMAT_UNKNOWN;
     }
     bool ready() const { return outSrv && w && h; }
 };
@@ -139,24 +143,29 @@ inline bool makeLookup(ID3D11Device* dev, const MapSmaaTable& table, DXGI_FORMAT
 
 }  // namespace uilayersmaa_detail
 
-// Makes what is missing for a layer of w x h. A failure is told once per size: the first call that fails fills `fail` and answers kFailed, the calls after it
-// at that size answer kStoodDown without creating anything. A different size tries again.
-inline UiLayerSmaaState uiLayerSmaaEnsure(UiLayerSmaa& s, ID3D11Device* dev, uint32_t w, uint32_t h, UiLayerSmaaFail* fail) {
+// Makes what is missing for a layer of w x h and its colour format. A failure is told once per size and format.
+inline UiLayerSmaaState uiLayerSmaaEnsure(UiLayerSmaa& s, ID3D11Device* dev, uint32_t w, uint32_t h, UiLayerSmaaFail* fail,
+                                         DXGI_FORMAT outputFormat = DXGI_FORMAT_R8G8B8A8_UNORM) {
     using namespace uilayersmaa_detail;
-    if (s.ready() && s.w == w && s.h == h) return UiLayerSmaaState::kReady;
-    if (s.failedW == w && s.failedH == h && w && h) return UiLayerSmaaState::kStoodDown;
+    if (s.ready() && s.w == w && s.h == h && s.format == outputFormat) return UiLayerSmaaState::kReady;
+    if (s.failedW == w && s.failedH == h && s.failedFormat == outputFormat && w && h) return UiLayerSmaaState::kStoodDown;
     s.releaseTargets();
     HRESULT hr = S_OK;
     const auto stand = [&](const char* what) {
         s.releaseTargets();
         s.failedW = w;
         s.failedH = h;
+        s.failedFormat = outputFormat;
         if (fail) {
             fail->what = what;
             fail->hr = hr;
         }
         return UiLayerSmaaState::kFailed;
     };
+    if (outputFormat != DXGI_FORMAT_R8G8B8A8_UNORM && outputFormat != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        hr = E_INVALIDARG;
+        return stand("unsupported HUD layer colour format");
+    }
     if (!dev || !w || !h) {
         hr = E_INVALIDARG;
         return stand("no device or an empty layer");
@@ -164,6 +173,8 @@ inline UiLayerSmaaState uiLayerSmaaEnsure(UiLayerSmaa& s, ID3D11Device* dev, uin
     // The edges and the weights are written through typed unordered-access views of their formats.
     if (!formatStores(dev, DXGI_FORMAT_R8G8_UNORM, &hr)) return stand("no typed unordered-access store for R8G8_UNORM on this GPU");
     if (!formatStores(dev, DXGI_FORMAT_R8G8B8A8_UNORM, &hr)) return stand("no typed unordered-access store for R8G8B8A8_UNORM on this GPU");
+    if (outputFormat == DXGI_FORMAT_R16G16B16A16_FLOAT && !formatStores(dev, outputFormat, &hr))
+        return stand("no typed unordered-access store for R16G16B16A16_FLOAT on this GPU");
     if (!s.edgesCs && FAILED(hr = dev->CreateComputeShader(kUiLayerSmaaEdgesBytecode, sizeof(kUiLayerSmaaEdgesBytecode), nullptr, s.edgesCs.GetAddressOf())))
         return stand("the edge shader could not be created");
     if (!s.weightsCs &&
@@ -203,18 +214,23 @@ inline UiLayerSmaaState uiLayerSmaaEnsure(UiLayerSmaa& s, ID3D11Device* dev, uin
     if (!makeTarget(dev, w, h, DXGI_FORMAT_R8G8_UNORM, s.edges, s.edgesUav, s.edgesSrv, &hr)) return stand("the edges texture (R8G8) could not be created");
     if (!makeTarget(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, s.weights, s.weightsUav, s.weightsSrv, &hr))
         return stand("the weights texture (R8G8B8A8) could not be created");
-    if (!makeTarget(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, s.out, s.outUav, s.outSrv, &hr)) return stand("the smoothed output (R8G8B8A8) could not be created");
+    if (!makeTarget(dev, w, h, outputFormat, s.out, s.outUav, s.outSrv, &hr))
+        return stand("the smoothed output could not be created");
     s.w = w;
     s.h = h;
+    s.format = outputFormat;
     return UiLayerSmaaState::kMade;
 }
 
-// The three passes on `layer` (an R8G8B8A8_UNORM view of the size uiLayerSmaaEnsure made the targets for): edges, then weights, then the blend into the output.
+// The three passes on `layer` (a typed view matching uiLayerSmaaEnsure's format and size): edges, then weights, then the blend into the output.
 // Returns the output's view, valid until the next run, or null when there is nothing to run. The compute shader, constant buffer 0, resource slots 0-2 and
 // unordered-access slot 0 are left as the last pass set them (slots 0-2 and the unordered-access slot null); the caller saves and restores those. The two
 // samplers are saved and put back here.
 inline ID3D11ShaderResourceView* uiLayerSmaaRun(UiLayerSmaa& s, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* layer) {
     if (!ctx || !layer || !s.ready() || !s.edgesCs || !s.weightsCs || !s.blendCs) return nullptr;
+    D3D11_SHADER_RESOURCE_VIEW_DESC layerView{};
+    layer->GetDesc(&layerView);
+    if (layerView.Format != s.format || layerView.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) return nullptr;
     ID3D11SamplerState* savedSamplers[2] = {};
     ctx->CSGetSamplers(0, 2, savedSamplers);
     ID3D11SamplerState* samplers[2] = {s.linear.Get(), s.point.Get()};

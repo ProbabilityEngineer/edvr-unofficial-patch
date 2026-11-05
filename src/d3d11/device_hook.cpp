@@ -54,6 +54,8 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "ui_sizing_math.h" // uiDisplaySizeFromXml: DisplaySettings.xml, for the panel budget
 #include "vr_ssaa_gate.h"   // the step-1 Supersampling gate instruments (log only)
 #include "vr_ssaa_hold.h"   // the Supersampling hold's shutdown (the loader slot goes back)
+#include "hdr_fullscreen_mode.h"  // fix.hdr: the display-mode retry an FP16 chain needs
+#include "hdr_output.h"   // fix.hdr: the swapchain's format, the widened post-tone targets, the two substituted shaders and the output transform
 #include "vr_display_observer.h"  // the game window's state (read only) and its handle
 #include "desktop_window.h"  // visual.desktop_window: the eye image drawn into Elite's desktop window at its Present
 #include "mode_watch.h"     // modeWatchFrameBoundary: the 3D mode watch's commit, at the frame boundary
@@ -157,6 +159,8 @@ constexpr size_t kDevCreateSlots         = 11;
 
 constexpr size_t kSwapPresent            = 8;
 constexpr size_t kSwapResizeBuffers = 13, kSwapResizeBuffers1 = 39;
+// fix.hdr's display-mode transaction boundaries (hdr_fullscreen_mode.h).
+constexpr size_t kSwapSetFullscreenState = 10, kSwapResizeTarget = 14;
 constexpr size_t kFactoryCreateSwapChain = 10;
 constexpr size_t kFactory2CreateSwapChainForHwnd = 15;
 
@@ -272,6 +276,9 @@ struct State {
     PFN_Present      realPresent = nullptr;
     PFN_ResizeBuffers realResizeBuffers = nullptr;
     PFN_ResizeBuffers1 realResizeBuffers1 = nullptr;
+    // fix.hdr only: the originals its display-mode scopes forward to.
+    void* realSetFullscreenState = nullptr;
+    void* realResizeTarget = nullptr;
     PFN_CreateSwapChain        realCreateSwapChain = nullptr;
     PFN_CreateSwapChainForHwnd realCreateSwapChainForHwnd = nullptr;
 
@@ -768,6 +775,19 @@ HRESULT STDMETHODCALLTYPE hookedCreatePS(ID3D11Device* self, const void* bytecod
     }
     const HRESULT hr = g_state->realCreatePS(self, bytecode, len, linkage, out);
     if (SUCCEEDED(hr)) g_createShaders.fetch_add(1, std::memory_order_relaxed);
+    // fix.hdr substitutes two of Elite's pixel shaders: the tone shader, so
+    // the frame is composed in HDR, and the final-copy shader, so the tone
+    // shader's 261-nit unit becomes the 500-nit unit the output transform
+    // encodes from. The game is handed the replacement, but the bookkeeping
+    // below runs on its ORIGINAL bytecode and hash, so every recogniser in
+    // EDVR -- the tonemap admission, the copy pair, the HUD layer's tone
+    // re-issue -- goes on seeing the draw it already knows.
+    if (SUCCEEDED(hr) && out && *out && hdrOutputOn()) {
+        if (ID3D11PixelShader* replacement = hdrOutputReplacementPs(bytecode, len)) {
+            static_cast<ID3D11PixelShader*>(*out)->Release();
+            *out = replacement;
+        }
+    }
     guardedBudget(g_createBudget, [&] {
         if (FAILED(hr) || !bytecode || len == 0 || !out || !*out) return;
         const uint64_t hash = fnv1a64(bytecode, len);
@@ -879,6 +899,17 @@ HRESULT STDMETHODCALLTYPE hookedCreateTexture2D(ID3D11Device* self,
         guardedBudget(g_createBudget, [&] { shrunk = uiSurfacesPanelNet(*desc, init != nullptr, &netDesc); });
         if (shrunk) desc = &netDesc;
     }
+    // fix.hdr WIDENS IN PLACE (hdr_output.h): Elite's post-tone RGBA8-typeless
+    // render and compute targets are created r16g16b16a16_typeless, because the
+    // substituted tone shader writes display-referred values above 1.0 and an
+    // 8-bit target clamps them away before the next pass reads them. The game's
+    // own creates only -- EDVR's surfaces choose their own formats -- and the
+    // predicate is format and bind flags with no size test, since the real tone
+    // target is nowhere near the display's size.
+    D3D11_TEXTURE2D_DESC hdrDesc;
+    if (!fromEdvr && desc && self == g_state->device && hdrOutputOn() &&
+        hdrOutputWidenTexture(*desc, &hdrDesc))
+        desc = &hdrDesc;
     const HRESULT hr = createTexture2DForwarded(self, desc, init, out);
     if (self == g_state->device) {
         if (FAILED(hr)) {
@@ -1092,6 +1123,30 @@ HRESULT STDMETHODCALLTYPE hookedDevCreate(ID3D11Device* self, const void* first,
     return hr;
 }
 
+// fix.hdr's three view creates. A body of their own rather than a branch
+// inside hookedDevCreate, because that template also stands behind
+// CreateBuffer -- which the game calls every frame, and whose stack frame the
+// note above it is careful about. This one is installed in place of the plain
+// forward only when fix.hdr is on, so a session without it pays nothing at
+// all.
+//
+// Format is the first member of all three view descs, which is what lets one
+// helper in hdr_output.cpp serve them; the assert holds the ABI to that.
+template <size_t Slot, typename Desc>
+HRESULT STDMETHODCALLTYPE hookedCreateHdrView(ID3D11Device* self, const void* first,
+                                              const void* second, void** out) {
+    static_assert(offsetof(D3D11_SHADER_RESOURCE_VIEW_DESC, Format) == 0 &&
+                      offsetof(D3D11_UNORDERED_ACCESS_VIEW_DESC, Format) == 0 &&
+                      offsetof(D3D11_RENDER_TARGET_VIEW_DESC, Format) == 0,
+                  "every view desc must begin with DXGI_FORMAT Format");
+    Desc scratch;
+    if (self == g_state->device && first && second)
+        second = hdrOutputViewDescFor(
+            const_cast<ID3D11Resource*>(static_cast<const ID3D11Resource*>(first)), second,
+            &scratch, sizeof scratch);
+    return hookedDevCreate<Slot, true>(self, first, second, out);
+}
+
 HRESULT STDMETHODCALLTYPE hookedCreateCS(ID3D11Device* self, const void* bytecode,
                                          SIZE_T len, ID3D11ClassLinkage* linkage,
                                          void** out) {
@@ -1176,6 +1231,19 @@ void flatResizeNote(const char* api, UINT count, UINT width, UINT height, DXGI_F
     }
 }
 
+// fix.hdr's two display-mode entry points. Both forward unconditionally; the
+// module decides whether this chain is one of its own, and does nothing at all
+// when fix.hdr is off.
+HRESULT STDMETHODCALLTYPE hookedHdrSetFullscreenState(IDXGISwapChain* self, BOOL fullscreen,
+                                                      IDXGIOutput* target) {
+    return hdrModeSetFullscreenState(self, g_state->realSetFullscreenState, fullscreen, target);
+}
+
+HRESULT STDMETHODCALLTYPE hookedHdrResizeTarget(IDXGISwapChain* self,
+                                                const DXGI_MODE_DESC* mode) {
+    return hdrModeResizeTarget(self, g_state->realResizeTarget, mode);
+}
+
 HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers(IDXGISwapChain* self, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     if (!runtimeFlatProfile()) {
         cross_profile::enterSite(cross_profile::Site::FlatResizeBuffers, true).stop();   // inactive while VR runs (cross_profile_cost.h)
@@ -1184,6 +1252,10 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers(IDXGISwapChain* self, UINT cou
     const bool ours = self == g_state->swapChain;
     long refs = -1;
     if (ours) { menuFlatResize(); flatRuntimeResize(); refs = flatResizeBackBufferRefs(self); }
+    // fix.hdr: a resize takes the buffers to the format it is given, so being
+    // given the game's would drop the whole frame's output domain. The cached
+    // backbuffer and the colour-space tag do not survive one either.
+    if (ours && hdrOutputOn()) { format = hdrOutputResizeFormat(format); hdrOutputSwapChainChanged(); }
     const HRESULT hr = g_state->realResizeBuffers(self, count, width, height, format, flags);
     if (ours) flatResizeNote("ResizeBuffers", count, width, height, format, flags, hr, refs);
     return hr;
@@ -1197,6 +1269,7 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers1(IDXGISwapChain3* self, UINT c
     const bool ours = static_cast<IDXGISwapChain*>(self) == g_state->swapChain;
     long refs = -1;
     if (ours) { menuFlatResize(); flatRuntimeResize(); refs = flatResizeBackBufferRefs(self); }
+    if (ours && hdrOutputOn()) { format = hdrOutputResizeFormat(format); hdrOutputSwapChainChanged(); }
     const HRESULT hr = g_state->realResizeBuffers1(self, count, width, height, format, flags, masks, queues);
     if (ours) flatResizeNote("ResizeBuffers1", count, width, height, format, flags, hr, refs);
     return hr;
@@ -1810,6 +1883,19 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     if (runtimeFlatProfile()) flatRuntimeBeforePresent();
     if (runtimeFlatProfile()) menuFlatBeforePresent(self, flags);
     if (runtimeFlatProfile()) flatRuntimeWeaponFootprintBeforePresent(self, flags);
+    // fix.hdr's output transform, and it has to be HERE: the game draws its own
+    // 2D interface onto the backbuffer after the final copy, and EDVR's menu
+    // after that, so an encode done any earlier would present those in the
+    // wrong domain. Everything above this line composes in the display-referred
+    // gamma-2.2 domain the substituted tone shader writes.
+    if (hdrOutputOn() && dev) {
+        ID3D11DeviceContext* hdrContext = nullptr;
+        dev->GetImmediateContext(&hdrContext);
+        if (hdrContext) {
+            hdrOutputBeforePresent(self, hdrContext);
+            hdrContext->Release();
+        }
+    }
     // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): for the first frames that reach the resolver, the
     // real Present is bracketed, its result and the device's removed reason written. Both crumbs fall outside the clock
     // reads below, which time the call alone. The gate is one relaxed load.
@@ -1939,7 +2025,22 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
 HRESULT STDMETHODCALLTYPE hookedCreateSwapChain(IDXGIFactory* self, IUnknown* device,
                                                 DXGI_SWAP_CHAIN_DESC* desc,
                                                 IDXGISwapChain** out) {
+    // fix.hdr asks for the buffers it needs instead of the ones Elite asked
+    // for: FP16, so values above 1.0 reach the transform at Present, and
+    // unordered access, so that transform can run in place. A copy, never the
+    // caller's desc: the game reads its own struct back.
+    DXGI_SWAP_CHAIN_DESC hdrDesc;
+    // Read before the swap: afterwards `desc` is the upgraded copy and would
+    // report FP16 as the format the game asked for.
+    const DXGI_FORMAT askedFormat = desc ? desc->BufferDesc.Format : DXGI_FORMAT_UNKNOWN;
+    if (desc && self == g_state->factory && hdrOutputSwapChainDesc(*desc, &hdrDesc))
+        desc = &hdrDesc;
+    const bool upgraded = desc == &hdrDesc;
     const HRESULT hr = g_state->realCreateSwapChain(self, device, desc, out);
+    // A chain created FP16 in place of what the game asked for has to answer
+    // the display-mode question too; hdr_fullscreen_mode.h says why.
+    if (SUCCEEDED(hr) && out && *out && upgraded)
+        hdrModeRecord(*out, askedFormat, hdrDesc.BufferDesc.Format);
     // Only swapchains from the factory we attached to are the game's. A
     // wrapper mod makes its own through a factory sharing this vtable, and
     // hooking one of those would put our frame boundary on somebody else's
@@ -1954,8 +2055,16 @@ HRESULT STDMETHODCALLTYPE hookedCreateSwapChainForHwnd(
     IDXGIFactory2* self, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* restrictTo,
     IDXGISwapChain1** out) {
+    DXGI_SWAP_CHAIN_DESC1 hdrDesc;
+    const DXGI_FORMAT askedFormat1 = desc ? desc->Format : DXGI_FORMAT_UNKNOWN;
+    if (desc && static_cast<void*>(self) == g_state->factory &&
+        hdrOutputSwapChainDesc1(*desc, &hdrDesc))
+        desc = &hdrDesc;
+    const bool upgraded1 = desc == &hdrDesc;
     const HRESULT hr =
         g_state->realCreateSwapChainForHwnd(self, device, hwnd, desc, fs, restrictTo, out);
+    if (SUCCEEDED(hr) && out && *out && upgraded1)
+        hdrModeRecord(*out, askedFormat1, hdrDesc.Format);
     if (SUCCEEDED(hr) && out && *out &&
         static_cast<void*>(self) == g_state->factory) {
         hookSwapChain(*out);
@@ -2710,6 +2819,11 @@ void hookDevice(ID3D11Device* device) {
                         "by hash. Set glare_shader_dump = 0 afterwards -- "
                         "this costs file writes during loading.");
     }
+    // fix.hdr is read before any hook that depends on it: the swapchain's
+    // format is decided the first time the game asks for a swapchain, and the
+    // three view creates below are only replaced when it is on.
+    hdrOutputStartup();
+    if (hdrOutputOn()) hdrOutputAttach(device);
     s.deviceHook.replace(kDevCreateVertexShader, &hookedCreateVS,
                          reinterpret_cast<void**>(&s.realCreateVS));
     s.deviceHook.replace(kDevCreateInputLayout,&hookedCreateLayout,reinterpret_cast<void**>(&s.realCreateLayout));
@@ -2735,10 +2849,20 @@ void hookDevice(ID3D11Device* device) {
     EDVR_HOOK_DEV_CREATE(kDevCreateBuffer, false);
     EDVR_HOOK_DEV_CREATE(kDevCreateTexture1D, false);
     EDVR_HOOK_DEV_CREATE(kDevCreateTexture3D, false);
-    EDVR_HOOK_DEV_CREATE(kDevCreateSrv, true);
-    EDVR_HOOK_DEV_CREATE(kDevCreateUav, true);
-    EDVR_HOOK_DEV_CREATE(kDevCreateRtv, true);
     EDVR_HOOK_DEV_CREATE(kDevCreateDsv, true);
+#define EDVR_HOOK_HDR_VIEW(slot, descType)                                   \
+    s.deviceHook.replace(slot, &hookedCreateHdrView<slot, descType>,         \
+                         reinterpret_cast<void**>(&s.realDevCreate[slot]))
+    if (hdrOutputOn()) {
+        EDVR_HOOK_HDR_VIEW(kDevCreateSrv, D3D11_SHADER_RESOURCE_VIEW_DESC);
+        EDVR_HOOK_HDR_VIEW(kDevCreateUav, D3D11_UNORDERED_ACCESS_VIEW_DESC);
+        EDVR_HOOK_HDR_VIEW(kDevCreateRtv, D3D11_RENDER_TARGET_VIEW_DESC);
+    } else {
+        EDVR_HOOK_DEV_CREATE(kDevCreateSrv, true);
+        EDVR_HOOK_DEV_CREATE(kDevCreateUav, true);
+        EDVR_HOOK_DEV_CREATE(kDevCreateRtv, true);
+    }
+#undef EDVR_HOOK_HDR_VIEW
 #undef EDVR_HOOK_DEV_CREATE
     vrSsaaGateStartup();  // log only: the 3D mode file, the .fxcfg's Supersampling and HMD Quality, once per process
     {
@@ -3116,6 +3240,22 @@ void hookSwapChain(IDXGISwapChain* swapChain) {
     }
     s.swapChainHook.replace(kSwapPresent, &hookedPresent,
                             reinterpret_cast<void**>(&s.realPresent));
+    // fix.hdr: an FP16 chain cannot negotiate a display mode in its own format,
+    // so the two calls that start a mode transaction are taken, and only for
+    // their duration is the output's mode matcher diverted. Not taken when the
+    // feature is off, so a session without it pays nothing.
+    if (hdrOutputOn()) {
+        const bool full = s.swapChainHook.executablePrefix() > kSwapSetFullscreenState &&
+            s.swapChainHook.replace(kSwapSetFullscreenState, &hookedHdrSetFullscreenState,
+                                    &s.realSetFullscreenState);
+        const bool target = s.swapChainHook.executablePrefix() > kSwapResizeTarget &&
+            s.swapChainHook.replace(kSwapResizeTarget, &hookedHdrResizeTarget,
+                                    &s.realResizeTarget);
+        Log::get().note("hdr: display-mode hooks: SetFullscreenState=%u ResizeTarget=%u. "
+                        "Without both, a fullscreen mode change asks for the FP16 format, "
+                        "finds no such display mode, and fails as often as it is asked.",
+                        full ? 1u : 0u, target ? 1u : 0u);
+    }
     if (runtimeScopeIncludesFlat()) {
         const bool resize = s.swapChainHook.replace(kSwapResizeBuffers, &hookedFlatResizeBuffers,
             reinterpret_cast<void**>(&s.realResizeBuffers));
@@ -3314,6 +3454,8 @@ void shutdownDeviceHooks() {
     storeHookSetFlatWorldProbe(false,0);
     flatWorldWitnessShutdown();
     flatTemporalStop();
+    hdrOutputShutdown();
+    hdrModeShutdown();   // fix.hdr's shaders, its backbuffer view and its scratch copy
     // FreeLibrary teardown can run under the loader lock on another thread.
     // Invalidate timing first, then let each owner release its queries without
     // issuing context commands. Normal process exit skips this entire path.

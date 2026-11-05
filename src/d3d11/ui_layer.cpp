@@ -358,12 +358,14 @@ struct LayerDs {
 
 struct Eye {
     UiCoverageCommandCache coverage;
-    // The layer: R8G8B8A8_UNORM, cleared to (0, 0, 0, 1) at the first draw
+    // The post-tone layer: UNORM for stock/VR, FP16 for a flat FP16 door.
+    // Cleared to (0, 0, 0, 1) at the first draw
     // of each frame -- premultiplied colour and transmittance.
     Ptr<ID3D11Texture2D> tex;
     Ptr<ID3D11RenderTargetView> rtv;
     Ptr<ID3D11ShaderResourceView> srv;
     uint32_t w = 0, h = 0;
+    DXGI_FORMAT layerFormat = DXGI_FORMAT_UNKNOWN, doorFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t basisW = 0, basisH = 0;  // the door size the layer was made for
     uint64_t seq = 0;            // the frame whose draws it holds
     uint32_t draws = 0;          // redirected into it for that frame
@@ -1303,21 +1305,25 @@ bool makeTarget(ID3D11Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT format,
 }
 
 bool ensureLayer(ID3D11Device* dev, Eye& e, uint32_t w, uint32_t h, int eye) {
-    if (e.tex && e.w == w && e.h == h) return true;
+    const DXGI_FORMAT format = runtimeFlatProfile() && e.doorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT
+        ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (e.tex && e.w == w && e.h == h && e.layerFormat == format) return true;
     e.coverage.reset();
+    e.smaa.releaseTargets();
     const bool resized = e.tex != nullptr;
     e.w = e.h = 0;
     e.seq = 0;
     e.draws = 0;
     e.chainOpen = false;
     if (!dev || !w || !h ||
-        !makeTarget(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &e.tex, &e.rtv, &e.srv))
+        !makeTarget(dev, w, h, format, &e.tex, &e.rtv, &e.srv))
         return false;
     e.w = w;
     e.h = h;
-    Log::get().note("ui quality: layer: %s eye's layer %s at %ux%u (R8G8B8A8_UNORM, %.1f MB).",
-                    eye == 0 ? "left" : "right", resized ? "re-created" : "created", w, h,
-                    uiLayerMB(uiLayerBytes(w, h)));
+    e.layerFormat = format;
+    Log::get().note("ui quality: layer: %s eye's layer %s at %ux%u (%s, %.1f MB).",
+                    eye == 0 ? "left" : "right", resized ? "re-created" : "created", w, h, viewName(format),
+                    uiLayerMB(uiLayerBytes(w, h, format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u)));
     return true;
 }
 
@@ -1325,7 +1331,9 @@ bool ensureLayerFor(ID3D11DeviceContext* ctx, int eye) {
     Eye& e = g_eye[eye];
     const UiLayerSize s = uiLayerSize(e.door.fullW, e.door.fullH, layerTarget());
     if (!s.w || !s.h) return false;
-    if (e.tex && e.w == s.w && e.h == s.h) {
+    if (e.tex && e.w == s.w && e.h == s.h &&
+        e.layerFormat == (runtimeFlatProfile() && e.doorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT
+            ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM)) {
         e.basisW = e.door.fullW;
         e.basisH = e.door.fullH;
         return true;
@@ -2691,7 +2699,7 @@ bool beginGuarded(ID3D11DeviceContext* ctx, int which) {
 ID3D11ComputeShader* g_cs = nullptr;
 bool g_csTried = false;
 ID3D11Buffer* g_cb = nullptr;
-bool g_fmtChecked[2] = {}, g_fmtOk[2] = {};
+bool g_fmtChecked[3] = {}, g_fmtOk[3] = {};
 // The in-place twin of the composite (kUiLayerCompositeInPlaceBytecode), and whether the GPU loads typed
 // UAVs of each frame view (D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD: an optional capability for every format
 // but R32). Either missing and the in-place composite is simply not taken: the out-of-place one is.
@@ -2798,10 +2806,11 @@ ID3D11UnorderedAccessView* inPlaceUavFor(Eye& e, ID3D11Device* dev, ID3D11Textur
 UiLayerSmaa* edgeSmoothingFor(Eye& e, uint32_t eye, ID3D11Device* dev) {
     UiLayerSmaaFail fail;
     const char* who = runtimeFlatProfile() ? "flat ui layer smaa" : eye == 0 ? "ui layer smaa (left eye)" : "ui layer smaa (right eye)";
-    switch (uiLayerSmaaEnsure(e.smaa, dev, e.w, e.h, &fail)) {
+    switch (uiLayerSmaaEnsure(e.smaa, dev, e.w, e.h, &fail, e.layerFormat)) {
         case UiLayerSmaaState::kMade:
-            Log::get().note("%s: ready at %ux%u -- edges R8G8, weights and output R8G8B8A8, %.1f MB", who, e.w, e.h,
-                            uiLayerMB(uiLayerBytes(e.w, e.h, 10)));
+            Log::get().note("%s: ready at %ux%u -- edges R8G8, weights R8G8B8A8, output %s, %.1f MB", who, e.w, e.h,
+                            viewName(e.layerFormat), uiLayerMB(uiLayerBytes(e.w, e.h,
+                                e.layerFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ? 14u : 10u)));
             return &e.smaa;
         case UiLayerSmaaState::kReady:
             return &e.smaa;
@@ -2820,9 +2829,9 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
                                 bool ownedFrame, const char** why, bool smooth) {
     D3D11_TEXTURE2D_DESC fd{};
     frame->GetDesc(&fd);
-    const DXGI_FORMAT view = uiLayerFrameView(fd.Format);
+    const DXGI_FORMAT view = uiLayerFrameView(fd.Format, runtimeFlatProfile());
     if (view == DXGI_FORMAT_UNKNOWN) {
-        *why = "the frame at the door is not an 8-bit UNORM family (the composite blends "
+        *why = "the frame at the door is not a supported UI color family (the composite blends "
                "in the space the game's UI composites did, and refuses to guess another)";
         return nullptr;
     }
@@ -2873,7 +2882,7 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
         *why = "the composite shader did not compile";
         return nullptr;
     }
-    const int fi = view == DXGI_FORMAT_R8G8B8A8_UNORM ? 0 : 1;
+    const int fi = uiLayerCompositeFormatIndex(view);
     if (!g_fmtChecked[fi]) {
         g_fmtChecked[fi] = true;
         UINT support = 0;
@@ -2901,7 +2910,10 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
     // in-place shader needs is there. Then there is no view for reading the frame, no copy and no
     // output texture: the one view is the frame as a UAV, which the shader loads and stores through.
     ID3D11UnorderedAccessView* inPlaceUav =
-        ownedFrame ? inPlaceUavFor(e, dev.Get(), frame, fd, view, region, fi) : nullptr;
+        // The existing in-place shader uses an UNORM UAV. Preserve FP16 through the
+        // same out-of-place composite instead; no conversion or range clamp.
+        ownedFrame && view != DXGI_FORMAT_R16G16B16A16_FLOAT
+            ? inPlaceUavFor(e, dev.Get(), frame, fd, view, region, fi) : nullptr;
     // The frame's view: over it directly when it allows one, else its region
     // copied out first (the sharpen's rule, for the same reason).
     ID3D11ShaderResourceView* frameSrv = nullptr;
@@ -2978,7 +2990,7 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
     p.layerSize[1] = static_cast<float>(e.h);
     p.outSize[0] = rw;
     p.outSize[1] = rh;
-    p.mode = 0u;
+    p.mode = view == DXGI_FORMAT_R16G16B16A16_FLOAT ? 2u : 0u;
     p.useMult = useMult ? 1u : 0u;
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) || !m.pData) {
@@ -3100,14 +3112,14 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
 bool doorCanComposite(ID3D11Texture2D* source) {
     D3D11_TEXTURE2D_DESC d{};
     source->GetDesc(&d);
-    const DXGI_FORMAT view = uiLayerFrameView(d.Format);
+    const DXGI_FORMAT view = uiLayerFrameView(d.Format, runtimeFlatProfile());
     static bool formatNoted = false, uavNoted = false, shaderNoted = false;
     if (view == DXGI_FORMAT_UNKNOWN || d.SampleDesc.Count != 1 || d.ArraySize != 1 ||
         d.MipLevels != 1) {
         if (!formatNoted) {
             formatNoted = true;
             Log::get().note("ui quality: layer: the pass hands on a %ux%u %s (DXGI_FORMAT %d, %u "
-                            "samples, %u mips) -- not an 8-bit UNORM eye; the layer is not armed "
+                            "samples, %u mips) -- not a supported UI color frame; the layer is not armed "
                             "(the composite blends only in the space the game's UI composites "
                             "did).",
                             d.Width, d.Height, viewName(d.Format), static_cast<int>(d.Format),
@@ -3120,7 +3132,7 @@ bool doorCanComposite(ID3D11Texture2D* source) {
     Ptr<ID3D11DeviceContext> ctx;
     if (dev) dev->GetImmediateContext(&ctx);
     if (!dev || !ctx) return false;
-    const int fi = view == DXGI_FORMAT_R8G8B8A8_UNORM ? 0 : 1;
+    const int fi = uiLayerCompositeFormatIndex(view);
     if (!g_fmtChecked[fi]) {
         g_fmtChecked[fi] = true;
         UINT support = 0;
@@ -3502,7 +3514,7 @@ void logMemory() {
     for (int i = 0; i < 2; ++i) {
         const Eye& e = g_eye[i];
         std::string one;
-        if (e.tex) appendResource(one, "layer colour", e.w, e.h, DXGI_FORMAT_R8G8B8A8_UNORM, &total);
+        if (e.tex) appendResource(one, "layer colour", e.w, e.h, e.layerFormat, &total);
         if (e.out) appendResource(one, "composite output", e.outW, e.outH, e.outFmt, &total);
         if (e.copy) appendResource(one, "frame copy", e.copyW, e.copyH, e.copyFmt, &total);
         if (e.mTex) {
@@ -5943,7 +5955,7 @@ bool uiLayerCrispToneBegin(ID3D11DeviceContext* ctx) {
             crispToneDecline(CrispToneDecline::kLayerBusy, p.vs, p.ps);
             return;
         }
-        // The 8-bit layer, at the HDR layers' size by construction.
+        // The post-tone layer, at the HDR layers' size by construction.
         if (!ensureLayerFor(ctx, p.eye) || !e.rtv) {
             crispToneDecline(CrispToneDecline::kLayerFailed, p.vs, p.ps);
             return;
@@ -6777,6 +6789,7 @@ void uiLayerDoorSeen(uint64_t sequence, uint32_t eye, ID3D11Texture2D* source) {
         }
         D3D11_TEXTURE2D_DESC d{};
         source->GetDesc(&d);
+        e.doorFormat = uiLayerFrameView(d.Format, runtimeFlatProfile());
         if (d.Width != e.door.fullW || d.Height != e.door.fullH) {
             if (e.door.fullW && e.door.fullH) openSizeChange(e.door.fullW, e.door.fullH, d.Width, d.Height);
             if (detail::g_uiLayerLive) {
@@ -7298,7 +7311,8 @@ void releaseDeviceObjects() {
         g_csInPlace = nullptr;
     }
     g_csTried = false;
-    for (int i = 0; i < 2; ++i) g_fmtChecked[i] = g_fmtOk[i] = g_loadChecked[i] = g_loadOk[i] = false;
+    for (int i = 0; i < 3; ++i) g_fmtChecked[i] = g_fmtOk[i] = false;
+    for (int i = 0; i < 2; ++i) g_loadChecked[i] = g_loadOk[i] = false;
 }
 }  // namespace
 

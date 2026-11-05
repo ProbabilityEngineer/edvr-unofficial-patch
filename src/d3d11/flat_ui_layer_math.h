@@ -182,17 +182,18 @@ inline bool flatUiSourceToneShape(uint32_t renderW, uint32_t renderH, uint32_t c
                                   uint32_t hdrW, uint32_t hdrH, uint32_t hdrViewFmt,
                                   bool lut3D, bool hdr2D, bool fullViewport) {
     return renderW && renderH && cachedOutW == renderW && cachedOutH == renderH &&
-           physicalOutW == renderW && physicalOutH == renderH && physicalOutViewFmt == 28 &&
+           physicalOutW == renderW && physicalOutH == renderH && (physicalOutViewFmt == 28 || physicalOutViewFmt == 10) &&
            hdrW == renderW && hdrH == renderH && hdrViewFmt == 26 && lut3D && hdr2D && fullViewport;
 }
-// Diagnostics can report an unverified 8-bit LDR view format; admission above
-// keeps the exact format 28 that the two E894 pairs physically used.
+// The post-tone output may be UNORM or typed FP16 (EDHDR startup). This is
+// UI-only admission; HDR input, LUT, viewport and physical HUD identity still qualify it.
+// Diagnostics also report other unverified 8-bit LDR view formats.
 inline bool flatUiUnknownSourceToneShape(uint32_t renderW, uint32_t renderH, uint32_t cachedOutW, uint32_t cachedOutH,
                                          uint32_t physicalOutW, uint32_t physicalOutH, uint32_t physicalOutViewFmt,
                                          uint32_t hdrW, uint32_t hdrH, uint32_t hdrViewFmt,
                                          bool lut3D, bool hdr2D, bool fullViewport) {
     return renderW && renderH && cachedOutW == renderW && cachedOutH == renderH &&
-           physicalOutW == renderW && physicalOutH == renderH && flatUiIs8bit(physicalOutViewFmt) &&
+           physicalOutW == renderW && physicalOutH == renderH && (flatUiIs8bit(physicalOutViewFmt) || physicalOutViewFmt == 10) &&
            hdrW == renderW && hdrH == renderH && hdrViewFmt == 26 && lut3D && hdr2D && fullViewport;
 }
 inline bool flatUiSourceToneDirectHud(const void* cachedHud, const void* physicalHud, const void* physicalInput) {

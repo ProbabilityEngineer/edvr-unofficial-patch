@@ -356,10 +356,12 @@ struct State {
     Image color, rawOverlay, depth[2], motion, rejection, expected, output[2], outputDomain[2];
     uint32_t width=0, height=0, outWidth=0, outHeight=0, evalWidth=0, evalHeight=0, current=0;
     // The spatial recovery's own images (spatialImages), for a frame the temporal set above does not fit: the input copy by format ([0] the
-    // copy route's RGBA8, [1] the HDR route's R11G11B10F) at the render size, and the copy route's output at the evaluation size. Each is made
+    // copy route's RGBA8 or FP16, [1] the HDR route's R11G11B10F) at the render size, and the copy route's output at the evaluation size. Each is made
     // on first use and kept; resources() never touches them.
     Image spatialColor[2], spatialOutput;
     uint32_t spatialColorW[2]={0,0}, spatialColorH[2]={0,0}, spatialOutW=0, spatialOutH=0;
+    DXGI_FORMAT spatialColorFormat[2]={DXGI_FORMAT_UNKNOWN,DXGI_FORMAT_UNKNOWN};
+    DXGI_FORMAT spatialOutFormat=DXGI_FORMAT_UNKNOWN;
     // The steady-detail depth check's previous depth (FlatMonoResolveFrame::steadyDetail). TAA keeps last frame's depth in depth[current^1]
     // already; the other backends keep none, so depth[1] is made on the first frame that asks, and while frames ask, the depth the
     // backend is handed alternates between the two images: depthLast is the one the previous frame wrote (0 for every frame that did not ask).
@@ -367,6 +369,7 @@ struct State {
     uint64_t lastFrame=0;
     FlatMonoResolveMode mode=FlatMonoResolveMode::Taa;
     bool hdr=false;   // the resources below are the HDR route's (an HDR input copy, fp16 outputs)
+    bool fp16=false;  // post-tone FP16 copy route; independent of the HDR write-back route
     bool history=false;
     bool untrustedCoverageLast=false;
     bool opticalPriorWorldOnly=false; // diagnostic-only provenance for the depth image committed at lastFrame
@@ -525,7 +528,12 @@ bool preflightMetadataValid(const FlatMonoResolvePreflight& f,const char** reaso
         return false;
     }
     const bool colorFormat=f.hdr ? f.colorViewFormat==DXGI_FORMAT_R11G11B10_FLOAT
-        : (f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM || f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        : (f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM || f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+           f.colorViewFormat==DXGI_FORMAT_R16G16B16A16_FLOAT);
+    // XeSS's existing bridge accepts RGBA8 or pre-tone R11 color, not FP16 copy input.
+    if(!f.hdr && f.colorViewFormat==DXGI_FORMAT_R16G16B16A16_FLOAT && f.mode==FlatMonoResolveMode::Xess) {
+        if(reason)*reason="flat-preflight-xess-fp16-copy-unsupported";return false;
+    }
     const bool depthFormat=f.depthViewFormat==DXGI_FORMAT_R32_FLOAT ||
         f.depthViewFormat==DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
         f.depthViewFormat==DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
@@ -665,7 +673,7 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
     // cache keyed only on mode/R/D would hand a D-sized cache to a cut E, and
     // the finish pass would fill only the E rectangle of it.
     if(g.width==f.renderWidth && g.height==f.renderHeight && g.outWidth==f.outputWidth &&
-       g.outHeight==f.outputHeight && g.mode==f.mode && g.hdr==f.hdr &&
+       g.outHeight==f.outputHeight && g.mode==f.mode && g.hdr==f.hdr && g.fp16==f.fp16 &&
        g.evalWidth==evalW && g.evalHeight==evalH)return true;
     ++stats.allocations;
     g.color={};g.rawOverlay={};g.depth[0]={};g.depth[1]={};g.motion={};g.rejection={};g.expected={};g.output[0]={};g.output[1]={};
@@ -692,6 +700,13 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
             make(g.output[0],DXGI_FORMAT_R16G16B16A16_FLOAT,true) &&
             (!taa || (make(g.output[1],DXGI_FORMAT_R16G16B16A16_FLOAT,true) && make(g.depth[1],DXGI_FORMAT_R32_FLOAT) &&
                       make(g.expected,DXGI_FORMAT_R32_FLOAT)));
+    } else if(f.fp16) {
+        // Copy-compatible with either FP16 resource family member (9/10); no UNORM round trip.
+        made=make(g.color,DXGI_FORMAT_R16G16B16A16_FLOAT,false,false) && make(g.depth[0],DXGI_FORMAT_R32_FLOAT) &&
+            make(g.motion,DXGI_FORMAT_R16G16_FLOAT) && make(g.rejection,DXGI_FORMAT_R8_UNORM) &&
+            make(g.output[0],DXGI_FORMAT_R16G16B16A16_FLOAT,true) &&
+            make(g.output[1],DXGI_FORMAT_R16G16B16A16_FLOAT,true) &&
+            (!taa || (make(g.depth[1],DXGI_FORMAT_R32_FLOAT) && make(g.expected,DXGI_FORMAT_R32_FLOAT)));
     } else {
         made=make(g.color,DXGI_FORMAT_R8G8B8A8_UNORM,false,false) && make(g.depth[0],DXGI_FORMAT_R32_FLOAT) &&
             make(g.motion,DXGI_FORMAT_R16G16_FLOAT) && make(g.rejection,DXGI_FORMAT_R8_UNORM) &&
@@ -701,18 +716,20 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
     }
     if(!made)return fail(reason,"flat-resolve-texture-create-failed");
     g.width=f.renderWidth;g.height=f.renderHeight;g.outWidth=f.outputWidth;g.outHeight=f.outputHeight;g.mode=f.mode;
-    g.evalWidth=evalW;g.evalHeight=evalH;g.hdr=f.hdr;
+    g.evalWidth=evalW;g.evalHeight=evalH;g.hdr=f.hdr;g.fp16=f.fp16;
     return true;
 }
 // `hdr`: the colour is the game's HDR scene target H itself (FlatMonoResolveFrame::hdr): an R11G11B10_FLOAT shader
 // view over an R11G11B10_FLOAT texture the game also renders into, because the result goes back through a render-target
 // view the resolver makes over it.
-bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,bool color,ComPtr<ID3D11Texture2D>& out,bool hdr=false,bool requireTarget=true) {
+bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,bool color,ComPtr<ID3D11Texture2D>& out,bool hdr=false,bool requireTarget=true,bool fp16=false) {
     if(!view)return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv{};view->GetDesc(&srv);
     if(srv.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D || srv.Texture2D.MostDetailedMip!=0 ||
        (srv.Texture2D.MipLevels!=1 && srv.Texture2D.MipLevels!=UINT(-1)))return false;
-    if(color && !hdr && srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)return false;
+    if(color && hdr && fp16)return false;
+    if(color && !hdr && (fp16 ? srv.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT :
+       (srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)))return false;
     if(color && hdr && srv.Format!=DXGI_FORMAT_R11G11B10_FLOAT)return false;
     if(!color && srv.Format!=DXGI_FORMAT_R32_FLOAT && srv.Format!=DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS &&
        srv.Format!=DXGI_FORMAT_R24_UNORM_X8_TYPELESS && srv.Format!=DXGI_FORMAT_R16_UNORM)return false;
@@ -720,6 +737,7 @@ bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,
     if(FAILED(resource.As(&out)))return false;
     D3D11_TEXTURE2D_DESC desc{};out->GetDesc(&desc);
     ComPtr<ID3D11Device> device;out->GetDevice(device.GetAddressOf());
+    if(color && fp16 && desc.Format!=DXGI_FORMAT_R16G16B16A16_TYPELESS && desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT)return false;
     if(color && hdr && (desc.Format!=DXGI_FORMAT_R11G11B10_FLOAT ||
        (requireTarget && !(desc.BindFlags&D3D11_BIND_RENDER_TARGET))))return false;
     return device.Get()==g.device.Get() && desc.Width==width && desc.Height==height && desc.MipLevels==1 &&
@@ -944,6 +962,7 @@ static FlatMonoResolvePreflightResult preflightBody(ID3D11Device* device,
     frame.outputWidth=planned.outputWidth;frame.outputHeight=planned.outputHeight;
     frame.mode=planned.mode;
     frame.hdr=planned.hdr;
+    frame.fp16=!planned.hdr && planned.colorViewFormat==DXGI_FORMAT_R16G16B16A16_FLOAT;
     frame.evalWidth=planned.evalWidth;frame.evalHeight=planned.evalHeight;
     // The HDR route's pixel-shader half is part of what must be ready before a frame may be jittered for it.
     if(planned.hdr && !initializeHdr(device,&why)) {
@@ -970,7 +989,7 @@ static FlatMonoResolvePreflightResult preflightBody(ID3D11Device* device,
         g.width==planned.renderWidth && g.height==planned.renderHeight &&
         g.outWidth==planned.outputWidth && g.outHeight==planned.outputHeight &&
         g.evalWidth==plannedEvalW && g.evalHeight==plannedEvalH &&
-        g.mode==planned.mode && g.hdr==planned.hdr;
+        g.mode==planned.mode && g.hdr==planned.hdr && g.fp16==frame.fp16;
     if(!result.spatialFallbackReady) {
         result.status=FlatMonoResolvePreflightStatus::FallbackUnavailable;
         result.reason="flat-preflight-spatial-output-not-ready";
@@ -1074,6 +1093,8 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     // The HDR route resolves at E = R into H itself (section 81): a render below the output, or a mode that evaluates
     // on another grid, is the copy route's.
     const bool hdr=f.hdr;
+    const bool hdrColor=hdr||f.fp16;
+    if(f.fp16 && f.mode==FlatMonoResolveMode::Xess)return fail(reason,"flat-xess-fp16-copy-unsupported");
     if(hdr && (evalW!=f.renderWidth || evalH!=f.renderHeight || f.renderWidth<f.outputWidth || f.renderHeight<f.outputHeight))
         return fail(reason,"flat-resolve-hdr-requires-render-size-evaluation");
     const bool untrusted=f.untrustedCameraCoverage!=nullptr;
@@ -1110,7 +1131,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     const bool overlay=f.cleanColor || f.overlayCoverage;
     if(overlay && (!hdr || !f.cleanColor || !f.overlayCoverage))
         return fail(reason,"flat-resolve-overlay-input-pair-incomplete");
-    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color,hdr) ||
+    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color,hdr,true,f.fp16) ||
        !inputTexture(f.depth,f.renderWidth,f.renderHeight,false,depth))return fail(reason,"flat-resolve-input-view-mismatch");
     if(overlay) {
         if(!inputTexture(f.cleanColor,f.renderWidth,f.renderHeight,true,cleanColor,true,false) ||
@@ -1395,10 +1416,10 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         const float sy=std::sqrt(f.camera[0][1]*f.camera[0][1]+f.camera[1][1]*f.camera[1][1]+f.camera[2][1]*f.camera[2][1]);
         ok=fsr3Evaluate(context,f.slot,g.color.texture.Get(),g.depth[depthIndex].texture.Get(),g.motion.texture.Get(),g.rejection.texture.Get(),
             g.output[0].texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,
-            sdkNear,(std::numeric_limits<float>::max)(),2*std::atan(1/sy),reason,true,hdr);
+            sdkNear,(std::numeric_limits<float>::max)(),2*std::atan(1/sy),reason,true,hdrColor);
     } else {
         ok=dlaaEvaluate(context,static_cast<int>(f.slot),g.color.texture.Get(),g.depth[depthIndex].texture.Get(),g.motion.texture.Get(),g.output[0].texture.Get(),
-            g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);
+            g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdrColor);
     }
     }
     backendStep.result("ok=%u reason=%s",ok?1u:0u,(reason && *reason)?*reason:"none");
@@ -1616,8 +1637,12 @@ static bool ensureSmaa(ID3D11Device* device,uint32_t renderW,uint32_t renderH) {
 // resources(), and the temporal set is never touched.
 bool spatialImages(const FlatMonoResolveFrame& f,uint32_t evalW,uint32_t evalH,Image** in,Image** out,const char** reason) {
     const bool hdr=f.hdr;
+    const bool fp16=!hdr && f.fp16;
+    const DXGI_FORMAT colorFormat=hdr?DXGI_FORMAT_R11G11B10_FLOAT:
+        fp16?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
+    const DXGI_FORMAT outputFormat=fp16?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_TYPELESS;
     *in=*out=nullptr;
-    if(g.color.texture && g.color.srv && g.hdr==hdr && g.width==f.renderWidth && g.height==f.renderHeight &&
+    if(g.color.texture && g.color.srv && g.hdr==hdr && g.fp16==f.fp16 && g.width==f.renderWidth && g.height==f.renderHeight &&
        (hdr || (g.output[1].texture && g.output[1].srv && g.output[1].uav && g.evalWidth==evalW && g.evalHeight==evalH))) {
         *in=&g.color;
         if(!hdr)*out=&g.output[1];
@@ -1625,24 +1650,26 @@ bool spatialImages(const FlatMonoResolveFrame& f,uint32_t evalW,uint32_t evalH,I
     }
     const size_t k=hdr?1:0;
     Image& color=g.spatialColor[k];
-    if(!color.texture || g.spatialColorW[k]!=f.renderWidth || g.spatialColorH[k]!=f.renderHeight) {
+    if(!color.texture || g.spatialColorW[k]!=f.renderWidth || g.spatialColorH[k]!=f.renderHeight ||
+       g.spatialColorFormat[k]!=colorFormat) {
         color={};g.spatialColorW[k]=g.spatialColorH[k]=0;
-        if(!image(g.device.Get(),f.renderWidth,f.renderHeight,hdr?DXGI_FORMAT_R11G11B10_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM,color,false,
+        if(!image(g.device.Get(),f.renderWidth,f.renderHeight,colorFormat,color,false,
                   "spatial-color")) {
             color={};
             return fail(reason,"flat-spatial-texture-create-failed");
         }
-        g.spatialColorW[k]=f.renderWidth;g.spatialColorH[k]=f.renderHeight;++stats.spatialAllocations;
+        g.spatialColorW[k]=f.renderWidth;g.spatialColorH[k]=f.renderHeight;
+        g.spatialColorFormat[k]=colorFormat;++stats.spatialAllocations;
     }
     *in=&color;
     if(hdr)return true;
-    if(!g.spatialOutput.texture || g.spatialOutW!=evalW || g.spatialOutH!=evalH) {
+    if(!g.spatialOutput.texture || g.spatialOutW!=evalW || g.spatialOutH!=evalH || g.spatialOutFormat!=outputFormat) {
         g.spatialOutput={};g.spatialOutW=g.spatialOutH=0;
-        if(!image(g.device.Get(),evalW,evalH,DXGI_FORMAT_R8G8B8A8_TYPELESS,g.spatialOutput,true,"spatial-output")) {
+        if(!image(g.device.Get(),evalW,evalH,outputFormat,g.spatialOutput,true,"spatial-output")) {
             g.spatialOutput={};
             return fail(reason,"flat-spatial-texture-create-failed");
         }
-        g.spatialOutW=evalW;g.spatialOutH=evalH;++stats.spatialAllocations;
+        g.spatialOutW=evalW;g.spatialOutH=evalH;g.spatialOutFormat=outputFormat;++stats.spatialAllocations;
     }
     *out=&g.spatialOutput;
     return true;
@@ -1668,7 +1695,7 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
     if(!initialize(device,context,reason))return false;
     if(hdr && !initializeHdr(device,reason))return false;
     ComPtr<ID3D11Texture2D> color;
-    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color,hdr))return fail(reason,"flat-spatial-input-view-mismatch");
+    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color,hdr,true,f.fp16))return fail(reason,"flat-spatial-input-view-mismatch");
     // The spatial recovery runs on the route's evaluation grid, exactly as
     // the resolve it substitutes for (section 72's supersample routes).
     const auto route = flatResolveRoute(f.mode, f.renderWidth, f.renderHeight, f.outputWidth, f.outputHeight);
@@ -1791,7 +1818,7 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
             context->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
         }
         g.lastSpatialEasu=true;
-        *output=(colorDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?spatialOut->srgb:spatialOut->srv).Get();
+        *output=(spatialOut->srgb && colorDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?spatialOut->srgb:spatialOut->srv).Get();
         (*output)->AddRef();
         return true;
     }
@@ -1806,7 +1833,7 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
     ID3D11UnorderedAccessView* target=spatialOut->uav.Get();context->CSSetUnorderedAccessViews(4,1,&target,nullptr);
     context->CSSetShader(g.spatial.Get(),nullptr,0);
     context->Dispatch((evalW+7)/8,(evalH+7)/8,1);
-    *output=(colorDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?spatialOut->srgb:spatialOut->srv).Get();
+    *output=(spatialOut->srgb && colorDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?spatialOut->srgb:spatialOut->srv).Get();
     (*output)->AddRef();
     return true;
 }
