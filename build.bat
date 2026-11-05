@@ -1795,6 +1795,13 @@ REM Actual installer boundary: far executable entries, real CodeHook, all four r
     "src\common\code_hook.cpp" /link /INCREMENTAL:NO /OPT:REF kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: native preview installer test build failed & exit /b 1 )
 "%BUILD%\native_preview_install_test.exe" --self-test || exit /b 1
+REM Shared near reservation: constrained policy and real CodeHook ownership/protection.
+%CC% /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\flatstationarycamera\\" ^
+    /Fe"%BUILD%\near_alloc_test.exe" "tools\near_alloc_test\near_alloc_test.cpp" ^
+    "src\common\code_hook.cpp" /link /INCREMENTAL:NO /OPT:REF kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: near allocation test build failed & exit /b 1 )
+"%BUILD%\near_alloc_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_c2_coexist_test
@@ -4370,4 +4377,3 @@ if errorlevel 1 ( echo [edvr] ERROR: addon_manager_test build failed & exit /b 1
 "%BUILD%\addon_manager_test.exe" --dry-run || exit /b 1
 "%BUILD%\addon_manager_test.exe" --self-test || exit /b 1
 exit /b 0
-

@@ -63,6 +63,13 @@ public:
     // is unchanged. A false result refuses installation. A prepared pointer is
     // valid only if install ultimately succeeds; discard it on failure.
     using Prepare = bool (*)(void* trampoline, void* context) noexcept;
+    // Writable caller-owned page, separately protected from target/replacement.
+    // Never freed by CodeHook, even on failure/uninstall. The owner must keep
+    // it alive while any hook or original-function forward can reach it.
+    struct BorrowedTrampoline {
+        uint8_t* address;
+        size_t bytes;
+    };
     CodeHook() = default;
     ~CodeHook() { uninstall(); }
 
@@ -81,12 +88,13 @@ public:
     // must treat false as "run without this fix", never as "try harder".
     bool install(void* target, void* replacement, void** origOut,
                  const char* who, Prepare prepare = nullptr,
-                 void* prepareContext = nullptr);
+                 void* prepareContext = nullptr,
+                 const BorrowedTrampoline* borrowed = nullptr);
 
     // Put the original bytes back, but ONLY if the patch is still ours: another
     // tool that hooked the same function after us owns those bytes now, and
     // restoring them would cut it out exactly the way this class exists to
-    // avoid being cut out. The trampoline is then released.
+    // avoid being cut out. Only owned trampolines are then released.
     void uninstall();
 
     bool  installed() const { return m_installed; }
@@ -111,6 +119,7 @@ private:
     uint8_t  m_original[16] = {};
     size_t   m_stolen = 0;
     bool     m_installed = false;
+    bool     m_ownsTrampoline = true;
     char     m_refusal[320] = {};
 };
 
