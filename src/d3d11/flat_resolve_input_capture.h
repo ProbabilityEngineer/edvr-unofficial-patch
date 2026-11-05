@@ -63,8 +63,6 @@ class FlatResolveInputCapture {
         switch(mode) {
         case FlatMonoResolveMode::Dlaa: return "dlaa";
         case FlatMonoResolveMode::Dlss: return "dlss";
-        case FlatMonoResolveMode::Mfx: return "mfx";
-        case FlatMonoResolveMode::Mfx4: return "mfx4";
         case FlatMonoResolveMode::Fsr: return "fsr";
         case FlatMonoResolveMode::Xess: return "xess";
         default: return "taa";
