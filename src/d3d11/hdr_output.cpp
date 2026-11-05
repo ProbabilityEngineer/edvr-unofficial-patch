@@ -16,6 +16,7 @@
 #include "../common/config.h"
 #include "../common/log.h"
 #include "hdr_output_rules.h"
+#include "hdr_shader_identity.h"
 #include "hdr_output_shaders.h"
 
 namespace edvr {
@@ -72,47 +73,6 @@ constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr DXGI_FORMAT kWideTypeless = DXGI_FORMAT_R16G16B16A16_TYPELESS;
 constexpr DXGI_FORMAT kWideFloat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-// Elite's tone pixel shader and its final-copy pixel shader, by identity.
-// Three fields each, all required: length, CRC-32 and FNV-1a-64, exactly the
-// predicate EDHDR shipped (edelite-hdr/src/edhdr.cpp toneBlobMatches /
-// copyBlobMatches). A partial match must never substitute -- a shader that is
-// nearly the tone shader is a different shader.
-//
-// The tone variant EBD83636 and the composite 1AD30D44 are deliberately NOT
-// matched: EDHDR left them vanilla and this port does the same.
-constexpr size_t kTonePsLen = 3192;
-constexpr uint32_t kTonePsCrc = 0xD7E646E3u;
-constexpr uint64_t kTonePsFnv = 0x75028D69C8E1B8E9ull;
-constexpr size_t kCopyPsLen = 268;
-constexpr uint32_t kCopyPsCrc = 0xD6A846C8u;
-constexpr uint64_t kCopyPsFnv = 0x3C4D865B7031B44Cull;
-
-// CRC-32, reflected, polynomial 0xEDB88320 -- the table the identities above
-// were measured with. EDVR's own fnv1a64 (log.h) is the other half.
-uint32_t crc32Of(const void* data, size_t bytes) {
-    static uint32_t table[256];
-    static bool built = false;
-    if (!built) {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
-        }
-        built = true;
-    }
-    const unsigned char* p = static_cast<const unsigned char*>(data);
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < bytes; ++i) c = table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-
-bool blobIs(const void* bytecode, size_t length, size_t wantLen, uint32_t wantCrc,
-            uint64_t wantFnv) {
-    if (!bytecode || length != wantLen) return false;
-    if (crc32Of(bytecode, length) != wantCrc) return false;
-    return fnv1a64(bytecode, length) == wantFnv;
-}
-
 // ---- state ---------------------------------------------------------------
 
 struct State {
@@ -126,6 +86,7 @@ struct State {
     ID3D11Device* device = nullptr;
 
     ID3D11PixelShader* tonePs = nullptr;
+    ID3D11PixelShader* toneNoBloomPs = nullptr;
     ID3D11PixelShader* copyPs = nullptr;
 
     // The transform, in place.
@@ -180,8 +141,8 @@ PfnD3DCompile compiler() {
     return fn;
 }
 
-// Compile one of the four, entry point "m" (EDHDR's convention, and the text
-// is unedited). Returns a blob the caller releases, or null with the
+// Compile an HDR shader, entry point "m" (EDHDR's convention).
+// Returns a blob the caller releases, or null with the
 // compiler's own message in the log.
 ID3DBlob* compileHlsl(const char* source, const char* name, const char* profile,
                       const char* entry, const D3D_SHADER_MACRO* macros) {
@@ -724,19 +685,25 @@ void hdrOutputAttach(ID3D11Device* device) {
     if (!g.on || !device || g.device) return;
     g.device = device;
 
-    // The two substitutions first, because the game creates its pixel shaders
+    // The substitutions first, because the game creates its pixel shaders
     // while it loads and a replacement that is not ready by then is a
     // replacement that never happens.
     ID3DBlob* tone = compileHlsl(kHdrToneReplacementPs, "tone_hdr_ps", "ps_5_0", "m", nullptr);
+    const D3D_SHADER_MACRO noBloom[] = {{"HDR_TONE_NO_BLOOM", "1"}, {nullptr, nullptr}};
+    ID3DBlob* toneNoBloom = compileHlsl(kHdrToneReplacementPs, "tone_hdr_no_bloom_ps",
+                                      "ps_5_0", "m", noBloom);
     ID3DBlob* copy = compileHlsl(kHdrCopyScalePs, "copyscale_ps", "ps_5_0", "m", nullptr);
-    bool ok = tone && copy;
+    bool ok = tone && toneNoBloom && copy;
     if (ok) {
         ok = SUCCEEDED(device->CreatePixelShader(tone->GetBufferPointer(),
                                                  tone->GetBufferSize(), nullptr, &g.tonePs)) &&
+             SUCCEEDED(device->CreatePixelShader(toneNoBloom->GetBufferPointer(),
+                                                 toneNoBloom->GetBufferSize(), nullptr, &g.toneNoBloomPs)) &&
              SUCCEEDED(device->CreatePixelShader(copy->GetBufferPointer(),
                                                  copy->GetBufferSize(), nullptr, &g.copyPs));
     }
     if (tone) tone->Release();
+    if (toneNoBloom) toneNoBloom->Release();
     if (copy) copy->Release();
     if (ok) ok = buildTransformShaders(g.wantPq);
 
@@ -785,12 +752,20 @@ ID3D11PixelShader* hdrOutputReplacementPs(const void* bytecode, size_t length) {
     if (!g.on || g.shadersFailed || !bytecode || !length) return nullptr;
     ID3D11PixelShader* replacement = nullptr;
     const char* which = nullptr;
-    if (g.tonePs && blobIs(bytecode, length, kTonePsLen, kTonePsCrc, kTonePsFnv)) {
+    switch (hdrShaderKind(bytecode, length)) {
+    case HdrShaderKind::ToneBloom:
         replacement = g.tonePs;
-        which = "tone";
-    } else if (g.copyPs && blobIs(bytecode, length, kCopyPsLen, kCopyPsCrc, kCopyPsFnv)) {
+        which = "tone (bloom)";
+        break;
+    case HdrShaderKind::ToneNoBloom:
+        replacement = g.toneNoBloomPs;
+        which = "tone (no bloom)";
+        break;
+    case HdrShaderKind::Copy:
         replacement = g.copyPs;
         which = "final copy";
+        break;
+    default: break;
     }
     if (!replacement) return nullptr;
     replacement->AddRef();
@@ -799,7 +774,7 @@ ID3D11PixelShader* hdrOutputReplacementPs(const void* bytecode, size_t length) {
         Log::get().note("hdr: the game's %s pixel shader (len %zu crc 0x%08X) was handed "
                         "the HDR replacement; EDVR still records the original hash, so "
                         "every recogniser sees the draw it expects", which, length,
-                        crc32Of(bytecode, length));
+                        hdrShaderIdentity(bytecode, length).crc);
     return replacement;
 }
 
@@ -828,6 +803,7 @@ void hdrOutputBeforePresent(IDXGISwapChain* swapChain, ID3D11DeviceContext* cont
 void hdrOutputShutdown() {
     releaseBackBuffer();
     if (g.tonePs) { g.tonePs->Release(); g.tonePs = nullptr; }
+    if (g.toneNoBloomPs) { g.toneNoBloomPs->Release(); g.toneNoBloomPs = nullptr; }
     if (g.copyPs) { g.copyPs->Release(); g.copyPs = nullptr; }
     if (g.encodeCs) { g.encodeCs->Release(); g.encodeCs = nullptr; }
     if (g.drawVs) { g.drawVs->Release(); g.drawVs = nullptr; }

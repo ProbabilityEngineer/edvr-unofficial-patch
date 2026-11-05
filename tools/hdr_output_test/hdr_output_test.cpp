@@ -4,6 +4,10 @@
 // the oracle's two bind classes, the exclusions, and a view that cannot be mapped exactly. Built from the repo root by build.bat's
 // :rig_hdr_output_test. Windows-free: it includes only the pure header. --dry-run writes nothing; --self-test runs the checks.
 #include "../../src/d3d11/hdr_output_rules.h"
+#include "../../src/d3d11/hdr_shader_identity.h"
+#ifdef _WIN32
+#include "hdr_shader_tests.h"
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -206,23 +210,50 @@ void theFlatProfileReadsTheHdrKeys() {
           "the flat profile names advanced.hdr_encode, so the domain A/B can be set");
 }
 
+void shaderIdentities() {
+    using namespace edvr;
+    const auto hello = hdrShaderIdentity("hello", 5);
+    check(hello.fnv == 0xa430d84680aabd0bull && hello.crc == 0x3610a686u,
+          "HDR uses standard FNV-1a and reflected CRC32, not EDVR's legacy offset");
+    const HdrShaderIdentity ids[] = {
+        {3192, 0xD7E646E3u, 0x75028D69C8E1B8E9ull},
+        {2244, 0x6BE69EF3u, 0x3B86E25519AA3DA6ull},
+        {268, 0xD6A846C8u, 0x3C4D865B7031B44Cull}};
+    const HdrShaderKind kinds[] = {HdrShaderKind::ToneBloom, HdrShaderKind::ToneNoBloom, HdrShaderKind::Copy};
+    for (unsigned i = 0; i < 3; ++i) {
+        check(hdrShaderMatch(ids[i]) == kinds[i], "exact identity chooses its own HDR variant");
+        auto bad = ids[i]; ++bad.bytes;
+        check(hdrShaderMatch(bad) == HdrShaderKind::None, "wrong length refuses");
+        bad = ids[i]; bad.crc ^= 1;
+        check(hdrShaderMatch(bad) == HdrShaderKind::None, "wrong CRC refuses");
+        bad = ids[i]; bad.fnv ^= 1;
+        check(hdrShaderMatch(bad) == HdrShaderKind::None, "wrong FNV refuses");
+    }
+    check(hdrShaderKind(nullptr, 268) == HdrShaderKind::None, "null bytecode refuses");
+    check(hdrShaderKind("hello", 5) == HdrShaderKind::None, "unrelated shader refuses");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     bool selfTest = false;
+    bool hardware = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dry-run") == 0) {
             std::printf("hdr_output_test: would run the widening predicate and the view-format "
                         "rule over the tone target, the exclusions and the inexact views, and read "
                         "src/common/flat_profile_keys.h to check fix.hdr is gated in, and run the "
-                        "display-mode retry rule. "
+                        "display-mode retry rule and HDR shader identities. On Windows, also "
+                        "compile/reflect tone variants and execute exposure on WARP "
+                        "(--hardware-self-test selects the hardware adapter). "
                         "Writes nothing.\n");
             return 0;
         }
         if (std::strcmp(argv[i], "--self-test") == 0) selfTest = true;
+        if (std::strcmp(argv[i], "--hardware-self-test") == 0) { selfTest = true; hardware = true; }
     }
     if (!selfTest) {
-        std::printf("usage: hdr_output_test [--dry-run] [--self-test]\n");
+        std::printf("usage: hdr_output_test [--dry-run] [--self-test] [--hardware-self-test]\n");
         return 0;
     }
     theToneTargetWidens();
@@ -232,6 +263,12 @@ int main(int argc, char** argv) {
     theCheapTestAgreesWithTheRule();
     theDisplayModeRetry();
     theFlatProfileReadsTheHdrKeys();
+    shaderIdentities();
+#ifdef _WIN32
+    hdr_shader_tests::run(check, hardware);
+#else
+    (void)hardware;
+#endif
     if (g_fails) {
         std::printf("FAIL: hdr_output_test %d of %d checks failed\n", g_fails, g_checks);
         return 1;
@@ -241,6 +278,7 @@ int main(int argc, char** argv) {
                 "UNORM and sRGB views map exactly, UINT/SNORM/SINT map inexactly and say so; views over "
                 "unwidened targets are left alone; the flat profile names fix.hdr and "
                 "advanced.hdr_encode; the display-mode retry fires only on no-such-FP16-mode "
-                "inside our own transaction)\n", g_checks);
+                "inside our own transaction; HDR-local identities match exactly; on Windows "
+                "tone resource contracts and exposure execution also pass)\n", g_checks);
     return 0;
 }

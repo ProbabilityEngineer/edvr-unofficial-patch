@@ -4144,12 +4144,13 @@ echo [edvr] === hdr_output_test.exe ===
 REM fix.hdr's two decisions (src\d3d11\hdr_output_rules.h; docs\edvr-unified-hdr-2026-11-01.md): which of Elite's textures are created
 REM wide and what format a view over a widened one gets. Both fail silently when wrong -- a widening predicate that misses leaves the
 REM HDR clamped to SDR while every other log line still says the feature ran -- so the rig holds the tone target at its real size, both
-REM bind classes, every exclusion, and the views that cannot be mapped exactly. No Windows API: the rig includes only the pure header.
+REM bind classes, every exclusion, and the views that cannot be mapped exactly. Also check HDR-local identities,
+REM compile/reflect both tone variants, and execute the production exposure function on WARP.
 if not exist "%OBJ%\hdroutput" mkdir "%OBJ%\hdroutput"
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\hdroutput\\" /Fe"%OBJ%\hdroutput\hdr_output_test.exe" ^
     "tools\hdr_output_test\hdr_output_test.cpp" ^
-    /link /INCREMENTAL:NO
+    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib dxguid.lib
 if errorlevel 1 ( echo [edvr] ERROR: hdr_output_test build failed & exit /b 1 )
 "%OBJ%\hdroutput\hdr_output_test.exe" --dry-run || exit /b 1
 "%OBJ%\hdroutput\hdr_output_test.exe" --self-test || exit /b 1

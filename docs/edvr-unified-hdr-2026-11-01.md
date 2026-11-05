@@ -2,6 +2,11 @@
 
 ## RC6 private backport
 
+The baseline description below refers to `28c50afb`. The combined
+`private/rc6-hdr` branch now also contains the independent engine-hook and
+HDR correction candidates documented below; combined CI/gameplay validation
+is not yet established.
+
 `private/rc6-hdr` starts at `v0.22.0-rc.6` and carries only the shared FP16
 rendering/composition work and HDR display output, plus private-repository
 policies. The HDR output implementation matches the supplied Polski source
@@ -38,6 +43,73 @@ The synthetic `near_alloc_test` passes under CrossOver; x64 engine-source and
 x64/ARM64EC CodeHook/test syntax checks pass. ARM64EC engine-source checking
 still encounters baseline `__readgsdword` incompatibility. No flight validation
 or new CI result is claimed.
+
+### HDR investigation (`private/rc6-hdr-output-fix`)
+
+This branch starts at successful CI revision `28c50afb`, separately from
+`private/rc6-hdr-engine-hooks`. Keep the owner's display preset, game gamma,
+and vanilla DXMT unchanged; assume the HDR defect is in EDVR.
+
+Apple's [color-space guidance](https://developer.apple.com/documentation/metal/using-color-spaces-to-display-hdr-content)
+shows PQ BT.2020 content tagged `itur_2100_PQ` on an EDR-enabled Metal layer.
+The XDR preset's **SDR** gamma 2.2 is not the HDR transfer function; 1600 nits
+is a peak capability, not diffuse white.
+
+For context, DXMT `647b0020` scales linear HDR light by current / potential EDR
+headroom before re-encoding PQ. A local query returned 1.2 / 16 = 0.075,
+outside the reported flight. This does not establish flight attenuation or
+a DXMT defect, and is not authorization to compensate for it in EDVR.
+
+Audit EDVR's tone replacement, Elite gamma/exposure inputs, scene-copy
+261-to-500-nit unit conversion, and final output encoding. Verify both 1:1 and
+0.75-scale routing without assuming the same copy shader executes. These
+initial investigation notes preceded the local candidate described below.
+
+#### Confirmed matching defects in the reported flights
+
+All three 22:34–22:40 logs have zero `HDR replacement` messages, while the
+final PQ encoder runs. The output draw uses copy PS `DED8796049C7BB4A`.
+Its captured 268-byte DXBC has CRC `D6A846C8` and standard FNV-1a-64
+`3C4D865B7031B44C`: exactly the HDR copy constants. However, `blobIs` calls
+EDVR's `fnv1a64`, whose historical offset basis is `1469598103934665603`,
+not the standard `14695981039346656037`. On those same bytes it produces
+`DED8796049C7BB4A`, so the exact copy shader is rejected. Do not change the
+global EDVR hash: existing shader identities depend on that convention.
+
+The selected tone PS in these logs is `FEE777E92850B390`, captured as 2244
+bytes with CRC `6BE69EF3`. The imported shader comments identify this CRC as
+the no-bloom tone variant, but `hdrOutputReplacementPs` only supports the
+3192-byte `D7E646E3` variant. Fixing the hash convention alone therefore will
+not provide the required tone replacement for the observed scene path.
+The bloom variant cannot simply be assigned to it: the replacement samples
+bloom and must be adapted to the actual variant's input contract.
+
+These establish incomplete EDVR HDR processing, not the numerical cause of
+the user's gamma compensation. No claim is made yet about corrected image
+brightness, and no live configuration or shader-capture file was modified.
+
+#### Local correction candidate
+
+HDR matching now uses standard FNV locally, leaving EDVR's global shader
+identities intact. The captured tone and copy blobs both select their intended
+replacement through the production matcher. The no-bloom tone variant is
+compiled separately: scene `t1/s1`, constants `b2`, input `TEXCOORD1`, no
+`t2/s2`, bloom blend, or post-blend clamp. Its display transform and luminance
+constants remain the imported HDR ones.
+
+Disassembly also exposed an exposure transcription error: the engine subtracts
+`cb2[8].x + (cb2[8].z != 0 ? 1.4 : 0)` from `log2(8*v0.z)`, whereas the
+imported helper added it. RenoDX's `tonemap_0xD7E646E3.ps_5_0.hlsl` confirms
+the same subtraction for bloom. The shared helper now follows that operation.
+
+Local checks: 54 portable rule/identity checks; 73 checks under CrossOver
+hardware, including compiling/reflecting both tone variants and GPU execution
+of the production exposure helper against the captured instruction arithmetic.
+x64 and ARM64EC HDR source/test syntax checks pass. `build.bat` runs the same
+Windows shader checks on WARP; full Windows CI has not run for this candidate.
+There is no gameplay validation yet: corrected brightness, scale-path routing,
+and the remaining imported display-transform assumptions are not established
+by these tests. No DXMT, display preset, game gamma, or live settings changed.
 
 ## Original status
 
