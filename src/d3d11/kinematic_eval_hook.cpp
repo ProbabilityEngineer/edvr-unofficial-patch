@@ -4,6 +4,8 @@
 #include "engine_velocity_emit.h"
 #include "engine_motion_cpu.h"   // the CPU instrument: EDVR's own work in every relay below is clocked per call
 #include "../common/code_hook.h"
+#include "../common/near_alloc_constrained.h"
+#include "../common/runtime_profile.h"
 #include "../common/game_build.h"   // issue 124: every exe address below through gameRva; the pins through gamePinMatches
 #include "../common/log.h"
 #include <windows.h>
@@ -120,6 +122,7 @@ struct HookEntry {
     // so a plain bool could observe a half-installed entry (finding 5).
     std::atomic<bool> ready{false};
     bool noted=false;   // an unknown build: its found / not found line is written (under g_installMutex)
+    bool reservationUnsafe=false; // terminal allocation/cleanup refusal, under g_installMutex
 };
 
 // Job bodies behind the run thunks (recovered from the hash-verified exe,
@@ -195,7 +198,7 @@ bool readQueueNodes(uintptr_t descriptor,uint32_t entry,uint32_t exit,
 // file is not touched; if one changes, change both.
 constexpr size_t kRelayBytes=44,kOriginalLiteral=36;
 
-uint8_t* allocateRelay(uintptr_t target) noexcept {
+uint8_t* allocateRelay(uintptr_t target, size_t bytes) noexcept {
     SYSTEM_INFO info{};GetSystemInfo(&info);
     const uintptr_t granularity=info.dwAllocationGranularity;
     const uintptr_t floor=reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
@@ -215,7 +218,7 @@ uint8_t* allocateRelay(uintptr_t target) noexcept {
             if(candidate>UINTPTR_MAX-(granularity-1))break;
             candidate=(candidate+granularity-1)&~(granularity-1);
             if(candidate<limit && candidate<end && end-candidate>=4096) {
-                auto* p=static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate),4096,
+                auto* p=static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate),bytes,
                                                          MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
                 if(p)return p;
             }
@@ -931,15 +934,45 @@ bool targetValid(uintptr_t base) noexcept {
 }
 
 bool installOne(HookEntry& entry,uintptr_t base) noexcept {
+    if(entry.reservationUnsafe)return false;
     const uintptr_t rva=gameRva(static_cast<uint32_t>(entry.rva));
     // An unknown build's line comes after the outcome, so "found" never precedes a refusal (nothing is logged on build 334925).
     if(!rva){noteUnknownBuild(entry,0,nullptr);return false;}
-    entry.relay=allocateRelay(base+rva);
+    const HMODULE ntdll=GetModuleHandleW(L"ntdll.dll");
+    const bool shared=runtimeFlatProfile() && ntdll && GetProcAddress(ntdll,"wine_get_version");
+    SYSTEM_INFO layout{};
+    if(shared) {
+        GetSystemInfo(&layout);
+        if(layout.dwPageSize<4096 || layout.dwAllocationGranularity/layout.dwPageSize<2 ||
+           layout.dwAllocationGranularity%layout.dwPageSize) {
+            entry.reservationUnsafe=true;
+            Log::get().note("kinematic hooks: %s unsupported shared reservation layout; standing down",entry.name);
+            return false;
+        }
+    }
+    const size_t bytes=shared?layout.dwAllocationGranularity:4096;
+    // The relay owns one block; its far-end page is borrowed by CodeHook.
+    // Keeping them far apart also separates protection on Wine hosts whose
+    // native pages are larger than the Windows page reported by GetSystemInfo.
+    if(shared) {
+        const auto result=near_alloc::allocateConstrained(base+rva,bytes,entry.name);
+        if(result.safetyRefusal()) {entry.reservationUnsafe=true;return false;}
+        entry.relay=reinterpret_cast<uint8_t*>(result.address);
+    }
+    if(!entry.relay)entry.relay=allocateRelay(base+rva,bytes);
     if(!entry.relay){noteUnknownBuild(entry,rva,"no relay page could be reserved near it");return false;}
     buildRelay(entry.relay,entry.gate?entry.gate:static_cast<const void*>(&evalGate),entry.callback);
+    const CodeHook::BorrowedTrampoline trampoline{
+        shared?entry.relay+bytes-layout.dwPageSize:nullptr,layout.dwPageSize};
+    if(shared)
+        Log::get().note("kinematic hooks: %s shared reservation base=%p bytes=%zu trampoline=%p",
+                       entry.name,static_cast<void*>(entry.relay),bytes,static_cast<void*>(trampoline.address));
     if(!entry.hook.install(reinterpret_cast<void*>(base+rva),entry.relay,nullptr,
-                           entry.name,&prepareRelay,&entry)) {
-        VirtualFree(entry.relay,0,MEM_RELEASE);
+                           entry.name,&prepareRelay,&entry,shared?&trampoline:nullptr)) {
+        if(!VirtualFree(entry.relay,0,MEM_RELEASE)) {
+            entry.reservationUnsafe=true;
+            Log::get().note("kinematic hooks: %s reservation release failed error=%lu; no retry",entry.name,GetLastError());
+        }
         entry.relay=nullptr;
         noteUnknownBuild(entry,rva,"CodeHook refused it (its own line names why)");
         return false;

@@ -24,6 +24,21 @@ conversions in the device hook and a `near` macro collision in temporal tests).
 The implementation and flight notes below describe the original HDR work,
 not a validation receipt for this RC6 backport.
 
+### RC6 engine-hook follow-up (`private/rc6-hdr-engine-hooks`)
+
+The three 2026-11-05 22:34–22:40 flights accepted no temporal frames. Camera
+installation succeeded, but the kinematic build hook failed nearby allocation,
+leaving engine motion stood down and `engine-source-not-ready` at resolve.
+The local candidate uses one allocation-granularity block per kinematic hook
+under flat Wine: constrained `VirtualAlloc2`, then the original fixed search
+only on ordinary failure/unavailability. CodeHook borrows the final page;
+the relay owns the complete block. Unsafe placement/cleanup failures stop
+that entry's retries. Native Windows/VR retain their old path.
+The synthetic `near_alloc_test` passes under CrossOver; x64 engine-source and
+x64/ARM64EC CodeHook/test syntax checks pass. ARM64EC engine-source checking
+still encounters baseline `__readgsdword` incompatibility. No flight validation
+or new CI result is claimed.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.

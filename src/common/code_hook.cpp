@@ -230,7 +230,8 @@ void CodeHook::refusedf(const char* fmt, ...) {
 }
 
 bool CodeHook::install(void* target, void* replacement, void** origOut,
-                       const char* who, Prepare prepare, void* prepareContext) {
+                       const char* who, Prepare prepare, void* prepareContext,
+                       const BorrowedTrampoline* borrowed) {
     const char* label = who ? who : "?";
     m_refusal[0] = 0;
     if (m_installed || !target || !replacement) return false;
@@ -302,7 +303,24 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
     // does not have to be within reach of the trampoline once both have been
     // placed by the allocator.
     const size_t trampolineBytes = stolen + 14;
-    uint8_t* const tramp = allocateNear(target, trampolineBytes);
+    if (borrowed) {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        if (!borrowed->address || !info.dwPageSize ||
+            reinterpret_cast<uintptr_t>(borrowed->address) % info.dwPageSize ||
+            borrowed->bytes < trampolineBytes ||
+            reinterpret_cast<uintptr_t>(replacement) / info.dwPageSize ==
+                reinterpret_cast<uintptr_t>(borrowed->address) / info.dwPageSize ||
+            reinterpret_cast<uintptr_t>(target) / info.dwPageSize ==
+                reinterpret_cast<uintptr_t>(borrowed->address) / info.dwPageSize) {
+            refusedf("CodeHook %s: invalid caller-owned trampoline page. Not hooked.", label);
+            return false;
+        }
+    }
+    uint8_t* const tramp = borrowed ? borrowed->address : allocateNear(target, trampolineBytes);
+    const auto releaseTrampoline = [&] {
+        if (!borrowed) VirtualFree(tramp, 0, MEM_RELEASE);
+    };
     if (!tramp) {
         refusedf(
             "CodeHook %s: no executable memory could be reserved within reach "
@@ -360,7 +378,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
         if (!built) {
             refusedf("CodeHook %s: the trampoline for the prologue at %p could not be written. Not hooked.", label, target);
         }
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        releaseTrampoline();
         return false;
     }
 
@@ -374,7 +392,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
             "CodeHook %s: could not make the trampoline at %p executable (err "
             "%lu). Not hooked.",
             label, tramp, GetLastError());
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        releaseTrampoline();
         return false;
     }
     FlushInstructionCache(GetCurrentProcess(), tramp, trampolineBytes);
@@ -390,7 +408,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
             "CodeHook %s: %p is more than two gigabytes from the replacement, "
             "which a five-byte jump cannot reach. Not hooked.",
             label, target);
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        releaseTrampoline();
         return false;
     }
 
@@ -412,7 +430,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
             prepared = prepare(tramp, prepareContext);
         }) || !prepared)) {
         refusedf("CodeHook %s: replacement preparation refused; target unchanged.", label);
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        releaseTrampoline();
         return false;
     }
 
@@ -420,7 +438,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
     if (!VirtualProtect(code, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         refusedf("CodeHook %s: could not make %p writable (err %lu). Not "
                         "hooked.", label, target, GetLastError());
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        releaseTrampoline();
         return false;
     }
     // ONE aligned store. Every other thread sees either the old eight bytes or
@@ -431,7 +449,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
     DWORD ignored = 0;
     VirtualProtect(code, 8, oldProtect, &ignored);
     if (!wrote) {
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        releaseTrampoline();
         return false;
     }
     FlushInstructionCache(GetCurrentProcess(), code, 8);
@@ -439,6 +457,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
     m_target = target;
     m_replacement = replacement;
     m_trampoline = tramp;
+    m_ownsTrampoline = !borrowed;
     m_stolen = stolen;
     m_installed = true;
     if (origOut) *origOut = tramp;
@@ -502,12 +521,13 @@ void CodeHook::uninstall() {
     }
 
     // Freed only when the patch was still ours; see above.
-    if (ours && m_trampoline) VirtualFree(m_trampoline, 0, MEM_RELEASE);
+    if (ours && m_trampoline && m_ownsTrampoline) VirtualFree(m_trampoline, 0, MEM_RELEASE);
     m_trampoline = nullptr;
     m_target = nullptr;
     m_replacement = nullptr;
     m_stolen = 0;
     m_installed = false;
+    m_ownsTrampoline = true;
 }
 
 }  // namespace edvr
