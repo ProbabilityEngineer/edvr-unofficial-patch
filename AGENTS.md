@@ -14,12 +14,10 @@ Git operations for this checkout belong to
 After a session or checkout move, verify the repository with
 `git rev-parse --show-toplevel` and `git remote -v` before making changes.
 
-Entire is enabled here. Consult `entire agent-help`, then
-`entire agent-help <command>` for current subcommand usage; do not guess flags.
-Approved commits capture the AI session as a checkpoint automatically. Create
-manual checkpoints only when requested. Ask before Entire setup or destructive
-operations such as enable, disable, clean or auth. Keep automatic session
-pushing disabled unless the owner explicitly authorizes changing it.
+Entire is enabled. Keep session/checkpoint uploads disabled unless the owner
+explicitly authorizes them. Ask before changing Entire configuration or
+performing destructive operations. When using Entire commands, consult
+`entire agent-help` for current usage.
 
 ## Private derivative and publication
 
