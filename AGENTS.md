@@ -7,6 +7,20 @@ EDVR provides Elite Dangerous: Odyssey graphics fixes through a `d3d11.dll`
 proxy and its own OpenXR runtime through `Openvr/win64/openvr_api.dll`.
 Test flights are expensive: distinguish local checks from actual game results.
 
+## Repository identity and Entire
+
+Git operations for this checkout belong to
+`ProbabilityEngineer/edvr-unofficial-patch`, not the separate DXMT repository.
+After a session or checkout move, verify the repository with
+`git rev-parse --show-toplevel` and `git remote -v` before making changes.
+
+Entire is enabled here. Consult `entire agent-help`, then
+`entire agent-help <command>` for current subcommand usage; do not guess flags.
+Approved commits capture the AI session as a checkpoint automatically. Create
+manual checkpoints only when requested. Ask before Entire setup or destructive
+operations such as enable, disable, clean or auth. Keep automatic session
+pushing disabled unless the owner explicitly authorizes changing it.
+
 ## Private derivative and publication
 
 This checkout is the owner's private derivative. AI-assisted implementation
@@ -79,6 +93,10 @@ If a required project gate exceeds the approved scope, explain once and ask.
 - The full build runs tests and installer gates and produces a receipt.
   `--dll-only` is receipt-guarded; it is not a shortcut around validation.
   Compile-only outputs are not validated release artifacts.
+- For an explicitly unvalidated graphics test DLL, the supported path is
+  `--compile-only --graphics-only`, or manual CI input `graphics_only=true`;
+  see `docs/building.md`. This does not require full validation and is not a
+  bypass of receipt-guarded promotion. Remote CI still requires approval.
 - Use `tools/worktree.py` for build-capable worktrees. Never use a bare
   stash/pop across worktrees; the stash stack is shared.
 - Read targeted source and documentation ranges. Delegate only when useful
