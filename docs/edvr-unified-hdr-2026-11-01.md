@@ -248,6 +248,192 @@ the same 30 baseline MinGW/MSVC incompatibility errors, with identical error
 messages before and after this change. These are local checks, not a complete
 Windows DLL build or gameplay confirmation.
 
+#### Diagnostic flight, 2026-11-06 16:08
+
+`edvr_gfx_20261106_160852.log` confirms diagnostic revision `8b001cc0`,
+build `6AEDF5F7`. Tracking ran with zero attachment failures, cap skips, or
+pending attachments at all twelve reporting snapshots. Screenshots show the
+same Elite PID at 12.21, 12.94, and 12.81 GB with elevated system pressure;
+these are not additive to the texture estimates.
+
+Between 16:10:22 and 16:14:23, externally created tracked textures increased
+from 5879 to 6701 live objects, and from 3282 to 4966 MiB estimated live bytes
+(+822 objects, +1684 MiB). EDVR-image-created textures stayed at 49 live
+objects / 1473 MiB: created/destroyed changed from 54/5 to 56/7, with the two
+later creates balanced by destruction. This measures live-object growth,
+not merely backing-memory growth while all tracked object lifetimes stay flat.
+
+Identified growing external groups include shader-resource-only, mipmapped
+1024x1024 BC4, BC5, and BC7 textures. For example, BC4_UNORM increased from
+229 to 408 live objects. These descriptors are outside the HDR widening
+predicate (which requires RGBA8 typeless and render-target/UAV binding).
+The descriptor table filled, so some objects are aggregated into overflow
+groups; their counts/bytes remain in the totals, but their individual
+descriptors cannot be recovered from this report.
+
+Creation origin does not identify the retaining owner. EDVR could retain
+game-created resources/views, and legitimate streaming caches or runtime
+retention remain alternatives. The next source target is the reference/
+cache lifetime of externally created shader-resource textures, not another
+speculative FSR/HDR working-target reset. No additional flight is needed
+just to reproduce or confirm the growth already measured here.
+
+Source follow-up: the inspected `FlatContextState` capture/restore path releases
+all captured shader-stage SRV arrays, both on restore and destruction.
+`flat_runtime.cpp`'s binding-view cache has six slots and resets an old owning
+reference before replacing it. Foreground motion keeps current/previous draw
+collections with frame rollover, rather than appending indefinitely; its
+inspected retained views concern geometry/history. GUI/draw packet snapshots
+have explicit arming/frame or byte/count limits and cleanup paths. These
+checks found no growing material-texture container or demonstrated missing
+release in those paths; they are not an exhaustive proof against EDVR retention.
+
+A separate ambiguity is cache pressure: the same flight reports a roughly
+28754 MB local GPU budget throughout, with only 8042 MB used (28%) at
+16:14:28 despite the system-pressure screenshots. The local DXMT source's
+`QueryVideoMemoryInfo` returns Metal's `recommendedMaxWorkingSetSize()` as
+budget and `currentAllocatedSize()` as usage, for either memory segment.
+This source inspection is not verification of the bundled binary's exact
+implementation, nor evidence that Elite bases its texture eviction on that
+API. A cache remaining below its perceived GPU budget while the whole machine
+is under pressure remains a live alternative to lost references. No budget,
+Wine-process, runtime, or live-setting change was made.
+
+The user subsequently supplied an important control: the symptom does not
+occur without EDVR. Treat EDVR-triggered retention/behavior as the leading
+scope, not ordinary game caching as a sufficient explanation. The budget
+observation above does not supersede that control.
+
+The raw-reference follow-up inspected the HDR resource/view forwarding,
+binding resolution, shader-resource scans, and explicit state capture.
+`hdrOutputViewFormat` rejects BC formats before acquiring any reference and
+uses `GetType`/`GetDesc`, not `QueryInterface`. Inspected raw `GetResource`
+and `QueryInterface` success paths release their results or transfer them
+into owning smart pointers. `binding_shadow.cpp` deliberately permits a
+bounded leak if SEH interrupts resolution, but the flight contains no
+`FAULT ABSORBED` or `bindingShadow.resolve` reports to support that path.
+No ordinary-path unmatched reference was established by this pass.
+
+A focused test in the existing HDR rig now exercises production
+`FlatContextState` with 96 fresh BC4/BC5/BC7 textures, six shader stages,
+upper SRV slots, normal restoration, repeated capture, and abandonment
+through the destructor. Every iteration returns the tagged live-texture
+count to zero. The local CrossOver run requesting WARP passed 104 checks;
+71 portable checks and ARM64EC test syntax also passed. This does not test
+Elite's live DXMT workload or establish balanced references in every hook.
+Only tests and these notes changed; the installed diagnostic runtime remains
+`8b001cc0`. The remaining gap is which caller retains the growing external
+textures, which creation/destruction totals alone cannot identify.
+
+#### HDR-output-off / 1.5x supersampling flight, 2026-11-06 16:56
+
+The user reports HDR disabled for `edvr_gfx_20261106_165621.log`; revision
+remains `8b001cc0` / `6AEDF5F7`. Startup resizes use format 28 (RGBA8 UNORM),
+and no `hdr:` replacement/output-enable lines appear, consistent with that
+setting. The engine's pre-tonemap HDR scene and the AA route named "flat hdr
+route" are separate from the disabled HDR-output feature.
+
+The scene changes to 4536x2946 at 16:58:04 for a 3024x1964 output, confirming
+1.5x scaling on each axis (2.25x scene pixels). At 16:58:21 -> 17:00:21,
+external tracked live textures grow from 6135 / 4990 MiB to 6661 / 6882 MiB;
+EDVR's tracked set remains 37 / 1131 MiB through 17:03:52. Later external
+byte samples fluctuate near that level, then fall near the end, rather than
+forming an uninterrupted ramp. The screenshot shows Elite at 14.78 GB.
+All attachment-failure and tag-cap-skip samples remain zero.
+
+Importantly, all 74 route windows with a 4536x2946 HDR scene (16:58:07 to
+17:04:14) report zero treated/reached/captured/backend frames: 6051 frames
+declined before capture/backend execution. A startup FSR context exists, but
+ongoing FSR treatment is not required for the growth in this interval. This
+does not mean AA was off: its shared observation/engine-hook paths can remain
+enabled before treatment admission. The user's planned AA-off comparison
+therefore remains discriminating. Keep HDR and supersampling fixed for that
+pair and start a fresh process; this flight's absolute memory footprint/rate
+is not directly comparable with the earlier lower-resolution HDR-on flights.
+
+#### AA-off control, 2026-11-06 17:35
+
+The user reports no reproducible leak with AA disabled in the INI.
+`edvr_gfx_20261106_173558.log` confirms `8b001cc0` / `6AEDF5F7` and
+`flat runtime: mode=off`. Read-only inspection of the supplied live
+`edvr-flat.ini` shows `[fix] temporal_aa = off` and `hdr = off`.
+The log explicitly reports the UI-quality, sharp-weapons, and shield-ripple
+paths waiting/not live because temporal AA is off; it contains no FSR context
+creation or engine-motion reports.
+
+Across roughly 11.5 minutes, tracked EDVR textures total three created and
+three destroyed, with zero remaining at later snapshots. Compare the previous
+AA-selected/HDR-output-off run's stable 37 textures / 1131 MiB. The control
+also includes 5079 ordinary occluded Presents by the last status sample,
+with zero TEST calls; occlusion alone does not reproduce the reported symptom.
+
+External texture churn still occurs without the reported leak: at 17:40:28,
+46476 creates minus 39711 destructions leaves 6765 live; at 17:43:28,
+58953 minus 52166 leaves 6787 live, with estimated bytes almost unchanged
+(6243614636 -> 6246416369). Later bytes rise and then fall, alongside eight
+swapchain resizes across the session. Local GPU usage is 9416 MB at 17:43:59
+and 8908 MB at 17:46:59; these are not perfectly matched fixed-resolution
+samples against the earlier flight.
+
+This narrows the leading scope to AA-enabled machinery, including work
+before backend admission and dependent layers. It also corrects the earlier
+interpretation: external live-texture growth alone is not leak-specific,
+because substantial growth/churn also occurs in this no-symptom control.
+The comparison must distinguish additional persistent AA working memory
+from progressive retention; neither an AA-owned missing release nor a
+particular hook is established yet. No live settings were changed by the agent.
+
+#### AA-enabled pre-resolve path review, 2026-11-06
+
+Source and existing-flight inspection, not a new gameplay test:
+
+- `flatRuntimePresent` configures engine motion from AA selection before
+  resolve preflight. `FlatRuntimeDrawScope` can call
+  `engineVelocityFlatBeginDraw` and submit foreground captures before the
+  later `treatHdr` rejection on `s.observing`. This is actual work, not merely
+  an enabled setting: the HDR-off/AA-selected flight's final foreground SDK
+  domain report records 29604 submitted GPU identity captures. The 17:04:13
+  engine family report records 41078 substituted draws for
+  VS `BBE58E40FE88EC80` / PS `DB3E8D20CF53FBC0`. That is the previously
+  investigated decal family, not proof that it draws the missing glass signs.
+- Correction to the earlier conversational explanation: the first recorded
+  observation entry is `projection-preparation-refused` at 16:56:43.876,
+  before the 16:58:04 switch to 4536x2946. Supersampling is not established
+  as the cause of treatment refusal. "Observation" also does not mean all
+  AA-related rendering is pass-through.
+- Foreground capture count is workload, not retained-object count.
+  `FlatForegroundMotion::beginFrame` rolls current draws into previous draws
+  and advances history; capture passes use `FlatContextState` restoration.
+  The flight's history reports peak at only 12 records / 4174272 logical
+  position bytes, commonly 8 / 2782848, and show aged-record reclamation.
+  `AnimatedVertexHistory` separately bounds its reusable position-buffer pool
+  to 32 MiB and 128 pairs per history; a reused pair may be larger than the
+  logical record count. These are not total physical GPU-memory measurements,
+  but do not show a growing foreground-record container accounting for GiBs.
+- The material-SRV reference in the engine overlay guard is held in
+  `g_bound.gameSrv3` / `g_guardVerified.game` (ComPtr). `guardRestoreT3`
+  releases the bound reference; `engineVelocityFlatFrameEnd` forgets the
+  memo. `flatRuntimeBeforePresent` flushes substitutions before calling that
+  frame-end cleanup. Normal inspected getter/restore paths balance their
+  references; this does not prove every live DXMT interaction is correct.
+- A distinct intentional retaining owner exists for game **buffers**:
+  `notePrimaryBufferCreated` pins up to 16 dynamic structured buffers with
+  stride 336 in `g_primaryMaps`, released on engine-motion stand-down.
+  The flight reports zero overflow. This is not an identified owner of the
+  growing material textures, nor an unbounded container; do not remove the
+  pins without preserving the private-copy ownership contract.
+- Sharp-weapons and shield-ripple report no applicable draws in the sampled
+  late windows; ripple reports no displacement target allocated. The panel
+  sizing hook reports zero supersampling-factor moves. Those logs weaken
+  these particular mechanisms relative to the actively executing engine
+  substitutions/copy path; they do not clear every UI-layer path.
+
+No missing release or justified runtime correction was established. The
+remaining distinction is AA's persistent resources and active pre-resolve
+work versus genuine progressive retention, including driver backing storage
+not measured by texture-object tags. No runtime code, settings, or artifacts
+were changed for this review.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.
