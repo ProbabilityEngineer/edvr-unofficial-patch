@@ -7,7 +7,7 @@ namespace edvr::aa_memory {
 
 // Private diagnostic build only; not a user setting. The control branch keeps
 // record velocity enabled. The isolation branch changes only this constant.
-inline constexpr bool kIsolateEngineRecords = false;
+inline constexpr bool kIsolateEngineRecords = true;
 inline constexpr bool engineRecordsAllowed(bool flat, bool isolate = kIsolateEngineRecords) {
     return !flat || !isolate;
 }
