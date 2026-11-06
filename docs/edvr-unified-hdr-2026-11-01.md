@@ -586,6 +586,80 @@ has **not been implemented or tested**. Further remote CI and deployment need
 separate approval; no speculative signage fix, blanket cache reset or permanent
 INI switch is part of this step.
 
+#### Focused buffer-interception source review after the isolation flight
+
+Reviewed the working tree at `86ae14a4`, following the real Map/Unmap hooks
+in `vscreen.cpp`, the adapters in `flat_runtime.cpp`, `flat_map_bounce.h`,
+and the production projection runtime, binding plans and shadow bank.
+
+- **Registration:** `FlatProjectionRuntime::track` accepts only constant
+  buffers, 16-byte aligned and at most 65536 bytes. It retains them through
+  ComPtr in a 64-entry table. Rejected QueryInterface results are local ComPtrs.
+  The CPU shadow bank allocates its 64 x 65536-byte payload once (4 MiB);
+  full-write counters do not represent accumulating allocations.
+- **Map completion:** bounce uses eight reusable slots, each containing a
+  64 KiB payload plus a 64 KiB independent seed/baseline (about 1 MiB total,
+  plus metadata). An installed mapping retains its resource and context.
+  `beginUnmap` copies to the original driver pointer and returns an RAII
+  lease; `finish` releases both references. The hooked Unmap finishes that
+  lease before the real Unmap on the normal, foreign-context and internal
+  paths. Unmap cleanup is not conditional on AA remaining enabled.
+- **Abnormal mappings:** remapping releases an abandoned slot; wrong-context
+  Unmap preserves it for the matching context and trips the diagnostic;
+  overdue mappings trip at Present rather than invalidating a pointer still
+  owned by the game. This retention is bounded to eight slots. The flight's
+  zero open-at-Present/trip counters do not support that case here.
+- **Replacement:** unpromoted, unmapped, nonpending tracked buffers are
+  evicted under capacity pressure. `discard` releases their shadow identity,
+  private-buffer state and original ComPtr. Plan retirement removes logical
+  pins so entries can become evictable.
+- **Retention caveat:** `retirePlan` marks a plan unused and demotes its
+  references, but does not immediately clear the plan's saved original /
+  replacement ComPtrs. Those can remain until plan reinitialization or
+  runtime destruction. This is bounded by the fixed plan arrays, not a
+  demonstrated unbounded leak. The isolation flight's projection-readiness
+  report at the brief AA-off transition shows zero prepared projections;
+  it does not establish that these saved plans caused the growth. The new
+  allocation diagnostic's preflight counter measures resolver preflights,
+  not projection-plan creation. No speculative plan-lifetime change was made.
+- **Stand-down:** leaving the watched work tier or resizing/stopping deletes
+  the projection runtime and releases its tables, plans and shadow storage.
+  The process-lived bounce core deliberately survives with its fixed slot
+  storage so any outstanding Unmap can still finish.
+
+Local checks: the existing native `flat_map_bounce_test --self-test` passed
+with zero failures, including reference balance, mode changes, wrong-context
+handling, remapping and randomized transactions. Both production projection
+implementation files passed x64 MinGW syntax checks.
+
+The full existing projection-test header pulls in the missing generated
+`temporal_shader_bytecode.h`, so it could not be built locally. Instead, a
+focused temporary driver in `build/aa-buffer-investigation/projection_test.cpp`
+linked the actual `flat_projection_runtime.cpp` and `flat_projection_scope.cpp`.
+It created 576 fresh 64 KiB dynamic constant buffers, registered full writes,
+performed real discard Map/Unmap transactions, dropped caller references,
+and checked lifetime tags through table eviction, reset/reinitialization and
+runtime destruction. All 2312 checks passed: the unpromoted table retained at
+most 64 buffers / 4 MiB and all 576 resource tags were ultimately destroyed.
+This probe does not exercise active cached projection plans or Elite's hooked
+draw pipeline. It ran under CrossOver; the runtime warned that requested
+WARP driver type 5 was unsupported while device creation succeeded, so this
+must not be described as a true WARP or Windows validation result.
+
+**Conclusion:** no missing release or unbounded shadow allocation was found
+in these inspected normal paths. This does not clear interception behavior:
+bounce substitutes the pointer returned to the game and seeds it from the
+previous shadow (or zeros), then copies the full buffer back before Unmap.
+Balanced references alone cannot prove that interaction harmless, or account
+for physical driver backing allocations.
+
+If another isolation candidate is needed, bypass only bounce pointer
+substitution/writeback, retaining the game's original Map/Unmap calls and
+projection observation where valid. The existing Off path still finishes
+outstanding leases. Do not conflate that test with disabling all projection
+tracking or foreground capture. No bypass, runtime fix, CI run, installation
+or live-settings change was made during this review.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.
