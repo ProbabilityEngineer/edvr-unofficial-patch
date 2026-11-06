@@ -57,6 +57,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "hdr_fullscreen_mode.h"  // fix.hdr: the display-mode retry an FP16 chain needs
 #include "hdr_output.h"   // fix.hdr: the swapchain's format, the widened post-tone targets, the two substituted shaders and the output transform
 #include "present_dispatch.h"
+#include "texture_lifetime_diagnostics.h"
 #include "vr_display_observer.h"  // the game window's state (read only) and its handle
 #include "desktop_window.h"  // visual.desktop_window: the eye image drawn into Elite's desktop window at its Present
 #include "mode_watch.h"     // modeWatchFrameBoundary: the 3D mode watch's commit, at the frame boundary
@@ -916,6 +917,15 @@ HRESULT STDMETHODCALLTYPE hookedCreateTexture2D(ID3D11Device* self,
         if (FAILED(hr)) {
             noteDeviceCreateFailure(kDevCreateTexture2D, hr, desc, init, false);
         } else if (desc) {
+            if (out && *out && runtimeFlatProfile()) {
+                // HDR can widen the request; the runtime also resolves a
+                // zero mip count. Measure the actual returned descriptor.
+                D3D11_TEXTURE2D_DESC actual{};
+                (*out)->GetDesc(&actual);
+                const uint64_t bytes = texture2DBytes(actual) *
+                    (actual.SampleDesc.Count ? actual.SampleDesc.Count : 1u);
+                texture_lifetime::observe(*out, actual, fromEdvr, bytes);
+            }
             g_createTextures.fetch_add(1, std::memory_order_relaxed);
             g_createTextureBytes.fetch_add(texture2DBytes(*desc), std::memory_order_relaxed);
             // fix.ui_quality's instruments, on the game's own creates only: a
@@ -2041,6 +2051,8 @@ void notePresentStatus(UINT flags, HRESULT result) {
                     PresentStatusCounters::kMaxReports,
                     snapshot.report == PresentStatusCounters::kMaxReports
                         ? " reporting-stopped=session-cap" : "");
+    if (runtimeFlatProfile())
+        texture_lifetime::report(snapshot.report, PresentStatusCounters::kMaxReports);
 }
 
 HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,

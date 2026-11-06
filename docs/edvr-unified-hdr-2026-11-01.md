@@ -139,6 +139,115 @@ syntax checking. The full device-hook syntax check remains blocked by the
 same 30 MSVC/MinGW compatibility errors on baseline and candidate. No new CI
 or gameplay validation is claimed.
 
+#### Follow-up flight: TEST path not exercised
+
+`edvr_gfx_20261106_135613.log` identifies `8bfba374` (build `6AEDDA04`).
+Through the 14:10:15 status sample, TEST calls remain zero while ordinary
+occluded returns reach 5,006. The reported memory-growth reproduction therefore
+does not exercise the TEST guard. Ordinary occlusion is observed around
+14:02–14:04, 14:06–14:07 and again near 14:10; only the two startup resizes
+are recorded. FSR is selected from 13:59:53 onward.
+
+From 14:02:14 to 14:04:14, DXGI local usage rises 6,250→7,070 MB and
+Elite-tracked GPU allocations 3,838→4,626 MB, predominantly textures
+(1,909→2,685 MB); the main CPU heap stays near 2,360 MB. Later GPU samples
+both rise and fall, so this is not proof that every occluded interval leaks.
+The screenshot shows Elite at 13.28 GB and yellow system memory pressure.
+Those process/system metrics must not be added to the DXGI/engine counters.
+
+The next inspection target is allocation/submission behavior during ordinary
+occluded Presents, not TEST probes. `flatRuntimePresent` deliberately preserves
+history on positive DXGI status returns; changing that to a per-frame reset
+would revive a previously documented reset storm, not establish a leak fix.
+Gamma remains at default; the user's familiar UI orange is a colour reference,
+not a request to calibrate the UI separately. No leak owner is established.
+
+#### Ownership inspection after the follow-up flight
+
+The flight logs one FSR context creation at 13:59:53 (3024x1964 render cap
+and output), not repeated context creation during occlusion. The inspected
+`fsr3_engine.cpp` conversion/input targets use fixed slots and release old
+targets before rebuilding on size changes. `flat_mono_resolve.cpp` similarly
+reuses its matching-size images and clears them on recreation/reset. The HDR
+encoder keeps one backbuffer/view set, with one scratch image only for its
+fallback draw path.
+
+The pinned FidelityFX DX11 backend (`9b04fa49abae5aa341c0007af13c8ba1b4ad9913`)
+retains external resources across dispatches, but in fixed registration slots:
+unregister resets the slot cursor; registering a different resource destroys
+the old slot's views/reference before retaining the replacement. This is
+bounded retention, not evidence of progressive accumulation.
+
+Read-only inspection of vanilla DXMT's ordinary occlusion path confirms it
+flushes/commits commands without presenting; completed command chunks have
+their own reference cleanup. “Nothing is submitted or retired until the next
+visible Present” is therefore not a supported explanation. Presentation
+pacing differs, but that alone does not prove an allocation leak.
+
+`mem_tick.cpp` reads twelve live-byte fields from Elite's renderer ledger;
+`egpu_tex_mb` is one field, not EDVR-owned-texture accounting. The device
+hook's existing creation counters measure allocations but not destruction.
+The remaining discriminating measurement is texture-object lifetime:
+created/destroyed/live/peak counts and estimated bytes, grouped by descriptor
+and creation path, correlated with the existing occlusion counters. It must
+report coverage failures and must not retain the textures it measures.
+No missing release in the inspected FSR/HDR pools has been established, and
+no rendering/lifetime correction is justified by this inspection alone.
+
+#### Bundled-DXMT comparison, 2026-11-06 15:01 flight
+
+The user reports reproducing the pressure/growth with CrossOver's original
+DXMT. `edvr_gfx_20261106_150150.log` identifies the same EDVR `8bfba374`,
+build `6AEDDA04`; it identifies DXMT but does not independently establish its
+exact bundled version. The screenshot shows Elite at 12.03 GB and yellow
+system memory pressure (11.56 GB compressed system-wide, not Elite alone).
+
+At 15:03:50 / 15:05:50 / 15:06:50, respectively, reported local GPU usage was
+5875 / 6533 / 7105 MB; Elite GPU accounting was 3454 / 4172 / 4836 MB; its
+texture field was 1503 / 2063 / 2723 MB. The main CPU heap was 2199 / 2453 /
+2453 MB. Thus the last minute includes another 660 MB of texture accounting
+with a flat main-heap sample.
+
+Crucially, cumulative ordinary occlusion was still zero at 15:06:21; the first
+logged occluded result was at 15:06:47.703. Substantial growth therefore
+preceded reported occlusion. TEST remained zero throughout the sampled
+status lines. Only two startup resizes and one FSR context creation were
+logged. Early AA mode changes make this an imperfect fixed-settings A/B,
+but the nightly is not necessary for the user-observed symptom, and ordinary
+occlusion is not necessary for the measured growth. Neither result identifies
+the retaining owner or distinguishes all streaming/cache growth from leakage.
+
+#### Texture-lifetime diagnostic candidate
+
+The diagnostic adds a private-data `IUnknown` tag to successful texture results
+from the existing `CreateTexture2D` hook on EDVR's device, in the flat profile.
+The tag holds no texture reference. Its final release updates a process-lifetime
+ledger, including releases on driver threads. The candidate deliberately pins
+its DLL until process exit so late tag callbacks cannot enter unloaded code.
+
+`texture lifetime` lines accompany the existing Present-status samples
+(at least 30 seconds apart, at most 120 samples). Totals separate callers inside
+EDVR's module image from external callers; these labels are not proof of the
+ultimate retaining owner. Descriptor reports show at most eight groups per
+sample, selected by largest absolute byte change and largest live byte totals.
+The ledger holds 64 descriptor groups plus one overflow group per caller class.
+At most 65,536 tags can be live/pending; skipped and failed attachments are
+reported, and tracking can resume when tags are destroyed.
+
+Bytes reuse the profiler's rough format/mip estimate, using the returned
+descriptor (including HDR widening) and sample count. They are not physical
+GPU allocation sizes. Textures predating the hook, swapchain buffers, and
+creation through other entrypoints are outside coverage. A flat tracked-live
+curve therefore narrows the search but does not rule out all D3D-object growth.
+No rendering settings, temporal reset policy, or DXMT code is changed.
+
+Local checks: 71 portable and 100 CrossOver checks passed, including a real
+D3D texture/SRV lifetime test. The new production headers pass x64/ARM64EC
+syntax checks; the complete device-hook translation unit still encounters
+the same 30 baseline MinGW/MSVC incompatibility errors, with identical error
+messages before and after this change. These are local checks, not a complete
+Windows DLL build or gameplay confirmation.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.

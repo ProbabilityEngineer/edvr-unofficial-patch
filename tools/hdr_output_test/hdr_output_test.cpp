@@ -6,6 +6,7 @@
 #include "../../src/d3d11/hdr_output_rules.h"
 #include "../../src/d3d11/hdr_shader_identity.h"
 #include "../../src/d3d11/present_dispatch.h"
+#include "texture_lifetime_tests.h"
 #ifdef _WIN32
 #include "hdr_shader_tests.h"
 #endif
@@ -305,7 +306,8 @@ int main(int argc, char** argv) {
             std::printf("hdr_output_test: would run the widening predicate and the view-format "
                         "rule over the tone target, the exclusions and the inexact views, and read "
                         "src/common/flat_profile_keys.h to check fix.hdr is gated in, and run the "
-                        "display-mode retry rule, HDR shader identities and TEST-Present dispatch/counters. On Windows, also "
+                        "display-mode retry rule, HDR shader identities, TEST-Present dispatch/counters "
+                        "and bounded texture-lifetime accounting. On Windows, also "
                         "compile/reflect tone variants and execute exposure on WARP "
                         "(--hardware-self-test selects the hardware adapter). "
                         "Writes nothing.\n");
@@ -327,7 +329,9 @@ int main(int argc, char** argv) {
     theFlatProfileReadsTheHdrKeys();
     shaderIdentities();
     presentStatusOnly();
+    texture_lifetime_tests::run(check);
 #ifdef _WIN32
+    texture_lifetime_tests::runCom(check);
     hdr_shader_tests::run(check, hardware);
 #else
     (void)hardware;
@@ -342,7 +346,8 @@ int main(int argc, char** argv) {
                 "unwidened targets are left alone; the flat profile names fix.hdr and "
                 "advanced.hdr_encode; the display-mode retry fires only on no-such-FP16-mode "
                 "inside our own transaction; HDR-local identities match exactly; TEST-Present "
-                "dispatch preserves forwarding without frame work and status output is bounded; on Windows "
+                "dispatch preserves forwarding without frame work and status output is bounded; "
+                "texture lifetime accounting is bounded and balanced; on Windows "
                 "tone resource contracts and exposure execution also pass)\n", g_checks);
     return 0;
 }
