@@ -48,11 +48,11 @@ inline void report(unsigned sample, unsigned maxSamples, bool engineActive,
             "owner-textures-subset-of-texture-lifetime-do-not-add=1 "
             "engine-isolation=record-velocity-only domain-markers-remain-independent",
             (unsigned long long)texture_lifetime::kMaxTags);
-    Log::get().note("aa memory: sample=%u/%u isolate-engine-records=%u engine-active=%u "
+    Log::get().note("aa memory: sample=%u/%u isolate-engine-records=%u engine-active=%u bypass-map-bounce=%u "
         "pinned-game-buffers=%llu pinned-game-buffer-bytes=%llu "
         "engine-attempts=%llu engine-substituted=%llu domain-attempts=%llu domain-issued=%llu "
         "foreground-capture-attempts=%llu resolve-preflights=%llu resolve-attempts=%llu frame-cleanups=%llu",
-        sample, maxSamples, unsigned(kIsolateEngineRecords), unsigned(engineActive),
+        sample, maxSamples, unsigned(kIsolateEngineRecords), unsigned(engineActive), unsigned(kBypassMapBounce),
         (unsigned long long)pinnedCount, (unsigned long long)pinnedBytes,
         (unsigned long long)count(Work::EngineAttempt), (unsigned long long)count(Work::EngineSubstituted),
         (unsigned long long)count(Work::DomainAttempt), (unsigned long long)count(Work::DomainIssued),

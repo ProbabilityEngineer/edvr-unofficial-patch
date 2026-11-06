@@ -35,6 +35,40 @@ static MapRequest request(uintptr_t resource,FakeDriver::Slice& slice,uintptr_t 
     MapRequest r; r.resource=resource; r.context=context; r.real=slice.data(); r.width=slice.width;
     r.frame=frame; r.discard=true; r.eligible=true; r.success=true; return r;
 }
+static void diagnosticBypass() {
+    FakeDriver d;
+    auto core=std::make_unique<Core>(d);
+    core->setMode(Mode::Off);
+    // Auto's slow-copy detector must not re-enable a forced bypass.
+    for(unsigned i=0;i<32;++i)core->observeCopy(256,1000000);
+    check(core->decision()==State::Off,"C9.bypass-stays-off");
+    FakeDriver::Slice real(512);
+    std::array<unsigned char,512> seed;seed.fill(0x44);
+    auto r=request(2,real);r.seed=seed.data();r.seedValid=true;
+    auto* p=static_cast<unsigned char*>(core->install(r));
+    check(p==real.data() && p[0]==0xDD,"C9.original-pointer-and-unwritten-bytes-preserved");
+    p[17]=0x5A;
+    { auto lease=core->beginUnmap(r.resource,r.context);
+      check(!lease.bounced(),"C9.no-bounce-unmap-lease"); }
+    d.unmap(real);
+    const auto counts=core->counters();
+    check(real.gpu[17]==0x5A && real.gpu[0]==0xDD && real.guards(),
+          "C9.original-map-write-reaches-original-unmap");
+    check(d.refs==0 && counts.bounced==0 && counts.flushes==0 && counts.flushBytes==0,
+          "C9.no-retention-or-writeback-in-bypass");
+
+    // The production configuration must not invalidate an outstanding pointer.
+    core->setMode(Mode::On);
+    p=static_cast<unsigned char*>(core->install(r));
+    check(p!=real.data() && d.refs==1,"C9.existing-mapping-fixture");
+    p[17]=0x6B;
+    core->setMode(Mode::Off);
+    { auto lease=core->beginUnmap(r.resource,r.context);
+      check(lease.bounced(),"C9.existing-lease-still-finishes-after-bypass"); }
+    d.unmap(real);
+    check(real.gpu[17]==0x6B && d.refs==0 && core->counters().flushes==1,
+          "C9.existing-write-flushed-and-reference-released");
+}
 static void roundtrip() {
     FakeDriver d; auto core=std::make_unique<Core>(d); core->setMode(Mode::On);
     FakeDriver::Slice real(512); auto r=request(2,real);
@@ -150,7 +184,7 @@ static void randomPrograms() {
 }
 int main(int argc,char** argv) {
     if(argc<2 || (std::string(argv[1])!="--dry-run" && std::string(argv[1])!="--self-test")) return 2;
-    if(std::string(argv[1])=="--dry-run") { std::puts("flat_map_bounce_test: C1-C8 fake-driver tests; no files or GPU device"); return 0; }
-    roundtrip(); passthrough(); failuresTest(); interleave(); contextAndMode(); stale(); decisions(); randomPrograms();
+    if(std::string(argv[1])=="--dry-run") { std::puts("flat_map_bounce_test: C1-C8 fake-driver tests and C9 diagnostic bypass; no files or GPU device"); return 0; }
+    diagnosticBypass(); roundtrip(); passthrough(); failuresTest(); interleave(); contextAndMode(); stale(); decisions(); randomPrograms();
     std::printf("flat_map_bounce_test: %s (%d failures)\n",failures ? "FAIL" : "PASS",failures); return failures ? 1 : 0;
 }

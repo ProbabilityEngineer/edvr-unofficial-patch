@@ -6,11 +6,15 @@
 namespace edvr::aa_memory {
 
 // Private diagnostic build only; not a user setting. The control branch keeps
-// record velocity enabled. The isolation branch changes only this constant.
+// record velocity enabled. The record-isolation branch changes only this constant.
 inline constexpr bool kIsolateEngineRecords = true;
 inline constexpr bool engineRecordsAllowed(bool flat, bool isolate = kIsolateEngineRecords) {
     return !flat || !isolate;
 }
+
+// Second isolation: keep the engine-record baseline above unchanged. Off
+// leaves Map's original pointer alone; outstanding leases still finish.
+inline constexpr bool kBypassMapBounce = true;
 
 enum class Owner : unsigned { None, Engine, Foreground, Resolver, OtherEdvr, Count };
 inline constexpr unsigned kOwners = unsigned(Owner::Count);

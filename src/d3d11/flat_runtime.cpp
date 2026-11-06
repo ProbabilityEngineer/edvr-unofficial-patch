@@ -2,6 +2,7 @@
 #include <sstream>
 #include "flat_origin_capture.h"
 #include "flat_runtime.h"
+#include "aa_memory_scope.h"
 #include "flat_star_glow.h"   // visual.star_glow
 #include "ui_layer.h"          // UiGlowStar: the first level's star input
 #include "flat_sdk_bench_probe.h"
@@ -4343,7 +4344,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     static bool bounceModeSet=false;
     if (!bounceModeSet) {
         bounceModeSet=true;
-        mapBounce().setMode(flatmap::Mode::Auto);
+        mapBounce().setMode(aa_memory::kBypassMapBounce ? flatmap::Mode::Off : flatmap::Mode::Auto);
     }
     FlatComputeInternalScope guard;
     Ptr<ID3D11Device> actualDevice; swap->GetDevice(IID_PPV_ARGS(&actualDevice));

@@ -660,6 +660,46 @@ outstanding leases. Do not conflate that test with disabling all projection
 tracking or foreground capture. No bypass, runtime fix, CI run, installation
 or live-settings change was made during this review.
 
+#### Prepared bounce-only bypass candidate
+
+Branch `private/rc6-aa-bounce-isolation` starts from the record-isolation
+experiment, retaining `kIsolateEngineRecords = true`. The additional
+compile-time diagnostic constant `kBypassMapBounce = true` selects the
+existing `flatmap::Mode::Off` instead of Auto when the flat runtime configures
+bounce. There is no new INI setting and no change to the real Map/Unmap hooks,
+projection observation, buffer registration, or frame-end cleanup.
+
+Off prevents installation of a replacement mapped pointer, seeding of that
+pointer and bounce writeback for new mappings. Existing leases still finish:
+the bypass must not invalidate a pointer already returned to the game.
+The original driver mapping continues through the ordinary shadow observer
+and the real Unmap. Engine-record isolation remains intentional; this
+candidate is not intended to restore working temporal AA.
+
+The allocation report now includes `bypass-map-bounce=1`. For an authorized
+fresh-process flight with AA selected, confirm the existing bounce report
+settles to `state=off key=off`, with zero bounced mappings/flushes, while
+tracked mappings/full-write traffic still occur. Confirm record isolation
+remains active too. Startup before the flat runtime configures bounce is not
+evidence that its Off policy failed.
+
+Keep AA mode, HDR, scene resolution and activity comparable to the
+record-isolation run; avoid cycling modes in the comparison interval.
+If the symptom persists with verified zero bounce activity, bounce is not
+necessary for reproduction. If it disappears while projection observation
+continues, the pointer/seeding/writeback interaction is implicated, but that
+alone does not prove a particular reference leak or driver defect.
+
+Local verification: the existing map-bounce rig, extended with a focused Off
+test, passes natively and as a Windows executable under CrossOver. It checks
+that adaptive sampling cannot re-enable Off, the original pointer and
+untouched bytes survive, game writes reach the original Unmap, no bounce
+reference/writeback occurs, and a pre-existing lease still flushes and
+releases after switching Off. These are fake-driver/core tests, not gameplay.
+ARM64EC syntax checking of the existing HDR/AA diagnostic test translation
+unit also passed. This candidate has not had Windows DLL CI, deployment or
+an Elite reproduction flight; no claim about the memory outcome is made yet.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.
