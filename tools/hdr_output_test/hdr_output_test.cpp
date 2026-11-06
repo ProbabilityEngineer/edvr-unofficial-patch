@@ -5,6 +5,7 @@
 // :rig_hdr_output_test. Windows-free: it includes only the pure header. --dry-run writes nothing; --self-test runs the checks.
 #include "../../src/d3d11/hdr_output_rules.h"
 #include "../../src/d3d11/hdr_shader_identity.h"
+#include "../../src/d3d11/present_dispatch.h"
 #ifdef _WIN32
 #include "hdr_shader_tests.h"
 #endif
@@ -233,6 +234,67 @@ void shaderIdentities() {
     check(hdrShaderKind("hello", 5) == HdrShaderKind::None, "unrelated shader refuses");
 }
 
+void presentStatusOnly() {
+    using namespace edvr;
+    int owned = 0, foreign = 0;
+    bool routesCorrect = true, forwardsExact = true, observesExact = true;
+    // Include TEST combined with another flag, a non-TEST flag, occlusion,
+    // retry and failure HRESULTs. None may alter the forwarding contract.
+    for (bool ours : {false, true}) {
+        for (uint32_t flags : {0u, 1u, 9u, 8u}) {
+            for (uint32_t result : {0u, kPresentOccluded, 0x887a000au, 0x80004005u}) {
+                int* chain = ours ? &owned : &foreign;
+                unsigned forwards = 0, frameWork = 0, observations = 0;
+                unsigned gpuWork = 0, frameState = 0;
+                auto forward = [&](int* got, uint32_t interval, uint32_t gotFlags) {
+                    ++forwards;
+                    forwardsExact &= got == chain && interval == 3 && gotFlags == flags;
+                    return static_cast<int32_t>(result);
+                };
+                auto frame = [&](int* got, uint32_t interval, uint32_t gotFlags) {
+                    ++frameWork; ++gpuWork; ++frameState;
+                    return forward(got, interval, gotFlags);
+                };
+                auto observe = [&](uint32_t gotFlags, int32_t gotResult) {
+                    ++observations;
+                    observesExact &= forwards == 1 && gotFlags == flags &&
+                                     static_cast<uint32_t>(gotResult) == result;
+                };
+                const auto actual = dispatchPresent(chain, &owned, 3, flags, forward, frame, observe);
+                const unsigned expectedWork = ours && !(flags & kPresentTestFlag) ? 1u : 0u;
+                routesCorrect &= forwards == 1 && frameWork == expectedWork &&
+                                 gpuWork == expectedWork && frameState == expectedWork &&
+                                 observations == (ours ? 1u : 0u);
+                forwardsExact &= static_cast<uint32_t>(actual) == result;
+            }
+        }
+    }
+    check(routesCorrect, "TEST and foreign Presents forward once without GPU/frame work; normal owned Presents retain it");
+    check(forwardsExact, "Present preserves chain, interval, all flags and exact HRESULT, including failures");
+    check(observesExact, "owned Present status is observed only after forwarding");
+
+    PresentStatusCounters counts;
+    PresentStatusSnapshot snapshot;
+    check(counts.note(0, 0, 0, snapshot) && snapshot.regular == 1 && snapshot.tests == 0,
+          "initial status report includes zero TEST calls rather than silent instrumentation");
+    bool quiet = !counts.note(1, 0, 1, snapshot);
+    quiet &= !counts.note(9, kPresentOccluded, 2, snapshot);
+    quiet &= !counts.note(0, kPresentOccluded, 3, snapshot);
+    quiet &= !counts.note(1, 0x80004005u, 4, snapshot);
+    check(quiet, "status reports are rate limited while counters continue accumulating");
+    check(counts.note(0, 0, PresentStatusCounters::kReportMs, snapshot) &&
+              snapshot.tests == 3 && snapshot.regular == 3 &&
+              snapshot.testOccluded == 1 && snapshot.regularOccluded == 1,
+          "TEST and real-present occlusion are counted separately, including intervening calls");
+    bool bounded = true;
+    for (unsigned i = 2; i < PresentStatusCounters::kMaxReports; ++i)
+        bounded &= counts.note(0, 0, i * PresentStatusCounters::kReportMs, snapshot);
+    bounded &= snapshot.report == PresentStatusCounters::kMaxReports;
+    bounded &= !counts.note(1, kPresentOccluded,
+                           PresentStatusCounters::kMaxReports * PresentStatusCounters::kReportMs, snapshot);
+    check(bounded, "status output stops at the session cap with a final-report marker available");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -243,7 +305,7 @@ int main(int argc, char** argv) {
             std::printf("hdr_output_test: would run the widening predicate and the view-format "
                         "rule over the tone target, the exclusions and the inexact views, and read "
                         "src/common/flat_profile_keys.h to check fix.hdr is gated in, and run the "
-                        "display-mode retry rule and HDR shader identities. On Windows, also "
+                        "display-mode retry rule, HDR shader identities and TEST-Present dispatch/counters. On Windows, also "
                         "compile/reflect tone variants and execute exposure on WARP "
                         "(--hardware-self-test selects the hardware adapter). "
                         "Writes nothing.\n");
@@ -264,6 +326,7 @@ int main(int argc, char** argv) {
     theDisplayModeRetry();
     theFlatProfileReadsTheHdrKeys();
     shaderIdentities();
+    presentStatusOnly();
 #ifdef _WIN32
     hdr_shader_tests::run(check, hardware);
 #else
@@ -278,7 +341,8 @@ int main(int argc, char** argv) {
                 "UNORM and sRGB views map exactly, UINT/SNORM/SINT map inexactly and say so; views over "
                 "unwidened targets are left alone; the flat profile names fix.hdr and "
                 "advanced.hdr_encode; the display-mode retry fires only on no-such-FP16-mode "
-                "inside our own transaction; HDR-local identities match exactly; on Windows "
+                "inside our own transaction; HDR-local identities match exactly; TEST-Present "
+                "dispatch preserves forwarding without frame work and status output is bounded; on Windows "
                 "tone resource contracts and exposure execution also pass)\n", g_checks);
     return 0;
 }

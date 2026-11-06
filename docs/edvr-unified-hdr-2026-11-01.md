@@ -111,6 +111,34 @@ There is no gameplay validation yet: corrected brightness, scale-path routing,
 and the remaining imported display-transform assumptions are not established
 by these tests. No DXMT, display preset, game gamma, or live settings changed.
 
+### TEST-Present follow-up (local candidate)
+
+Flight `edvr_gfx_20261105_234540.log` used `0693bebf`. It has only two
+buffer resizes, both at startup; repeated resize-driven HDR recreation is
+not supported by this flight. The passive Present census ended at 23:47:40
+with `test=0`, before the menu reported lost focus at 23:50:08. That menu
+message is not a complete focus-transition log.
+
+Inspection found that the HDR transform and other frame work ran even on
+`DXGI_PRESENT_TEST` status probes. The outer Present dispatcher now forwards
+TEST calls without entering the frame-work function, preserving the original
+arguments and HRESULT. Foreign chains forward without frame work or counters.
+Ordinary owned Presents keep the existing frame path, even when their result
+is occluded; this is not a new background-rendering policy.
+
+`present status:` reports cumulative TEST/regular counts and their separate
+occlusion counts, once initially and at most every 30 seconds thereafter.
+There are at most 120 reports per DLL session; the final one says
+`reporting-stopped=session-cap`. These counters do not touch frame state or GPU
+resources. They can establish whether later app-switching uses TEST probes,
+but this correction is not yet a demonstrated memory-leak or brightness fix.
+
+Local verification: 61 portable HDR/dispatch checks and 80 checks under
+CrossOver hardware pass; the Windows test builds for x64 and passes ARM64EC
+syntax checking. The full device-hook syntax check remains blocked by the
+same 30 MSVC/MinGW compatibility errors on baseline and candidate. No new CI
+or gameplay validation is claimed.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.

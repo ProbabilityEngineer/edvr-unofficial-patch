@@ -56,6 +56,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "vr_ssaa_hold.h"   // the Supersampling hold's shutdown (the loader slot goes back)
 #include "hdr_fullscreen_mode.h"  // fix.hdr: the display-mode retry an FP16 chain needs
 #include "hdr_output.h"   // fix.hdr: the swapchain's format, the widened post-tone targets, the two substituted shaders and the output transform
+#include "present_dispatch.h"
 #include "vr_display_observer.h"  // the game window's state (read only) and its handle
 #include "desktop_window.h"  // visual.desktop_window: the eye image drawn into Elite's desktop window at its Present
 #include "mode_watch.h"     // modeWatchFrameBoundary: the 3D mode watch's commit, at the frame boundary
@@ -1848,8 +1849,9 @@ void presentFrameBoundary() {
     }
 }
 
-HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
-                                        UINT flags) {
+// Only dispatchPresent's ordinary-frame path enters this function.
+HRESULT STDMETHODCALLTYPE presentFrame(IDXGISwapChain* self, UINT syncInterval,
+                                       UINT flags) {
     // The hook's entry, one clock read for both clocks that want it: the runtime's
     // Present trace (microseconds) and the frame-tick chain (frame_ticks.h).
     const int64_t hookEnter = self == g_state->swapChain ? qpcNow() : 0;
@@ -2020,6 +2022,31 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     nativeTimingNotePresent(dev, traceToken, trace);
     frameTick("timing_note");
     return hr;
+}
+
+void notePresentStatus(UINT flags, HRESULT result) {
+    static_assert(kPresentTestFlag == DXGI_PRESENT_TEST, "Present TEST flag");
+    static_assert(kPresentOccluded == static_cast<uint32_t>(DXGI_STATUS_OCCLUDED),
+                  "Present occlusion status");
+    static PresentStatusCounters counts;
+    PresentStatusSnapshot snapshot;
+    if (!counts.note(flags, static_cast<uint32_t>(result), GetTickCount64(), snapshot)) return;
+    Log::get().note("present status: test-forwarded=%llu regular=%llu test-occluded=%llu "
+                    "regular-occluded=%llu last-flags=0x%X last-result=0x%08X sample=%u/%u%s",
+                    static_cast<unsigned long long>(snapshot.tests),
+                    static_cast<unsigned long long>(snapshot.regular),
+                    static_cast<unsigned long long>(snapshot.testOccluded),
+                    static_cast<unsigned long long>(snapshot.regularOccluded),
+                    flags, static_cast<unsigned>(result), snapshot.report,
+                    PresentStatusCounters::kMaxReports,
+                    snapshot.report == PresentStatusCounters::kMaxReports
+                        ? " reporting-stopped=session-cap" : "");
+}
+
+HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
+                                        UINT flags) {
+    return dispatchPresent(self, g_state->swapChain, syncInterval, flags,
+                           g_state->realPresent, &presentFrame, &notePresentStatus);
 }
 
 HRESULT STDMETHODCALLTYPE hookedCreateSwapChain(IDXGIFactory* self, IUnknown* device,
