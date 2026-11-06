@@ -5,6 +5,7 @@
 #include <memory>
 #ifdef _WIN32
 #include "../../src/d3d11/texture_lifetime_d3d11.h"
+#include "../../src/d3d11/flat_context_state.h"
 #endif
 
 namespace texture_lifetime_tests {
@@ -161,6 +162,76 @@ template<class Check> void runDevice(Check check, ID3D11Device* device) {
           "texture lifetime real D3D final release destroys the tag");
     // A runtime that defers destruction must not leave a tag pointing at
     // dead test storage after reporting the failed immediate-release check.
+    if (ledger.snapshot().totals[0].live) (void)storage.release();
+}
+
+// Exercise the production explicit-capture path, not a mocked COM context.
+// Fresh compressed textures expose lost references across object turnover,
+// including upper SRV slots, recapture and destruction without restoration.
+template<class Check> void runCapture(Check check, ID3D11Device* device) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+    ComPtr<ID3D11DeviceContext1> c1;
+    const HRESULT query = context.As(&c1);
+    check(SUCCEEDED(query), "texture lifetime capture test obtains context1");
+    if (!c1) return;
+    auto storage = std::make_unique<Ledger>();
+    auto& ledger = *storage;
+    // The conservative DXMT slot ranges also work on WARP.
+    const auto ranges = edvr::flatContextRanges(D3D_FEATURE_LEVEL_11_0, true);
+    bool made = true, restored = true, balanced = true;
+    unsigned completed = 0;
+    const DXGI_FORMAT formats[] = {
+        DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB};
+    for (unsigned i = 0; i < 96; ++i) {
+        context->ClearState();
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = desc.Height = 64;
+        desc.MipLevels = 3;
+        desc.ArraySize = desc.SampleDesc.Count = 1;
+        desc.Format = formats[i % 3];
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> view;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &texture)) ||
+            FAILED(device->CreateShaderResourceView(texture.Get(), nullptr, &view))) {
+            made = false; break;
+        }
+        attach(ledger, texture.Get(), keyFor(desc, false), 1);
+        auto* raw = view.Get();
+        context->VSSetShaderResources(0, 1, &raw);
+        context->HSSetShaderResources(127, 1, &raw);
+        context->DSSetShaderResources(127, 1, &raw);
+        context->GSSetShaderResources(127, 1, &raw);
+        context->PSSetShaderResources(127, 1, &raw);
+        context->CSSetShaderResources(127, 1, &raw);
+        {
+            edvr::FlatContextState saved;
+            saved.capture(c1.Get(), ranges, false);
+            if (i % 3 == 1) saved.capture(c1.Get(), ranges, false);
+            context->ClearState();
+            if (i % 3 != 2) {
+                saved.restore(c1.Get(), false);
+                ComPtr<ID3D11ShaderResourceView> got;
+                context->PSGetShaderResources(127, 1, &got);
+                restored = restored && got.Get() == view.Get() && !saved.holding();
+                context->ClearState();
+            } // otherwise the production destructor releases the capture
+            view.Reset();
+            texture.Reset();
+        }
+        ++completed;
+        const auto s = ledger.snapshot();
+        balanced = balanced && s.totals[0].live == 0 &&
+            s.totals[0].destroyed == completed && s.failed == 0;
+    }
+    context->ClearState();
+    context->Flush();
+    check(made && completed == 96, "texture lifetime creates 96 fresh BC4/BC5/BC7 resources");
+    check(restored, "production capture restores the high-slot compressed SRV");
+    check(balanced, "production capture, recapture and abandonment leave no live tagged textures");
+    // Keep test storage valid if a failed check reveals deferred retention.
     if (ledger.snapshot().totals[0].live) (void)storage.release();
 }
 #endif

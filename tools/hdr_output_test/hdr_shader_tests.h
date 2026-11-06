@@ -66,6 +66,7 @@ template<class Check> void run(Check check, bool hardware) {
     check(SUCCEEDED(hr), "exposure regression device");
     if (!device) return;
     texture_lifetime_tests::runDevice(check, device.Get());
+    texture_lifetime_tests::runCapture(check, device.Get());
     ComPtr<ID3D11ComputeShader> shader;
     if (FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader))) {
         check(false, "exposure compute shader"); return;

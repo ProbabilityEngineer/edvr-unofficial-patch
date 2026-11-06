@@ -12,9 +12,21 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <string>
+
+#ifdef _WIN32
+// The production capture is tested with breadcrumbs disabled. If that gate
+// unexpectedly opens, fail rather than write into a live game's log location.
+namespace edvr {
+void breadcrumb(const char*) {
+    std::fputs("FAIL: unexpected breadcrumb during texture lifetime test\n", stderr);
+    std::abort();
+}
+}
+#endif
 
 namespace {
 
@@ -308,6 +320,7 @@ int main(int argc, char** argv) {
                         "src/common/flat_profile_keys.h to check fix.hdr is gated in, and run the "
                         "display-mode retry rule, HDR shader identities, TEST-Present dispatch/counters "
                         "and bounded texture-lifetime accounting. On Windows, also "
+                        "check compressed-texture lifetimes through production state capture, "
                         "compile/reflect tone variants and execute exposure on WARP "
                         "(--hardware-self-test selects the hardware adapter). "
                         "Writes nothing.\n");
