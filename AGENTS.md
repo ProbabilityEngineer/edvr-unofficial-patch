@@ -1,397 +1,166 @@
-# EDVR — working notes for coding agents
+# EDVR — private-fork working rules
 
-This is the only instructions file in the repo. CLAUDE.md is a one-line @AGENTS.md import because Claude Code reads only CLAUDE.md; do not add content there.
+This is the repository's agent instruction file. `CLAUDE.md` imports it;
+do not duplicate instructions there.
 
-These notes include the maintainer's workflow. In a fork or contributor's
-clone, follow the project rules for tools, build validation, diagnosis and
-config editing. Use your own shell and Git workflow, and submit changes by
-pull request. The Git section, release-notes rules, and maintainer-only
-merge, push-to-main, tag, release and workflow-dispatch steps elsewhere in
-this file do not apply to contributors. The host-specific validation paths
-still apply: native Windows uses the full local build, and other hosts use
-the full Windows workflow for C++ changes.
+EDVR provides Elite Dangerous: Odyssey graphics fixes through a `d3d11.dll`
+proxy and its own OpenXR runtime through `Openvr/win64/openvr_api.dll`.
+Test flights are expensive: distinguish local checks from actual game results.
 
-Unofficial VR fixes for Elite Dangerous: Odyssey. A proxy DLL
-(`d3d11.dll` beside the game) and EDVR's own OpenXR runtime for
-Elite (`openvr_api.dll` in `Openvr\win64`), a config file, and an
-installer that carries all three.
+## Repository identity and Entire
 
-The expensive resource on this project is not tokens, it is **test
-flights**. Every wrong hypothesis costs a build, an install, a headset
-session and a log. Everything below exists to spend fewer of them.
+Git operations for this checkout belong to
+`ProbabilityEngineer/edvr-unofficial-patch`, not the separate DXMT repository.
+After a session or checkout move, verify the repository with
+`git rev-parse --show-toplevel` and `git remote -v` before making changes.
 
-## Shell
+Entire is enabled. Keep session/checkpoint uploads disabled unless the owner
+explicitly authorizes them. Ask before changing Entire configuration or
+performing destructive operations. When using Entire commands, consult
+`entire agent-help` for current usage.
 
-Use the **PowerShell tool**, not Bash. Windows PowerShell 5.1: no `&&` or
-`||` (use `;` and `if ($?)`), no ternary, no `??`. Don't redirect a native
-exe's stderr with `2>&1` — 5.1 wraps each line in an ErrorRecord and sets
-`$?` false on a clean exit. Send a file-writing tool's output to `*> $null`
-or a log file and read that: `| Select-Object -First N` stops the pipeline
-and kills the tool mid-write (an install died that way, #100). Pass paths
-to a native exe as arguments: piping strings into one (`$files | git
-checkout --pathspec-from-file=-`) prepends a BOM to the first item, which
-then matches nothing.
+## Private derivative and publication
 
-`build.bat` must be launched **by absolute path**; a `cmd` invocation that
-never ran the batch still exits 0, which has read as a successful build.
+This checkout is the owner's private derivative. AI-assisted implementation
+is permitted for that work, not as authorization for upstream contributions.
+Never push refs to `characterecho-sean/edvr-unofficial-patch`, open upstream
+PRs or issues, post comments there, or otherwise publish this work upstream.
+This applies to every branch and worktree, including direct URLs, remote
+aliases and APIs. Permission to push to the owner's fork is not permission
+to publish upstream. Preserve this policy when creating or updating branches.
 
-## Reading at low token cost
+## Scope and default permissions
 
-Every tool call re-sends the whole context, so anything read into it is
-paid for again on every later call. Measured 2026-09-15: a 359-call
-session averaged 427k tokens per call and never compacted.
+Treat the requested outcome as the scope boundary. When implementation is
+authorized, relevant inspection, necessary edits, focused regression tests,
+local checks and incremental builds using existing toolchains are included.
+Do not ask again for each ordinary implementation or verification step.
 
-- **Never read a large file whole.** `edvr.ini` (148 KB), `build.bat`
-  (94 KB), `README.md`, `vscreen.cpp`, `temporal_pass.cpp` and most docs
-  are far past the 30 KB line. Grep for the key or symbol, then read a
-  range with the Read tool's offset and limit. A whole-file dump through
-  PowerShell is not a way to read a file.
-- **An investigation doc starts with a `## Status` block** of at most 60
-  lines: state, open hypotheses, ruled-out pointer, next flight. Read the
-  block first and go into the journal only where it points. Update the
-  block whenever the doc changes; add one to any doc that lacks it.
-- **Keep new docs small.** Append a dated entry to the arc's own doc
-  rather than starting another review doc; a review that must be its own
-  file stays under about 15 KB.
-- **Delegate to subagents on the cheapest model that will do the job
-  well.** Research, exploration and implementation go to a subagent, and
-  only its conclusion comes back, so the main context stays small. Pick
-  the tier by the task: mechanical, fully specified work with a check at
-  the end (a reflow, an install and verify, a log read, a rename) goes to
-  the cheapest tier; work needing judgment across files or a build gate
-  goes to a mid tier; the top tier stays in the main context for diagnosis
-  and decisions, where a wrong call costs a test flight. If a cheaper tier
-  fails its check or reports doubt, rerun on the next tier up with its
-  report attached rather than finishing by hand in the main context. Do
-  not delegate a job of two or three tool calls: a subagent's own overhead
-  exceeds it.
-- Memory topic files point at the doc; they never mirror its journal.
+Do not add unrelated refactoring, cleanup, features or broad test-suite
+expansion. Report adjacent problems instead of silently fixing them.
+Do not remove or rename a feature or config key without quoting its exact
+name and current behavior and obtaining approval.
 
-## The sanctioned tools
+Ask before:
+- Paid compute, remote CI or other externally metered operations.
+- Downloading/installing dependencies or changing system/toolchain settings.
+- Installing artifacts or changing live game settings.
+- Committing, merging branches, pushing, publication or destructive operations.
+- Substantial unrelated work or unusually expensive local validation.
 
-These operations go through `tools\`, and **only** through `tools\`.
-Each was an ad-hoc one-liner retyped once a session for a month; the
-evidence is the dozens of backups in both game directories named six
-different ways, and a live `edvr.ini` a stray PowerShell anchor once
-corrupted. Do not regenerate the one-liner — extend the script.
+Before an operation that triggers remote CI or publication, disclose its
+expected downstream actions and obtain approval covering them. Approval of
+the initiating operation does not authorize undisclosed downstream work.
+There is no automatic commit, merge, push, issue-creation or release step.
 
-| Operation | Use | Never |
-|---|---|---|
-| Install a build next to the game | `python tools\install_edvr.py` | `Copy-Item` onto the game directory |
-| Check the install matches the build | `python tools\install_edvr.py --verify-only` | eyeballing timestamps |
-| Find and read a flight log | `python tools\edvr_log.py` (census aggregate: add `--tally vh [--frame N]`; first command on an on-foot flight: add `--health [--since HH:MM:SS] [--until HH:MM:SS]`, which says which tagged features ran and applied and exits 3 on a NEVER APPLIED one) | `Get-Content -Tail` + `Select-String` |
-| Reflow release notes or docs | `python tools\reflow_notes.py` | reflowing by hand or by regex |
-| Credit contributors in release notes | `python tools\release_credits.py --from <previous-tag> --thanks` | writing the credits from memory or ad-hoc `gh` queries |
-| Make a worktree that can build | `python tools\worktree.py add <path>` | `git worktree add` alone (no deps) |
-| Post PR replies or a summary | `python tools\pr_post.py --pr N --since <time> ...` | hand-built `gh api` / `gh pr comment` calls |
-| Compile on Linux for a test flight | `python3 tools/linux_toolchain.py build-dlls` | running `build.bat` under Wine by hand |
-| Keep the game exe before Steam updates it (`install_edvr.py` also does it on every install; then docs\game-binary-map.md "Re-deriving after a patch") | `python tools\archive_game_exe.py --target steam` (`--dry-run` first) | `Copy-Item` of the exe, or committing it |
+## Proportional verification
 
-Every release's notes carry a `## Thanks` section built from
-`release_credits.py --thanks` and finished by hand. It names only the authors
-of PRs merged in the release, and anyone the maintainer has approved by name in
-`tools\release_credits_approved.json` for a commit in the release. Everyone
-else who opened an issue or sent logs gets the tool's one general line and is
-not named. Add an entry to that file only on the maintainer's word. A person writes each sentence.
-People known only by an anonymised label ("user 2", "the reporter") are not
-named without the maintainer's consent.
+Use the smallest set of checks that exercises the requested behavior and
+guards likely regressions. Prefer existing test infrastructure. A focused
+regression test and a relevant compile/build check are normally sufficient
+for development, not proof of runtime correctness or release readiness.
 
-```bash
-python tools\install_edvr.py --target steam --dry-run
-python tools\install_edvr.py --target steam
-python tools\install_edvr.py --target steam --scope flat --xess
-python tools\install_edvr.py --target steam --scope flat --verify-only
-python tools\edvr_log.py --target steam --expect-build HEAD --version
-```
+Demonstrate failure before the fix when practical. Where the behavior needs
+the real runtime, explain that limit instead of manufacturing a substitute
+claim. Diagnostic changes and candidate fixes may precede runtime confirmation.
+State the hypothesis and the observation that would confirm or refute it.
 
-Anything that writes files takes `--dry-run`, and `--dry-run` **writes
-nothing at all** — no copies, no backups, no directories. This project has
-already shipped a `--dry-run` that wrote files; the self-tests assert the
-property directly.
+If a check exposes a defect in the requested change, fix it and rerun that
+check. Report unrelated failures without expanding scope. Stop when the
+requested work and relevant checks are complete, or report the specific
+blocker and remaining uncertainty.
 
-Every tool in `tools\` carries `--self-test`, and `build.bat` gates on it.
-A new tool gets one too, and gets added to that gate — a parser that
-drifts from the format it reads must fail in the build, not in the ten
-minutes after a flight finally reproduced the effect being chased.
+Do not recursively test test helpers, validate validators or add planning
+layers merely for confidence. Run a tool's relevant self-tests when changing
+the tool; ordinary use does not require revalidating it. New repository
+tools should use the existing self-test convention rather than a new framework.
 
-## Diagnosis discipline
+Use available local checks on the current host. Do not automatically dispatch
+Windows CI for each C++ edit. Full Windows validation is required to claim
+Windows validation or release readiness, not before every local edit or commit.
+Never bypass, weaken or forge build gates, receipt checks or safety checks.
+If a required project gate exceeds the approved scope, explain once and ask.
 
-- **Never ship a fix on an untested hypothesis.** State the hypothesis,
-  name the specific log line, draw call, counter or struct field that
-  would confirm or refute it, and get that evidence before editing code.
-- **The first question about any flight log is whether it is the right
-  build.** `python tools\edvr_log.py --target steam --expect-build HEAD`
-  exits 2 when it is not. A log from a stale DLL is not evidence, and
-  counters read off one have cost a session before.
-- **When a flight refutes a hypothesis, write it down** as a one-line
-  `ruled out: X, because Y` in the investigation doc under `docs\`, before
-  proposing the next one. These arcs run for days across separate
-  sessions; an idea that is not recorded as dead gets re-proposed.
-- **Prefer root causes to compensation.** Do not propose sharpening,
-  contrast tweaks, dead bands or threshold nudges to mask a geometry,
-  motion-vector or timing bug. Sharpening over DLSS blur was proposed once
-  and rightly rejected: the motion vectors were wrong.
-- **Enumerate before you build.** When several causes are plausible, list
-  them with a discriminating log signature for each and instrument them
-  together, so one flight can eliminate several. One flight per hypothesis
-  is the most expensive way to run this project.
-- **State the environment a rendering fix depends on**: VR runtime
-  (OpenVR / Oculus LibOVR / OpenXR), headset and per-eye render size,
-  DLSS version, and any fixed-size internal table. A supporter's Elite
-  using the Oculus native SDK meant four OpenVR-side fixes were inert on
-  their rig and nothing said so.
+## Build and tooling safeguards
 
-## Build and verify before commit
+- Use the host's supported shell. PowerShell 5.1 restrictions apply only there.
+  When using it, avoid native stderr redirection and pipelines that terminate
+  file-writing tools early; preserve UTF-8 and native argument quoting.
+- Invoke `build.bat` by absolute path and verify that it actually ran.
+  Use its `--wait-lock` option; do not wait separately and race another build.
+- The full build runs tests and installer gates and produces a receipt.
+  `--dll-only` is receipt-guarded; it is not a shortcut around validation.
+  Compile-only outputs are not validated release artifacts.
+- For an explicitly unvalidated graphics test DLL, the supported path is
+  `--compile-only --graphics-only`, or manual CI input `graphics_only=true`;
+  see `docs/building.md`. This does not require full validation and is not a
+  bypass of receipt-guarded promotion. Remote CI still requires approval.
+- Use `tools/worktree.py` for build-capable worktrees. Never use a bare
+  stash/pop across worktrees; the stash stack is shared.
+- Read targeted source and documentation ranges. Delegate only when useful
+  and supported, not as a mandatory model-escalation or review process.
+- Read-only source, log, config and Git inspection may use ordinary tools.
+  Prefer `tools/edvr_log.py` for structured flight reports.
+- Existing tools own installation, target resolution, artifact verification
+  and build receipts. Reuse them instead of ad-hoc replacement scripts.
+- `--dry-run` must write nothing, including temporary files or directories.
 
-- **Choose the validation path by host.** On native Windows, every C++
-  edit gets the full local validation build before commit: launch the
-  full absolute path to `build.bat --wait-lock` and read the tail of its
-  output. The GitHub workflow is optional there. From Linux or another
-  non-native Windows host, use the GitHub Windows workflow below for
-  full C++ validation. Wine and Proton do not count as native Windows.
-- **Linux: a compile-only build.** `tools/linux_toolchain.py` runs
-  `build.bat --compile-only` under Wine, with the same MSVC and Windows SDK as
-  CI, and writes the production DLLs to `<root>/build/compile-build` for the
-  main checkout or any worktree. It runs none of the gates, so it is not
-  validation and not a release asset; CI stays the validation for a merge or
-  release, and the full `build.bat` currently fails Wine's process/window gates
-  (do not bypass them). Run it with host `python3` from any shell, no wrapper.
-  Once per machine the user installs `wine msitools git` with sudo; then
-  `python3 tools/linux_toolchain.py setup --dry-run`, and
-  `setup --accept-license` only when the user has accepted VS 2022's Build
-  Tools licence (it needs a Visual Studio licence). Microsoft's binaries, the
-  Wine prefix and the SDKs sit in the Git-ignored
-  `<main checkout>/.toolchains/windows/` and are never shared; `doctor` checks
-  them.
-- **Linux test flight (Steam Deck, Proton).** For a build Sean will fly, CI
-  first is not required; CI is for a merge or release. Commit to the branch
-  before compiling: a dirty tree compiles as `vX.Y.Z-dirty`, which
-  `edvr_log.py --expect-build HEAD` will not match. Close Elite, then:
+## Runtime diagnosis and deployment safety
 
-  ```bash
-  python3 tools/linux_toolchain.py build-dlls
-  python3 tools/install_edvr.py --target steam --scope flat --xess --compile-only --dry-run
-  python3 tools/install_edvr.py --target steam --scope flat --xess --compile-only
-  python3 tools/install_edvr.py --target steam --scope flat --xess --compile-only --verify-only
-  python3 tools/edvr_log.py --target steam --expect-build HEAD --version
-  ```
+- Establish which build produced a flight log before attributing behavior.
+  Distinguish "never ran", "refused", "accepted" and completed/correct output.
+- Preserve hook displacement/relocation checks, protection transitions,
+  publication ordering, cleanup and bounded recovery behavior.
+- Trace new instrumentation through its actual execution/reporting path.
+  Make absence of execution distinguishable from success.
+- Prefer root causes over cosmetic compensation. State the relevant runtime,
+  rendering dimensions and feature state; do not demand extra test flights
+  when existing evidence answers the question.
+- Record important ruled-out hypotheses briefly in an existing investigation
+  document when needed to avoid repeated work. Do not create an investigation
+  archive for every small change.
+- Deployment needs separate approval. Use `tools/install_edvr.py` and its
+  verification mode; do not copy over a running game or infer identity from
+  timestamps. Preserve artifact and receipt safeguards.
+- Live `edvr.ini` and `edvr-flat.ini` are user state. Do not overwrite them
+  during unrelated installation or edit them with broad regex replacements.
+  For authorized changes, inspect the exact keys and review the resulting diff.
+- Config keys describe user-facing functionality, not implementation details.
+  Avoid permanent switches solely for a temporary diagnostic experiment.
 
-  To fly a worktree, give `build-dlls` and `install_edvr.py` `--root
-  <worktree>`. `--target steam` finds the game on Linux
-  (`tools/steam_library.py`: `~/.local/share/Steam`, `~/.steam/steam`, then
-  every library in `libraryfolders.vdf`). `--compile-only` installs from
-  `<root>/build/compile-build` instead of `build/`, and refuses without that
-  build's `compile_only_receipt.json`, when an output no longer matches it, or
-  when the tree has been edited or committed since (`tools/compile_only.py`
-  holds the fingerprint, shared with the toolchain). It prints that the build
-  is not Windows validated and writes `"build": "compile-only"` into the
-  install receipt; `--verify-only` compares the game directory to that build
-  and only warns about a moved tree. A real install runs under the host
-  `python3`, which checks `/proc` for a running `EliteDangerous6*` (Proton); do
-  not run it through the Wine Python, which cannot see Proton's processes and
-  passes that check vacuously.
-- For C++ changes on a non-native host, commit and push the candidate
-  branch so Actions can validate that exact commit. The `release.yml`
-  workflow runs the full build and package path on every pull request
-  and every push to `main` or `codex/release-*`; for a branch with none
-  of those, dispatch it with `gh workflow run release.yml --ref <branch>`. Find the branch run with `gh run list --workflow
-  release.yml --branch <branch>`, verify its `headSha` matches the
-  candidate with `gh run view <run-id> --json headSha`, then require `gh
-  run watch <run-id> --exit-status` to pass before merging or releasing.
-  This commit-before-CI order is necessary for remote validation; native
-  Windows keeps the full-build-before-commit order above. Read the full
-  job log and `edvr-diagnostics-<run-id>-<attempt>` on failure; on
-  success inspect `edvr-build-<run-id>-<attempt>` and
-  `edvr-packages-<run-id>-<attempt>`. Branch proof packages use a
-  runner-local CI tag (or an exact existing tag) and are not release
-  assets. See `docs/building.md` for the download, checksum and release
-  commands.
-- For an actual release from a non-native host, merge the validated
-  source, push the exact clean `vX.Y.Z` tag, and require that tag's full
-  Windows build and package run to pass. Download and verify all three
-  ZIPs with `SHA256SUMS`, generate and review release notes including
-  `release_credits.py`'s `## Thanks` section, then create a draft
-  release; publication remains an explicit step. On native Windows, the
-  full local build and `package.bat <version>` at the clean version tag
-  are sufficient; GitHub Actions is not required.
-- **One build at a time on this machine.** Run `build.bat --wait-lock` by
-  absolute path: it waits for any other build to finish and then takes the
-  lock and builds in one step. A bare `build.bat` that finds another build
-  running prints "another build is already running" and exits 1. Do not run
-  `build_lock.py --wait` and then `build.bat` as two commands; another build
-  can take the lock between them.
-- The normal `build.bat` path is the validation build: it runs the Python
-  self-tests, compiles the production DLLs, runs the test rigs, builds and
-  checks the self-contained installer, and writes
-  `build\full_build_receipt.json` only after all gates pass. Green means
-  green; do not report success off a build you did not read.
-- Compiles go through `tools\compile_cache.py`, which skips a compile whose
-  sources, project headers, flags, toolchain and `INCLUDE` are unchanged. Each
-  invocation prints a `compile_cache:` summary line (compiled / reused, and why
-  for the first misses); a hit does not replay the compiler's warnings.
-  `build.bat --clean` or `EDVR_NO_COMPILE_CACHE=1` forces full recompiles.
-  System and SDK headers are covered only by the `INCLUDE` path and the
-  compiler's identity, not by content.
-- On native Windows, after that full build, commit the same source tree.
-  For the install-only rebuild that gives the DLLs the clean commit's
-  version, use `build.bat --dll-only` by absolute path. It requires a
-  clean working tree and a matching full-build receipt, rebuilds and
-  validates the production DLLs, and skips the test rigs and
-  self-contained installer. It is a promotion step, never a substitute
-  for validating changed source; if its receipt check fails, run the
-  full build again. The receipt fingerprints tracked files, untracked
-  files git does not ignore, and the ignored dependency folders
-  (`third_party\ngx`, `third_party\ffx-dx11`,
-  `third_party\openxr\loader`, `third_party\xess`); `docs\`, `reviews\`
-  and other ignored paths are not inputs, so writing a review or a doc
-  does not stale it (`tools\build_receipt.py` states the rule and its
-  self-test pins it).
-- After editing, re-read the changed region for the things that have bitten
-  here: declaration order, a duplicated census or log string, a shader
-  entry-point name collision that would silently disable a new instrument.
-- **Trace a new instrument end to end before flying it.** A summary path
-  that set its finished flag before calling the report was dead on
-  arrival; a fix that returned early shadowed the probe meant to measure
-  it, and cost a flight. Ask what would appear in the log if the new code
-  never ran, and make sure that is distinguishable from success.
+## Private analysis and shared state
 
-## Editing config and INI files
+`analysis/`, when present in the main checkout, is a separate private
+repository. Read its own `AGENTS.md` before working there. Game executables,
+Ghidra projects and decompiled material must not be published in this fork,
+its issues or release artifacts.
 
-- **Never edit a live `edvr.ini` with a regex or a PowerShell anchor.**
-  Read it, edit it with the Edit tool, diff before and after. A bad anchor
-  has corrupted Sean's working config.
-- `edvr.ini` in a game directory carries the settings of whoever flew
-  last. A reinstall does not undo an edit to it. `install_edvr.py` does not
-  overwrite an existing one unless `--ini` says so (and backs it up when it
-  does); a missing one it writes, from the newest copy in the `%LOCALAPPDATA%\EDVR`
-  mirror when there is one, else from the shipped default.
-- `edvr-flat.ini` is the flat profile's own settings file: while the flat
-  profile is active, EDVR reads it first and falls back to `edvr.ini`.
-  `--scope flat --ini` writes it (never `edvr.ini`), `--scope both --ini`
-  writes both, and a scope that includes flat seeds it from `edvr.ini` when
-  the game directory has none yet. Everything above about a live `edvr.ini`
-  applies to it verbatim.
-- Settings mirror to `%LOCALAPPDATA%\EDVR\<leaf>-<store>\` and are restored
-  from there, because a game update once wiped the whole install directory
-  including the ini.
-- **Config values name the functionality, never the mechanism.** A key
-  says what the user gets — `on`, `off`, `auto` — not the name of the
-  technique inside.
-- **Every key is one a user would set.** A key added to chase an effect
-  (an A/B switch, an instrument switch, a threshold tuned by a flight) is
-  temporary: list it in the arc's `## Status` block, and when the arc
-  closes, ship the winning value as the behaviour and propose removing the
-  key, quoted, as Scope control requires. A fix that always helps gets no
-  toggle. The holo config sweep and the jitter and steady keys in the
-  2026-10 cleanup build were both this debt, paid late.
+Do not symlink/junction analysis into a worktree or bypass analysis write
+guards through a shell, another clone or another path. Worktree sessions may
+read it but must use its documented intake process for proposed writes.
+An EDVR commit approval does not authorize commits in the analysis repository.
+Protect shared outputs from silent replacement by another session or process.
 
-## Scope control
+## Reporting and documentation
 
-- **Do not remove or rename a feature or config key without quoting the
-  exact key and its current behaviour and asking first.** Similar names
-  are easy to confuse: three separate things here share the word
-  "witchspace", and only `fix.witchspace_stars` touches explosions. A
-  removal was asked for, carried out against the wrong one, and reverted
-  in the same turn.
-- Do the work asked for. If something adjacent is worth fixing, say so;
-  don't fold it in.
+Briefly report what changed, the checks run and their results, and material
+limitations. Distinguish verified behavior from hypotheses and identify the
+tested revision or working-tree state. Do not enumerate every unrelated check.
 
-## Tracking work
+Do not create extra plans, reports, manifests or evidence archives unless
+requested or necessary. This does not prohibit runtime artifacts required by
+the requested behavior, generated assets, or normal build/test output.
+Do not repair unrelated documentation structure as part of an implementation.
+Agent-only handoffs belong under `.agents/`, not source comments or release
+notes; keep agent material `export-ignore`. Human-facing docs belong in `docs/`.
 
-- **Work is tracked in GitHub issues** on
-  `characterecho-sean/edvr-unofficial-patch` (`gh issue list`). A finding
-  to act on later — a review follow-up, a retro item, a bug noticed in
-  passing — becomes an issue. Commits and PRs name it (`(#97)`,
-  `Closes #97`). A plan or task list that only hands one session's work
-  to the next can stay a file; anything meant to outlive the session is
-  an issue.
-- `docs\` holds the evidence: an investigation doc carries an arc's
-  journal, and its `## Status` block links the arc's issues.
-- **Re-fetch a PR's reviews and comments right before posting** replies
-  or a summary to it. A review that landed while you worked otherwise
-  goes unanswered (PR #92, twice).
+## References and layout
 
-## Git
-
-- Solo project: **branch, commit, merge to main, push.** No pull requests.
-- **The task is not done until it is pushed.** After merging run
-  `git push`, then `git log origin/main -1` and confirm the commit is
-  actually there. A commit made and never pushed has been noticed from the
-  other side more than once.
-- **Write commit messages to a file and use `git commit -F`.** PowerShell
-  5.1 does not escape embedded quotes when building a native command line,
-  so a message with `"` in it splits into stray pathspecs. Write the file
-  as UTF-8 without a BOM.
-- Reading a file back to verify it: decode explicitly with
-  `[Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes(path))`.
-  `Get-Content` on a BOM-less UTF-8 file decodes as the ANSI codepage and
-  turns every em-dash into mojibake — that reached a public GitHub comment
-  once.
-- Worktrees under `.claude\worktrees\` and `.Codex\worktrees\` share one
-  stash stack with the main checkout. Never use bare `git stash` / `git
-  stash pop`.
-
-## Agent material
-
-Text addressed to agents rather than people stays where anyone can strip it
-from a clone without reading it: `AGENTS.md` and `CLAUDE.md` at the root,
-where the tools look for them, and everything else agent-only (handoff
-prompts, plans, task lists) under `.agents\`. All of it is `export-ignore`
-in `.gitattributes`, so `git archive` and GitHub's source zips leave it out.
-`tools\check_agent_material.py` checks recognized agent instruction and
-prompt paths for `export-ignore`, and rejects zero-width, bidi or tag
-characters in repository text. Placement of other agent-only material under
-`.agents\` is a rule for authors; filenames alone cannot identify every such
-file.
-
-- `docs\` is written for people and is not agent material, even where an
-  agent wrote it.
-- No agent-addressed text in source comments, commit messages or release
-  notes: none of them can be stripped.
-
-## The analysis directory
-
-`analysis\` in the **main checkout** is its own git repository (private: `characterecho-sean/elite-analysis`),
-cloned into this one and git-ignored here. It holds the decompiler and disassembly notes, the address maps and
-the Ghidra scripts, and, kept local and never committed, the game executables for builds 332841, 334473 and
-334925 and the Ghidra projects. **Read `analysis\AGENTS.md` before working in it**; it has its own rules and skills
-(`elite-rva`, `retarget-build`, `ghidra-headless`, `record-finding`).
-
-- A git worktree has no `analysis\`. Reach it by the main checkout's absolute path
-  (`C:\Users\seanm\projects\edvr-unofficial-patch\analysis`; from a worktree, `git rev-parse --git-common-dir`
-  names `<main>\.git`). **Never junction or symlink it into a worktree**: removing the worktree would delete
-  the 4 GB of Ghidra projects through the link. `tools\build_diff.py` and the per-arc `pins.py` take its
-  executables by path.
-- It is a separate repository: commit there with `git -C analysis ...`, to its own `main`, and stage files by
-  path. Its history is not EDVR's, and nothing in it ships in an EDVR archive.
-- Source comments and docs here cite its files as `analysis\decomp\...`. Those files are not in this public
-  repository: a citation is a pointer for the maintainer, not evidence a stranger can check, so state the
-  fact in the doc as well, and do not paste decompiled code into this repository or its issues.
-- **A session in a worktree does not write into `analysis\`.** The app stops Write and Edit there, and one
-  analysis session, started from the main checkout, is the only writer: it reviews, files and commits what
-  others hand over. Do not get around the guard with a shell write, a second clone or a junction. To hand over
-  a finding, make a new folder `C:\Users\seanm\AppData\Local\EDVR\analysis-inbox\<yyyymmdd-hhmmss>-<topic>\`
-  (outside every repository, so it survives your worktree), put the notes and scripts in it with a
-  `MANIFEST.md` (build, from, summary, and for each file its destination under `analysis\`; the format and the
-  checks are in `analysis\AGENTS.md`, "Intake"), then send the folder name to the session titled
-  `elite-analysis intake` (`ListAgents`, or `mcp__ccd_session_mgmt__list_sessions`) if it is running. If it
-  is not, say in your report that an item is waiting. Cite the file in your doc as `analysis\decomp\<name>`
-  once it is filed. Reading `analysis\` needs no handover.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `src\d3d11\` | the graphics half: hooks, shader fixes, the draw census |
-| `src\openxr\` | the native OpenXR runtime: the OpenVR ABI Elite calls, translated to OpenXR |
-| `src\openvr\compat\` | the OpenVR ABI header |
-| `src\installer\` | the self-contained installer and its log bundler |
-| `src\common\` | config, logging, the crash sentinel |
-| `tools\` | Python tools, each with `--self-test`; C++ test rigs in subdirs |
-| `docs\` | one investigation doc per arc — read its `## Status` block first |
-| `CODING_STANDARDS.md` | review: the judgement rules for every diff, applied by its author before pushing and by its reviewer |
-| `GLOSSARY.md` | the project's terms: game builds, binding, build-map statuses; use them, add a term when one is settled |
-| `.agents\` | agent-only material: handoff prompts, plans; `export-ignore`, never in an archive |
-| `analysis\` | main checkout only: the private `elite-analysis` repository (git-ignored here), see above |
-| `build.bat` | full build, all gates; `--dll-only` is the receipt-guarded promotion path |
-| `package.bat <version>` | packages a release from the last full build; it does not build, and refuses unless the build's receipt matches the tree (run `build.bat --wait-lock` first) |
+- `CODING_STANDARDS.md`: relevant code-review and correctness rules.
+- `docs/building.md`: detailed platform, build, receipt and packaging recipes.
+- `docs/windows-release-ci-2026-10-18.md`: Windows CI background, not permission
+  to dispatch it. Release packaging and credits apply only to authorized releases.
+- `src/d3d11/`: graphics hooks and rendering fixes; `src/common/`: shared code.
+- `src/openxr/`: OpenXR runtime; `src/openvr/compat/`: OpenVR ABI.
+- `src/installer/`: installer; `tools/`: existing tooling and test infrastructure.
+- `build.bat` / `package.bat`: official full-validation and packaging entry points.
