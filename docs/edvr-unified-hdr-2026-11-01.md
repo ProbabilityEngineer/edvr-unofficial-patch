@@ -497,6 +497,95 @@ Full engine/resolver/foreground compilation is blocked locally by the absent
 generated `temporal_shader_bytecode.h`. These are not Windows DLL validation
 or Elite/DXMT gameplay results. No remote CI or deployment was performed.
 
+#### Record-isolation flight, 2026-11-06 23:05
+
+After approved owner-fork push and graphics-only CI 42307373267 (passed in
+8m41s), the user supplied `edvr_gfx_20261106_230550.log`. It identifies
+`6b6b3978` / `6AEE5B22`, linked 22:56:34 UTC. The user reports AA not visibly
+working, glass decals restored, and the memory problem still present.
+
+All ten allocation reports confirm isolation active, engine records inactive,
+zero pinned game buffers and zero record substitutions. Resolver attempts
+remain zero; preflight attempts reach 11762. HDR-route reports decline with
+`engine-source-not-ready`, explaining the absent treatment without requiring
+a visual guess. Initial mode is `on` (TAA); at 23:09:10–14 the user cycles
+DLSS, FSR, XeSS, off and back to on. Scene/output reports show 3024x1964,
+not the previous 4536x2946 supersampled scene. This is not a fixed-settings
+rate comparison against the earlier FSR/supersampled flight.
+
+Before that mode cycle, external estimated live texture bytes rise from
+2402789687 at 23:06:50 to 4120714111 at 23:08:50 (2292 -> 3930 MiB).
+Foreground capture and domain-marker attempts are both zero throughout
+those samples. The brief later foreground activity submits 372 domain
+markers and makes 22 buffers, all 22 destroyed by 23:09:20. No foreground
+textures are recorded. A further foreground-disable flight is not needed
+just to establish that growth can occur without foreground capture.
+
+At 23:09:20–23:10:20 all owner totals are stable: engine/domain helper one
+texture / 95026176 estimated bytes plus a 16-byte buffer; resolver eight
+textures / 172234944 bytes plus a 336-byte buffer; other EDVR four textures /
+55691664 bytes plus four buffers / 976 bytes. Foreground live bytes are zero.
+The surviving engine-labelled allocations belong to the independently
+enabled domain path, not evidence that record isolation failed.
+Attachment failures, cap skips and pending attachments are zero. Local GPU
+usage rises 3520 -> 7530 MB over the periodic samples; the supplied screenshot
+shows system pressure/compression but its `wine` filter does not show Elite's
+per-process usage.
+
+The glass regression is now implicated in the disabled record-motion group;
+the exact responsible shader/draw is still unproven. The memory symptom does
+not require that group, successful resolve, or sustained foreground capture.
+The next active shared-path target is projection/buffer tracking and map
+bounce: late five-second windows still perform roughly 70000 bounced maps
+and 166 MB of flush traffic, with zero open mappings at Present. Those are
+work/traffic counters, not retained-byte measurements. Owner-created resource
+totals do not show a runaway pool, but do not clear retained game references,
+CPU-side bookkeeping or driver backing-storage behavior.
+
+#### Memory investigation: current conclusions and next step
+
+**Quick recap as of the 23:05 isolation flight:**
+
+| Comparison / observation | What it tells us |
+| --- | --- |
+| User reports no problem without EDVR, and could not reproduce with `fix.temporal_aa = off` | AA-enabled EDVR behavior remains the leading scope; external texture creation does not absolve EDVR of retaining or indirectly affecting those resources. |
+| HDR-output-off run still reproduced | HDR output is not required for the reported memory problem. |
+| Record-isolation build restored glass decals, but memory trouble remained | The decal regression is implicated in the disabled engine-record group. The memory symptom does not require that group. Treat the two symptoms separately. |
+| Isolation log records zero substitutions, zero pinned engine buffers and zero resolver attempts | The isolation actually executed as intended; this was not just a setting that failed to take effect. |
+| Texture growth preceded any foreground capture in that flight | Another foreground-off flight is not needed merely to establish that growth can occur without capture. |
+| Measured EDVR allocations stayed bounded while external live textures increased | No growing EDVR-created pool has been identified. This does **not** identify who retains game resources or rule out CPU storage / driver backing-storage growth. |
+
+The exact leak/retention mechanism remains **unidentified**. Live texture growth
+alone is not proof of leaked references: the no-symptom AA-off control also
+loaded substantial texture data. The runs differ in AA mode, scene resolution
+and activity, so their absolute footprints and growth rates are not a clean
+one-variable comparison. The isolation build is a diagnostic, not a usable AA
+mode or a confirmed fix; do not expect it to provide correct temporal AA.
+
+**Next: source inspection of projection tracking and Map/Unmap bounce.**
+No additional flight is needed before this inspection. Follow ownership through:
+
+1. **Registration:** which game-buffer references and CPU shadow/history storage
+   are acquired when a buffer enters tracking.
+2. **Map/Unmap completion:** whether success, refusal and failure paths all release
+   temporary ownership.
+3. **Replacement and retirement:** whether old identities, references or storage
+   survive after the game replaces a buffer.
+4. **AA stand-down:** what AA-off releases that stays resident while AA is
+   selected but treatment is refused.
+
+Zero open mappings at Present argues against simply leaving maps open; it does
+not account for references or storage retained after completed mappings. The
+roughly 166 MB per five seconds is copy traffic, **not a measured leak rate**.
+
+If a concrete lifetime defect is found, add a focused regression test and fix
+that defect. If source inspection remains inconclusive, the next candidate is
+a temporary map-bounce bypass: preserve the game's original Map/Unmap calls,
+and safely refuse treatment that needs unavailable tracking. This candidate
+has **not been implemented or tested**. Further remote CI and deployment need
+separate approval; no speculative signage fix, blanket cache reset or permanent
+INI switch is part of this step.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.
