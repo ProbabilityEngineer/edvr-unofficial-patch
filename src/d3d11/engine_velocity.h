@@ -78,6 +78,8 @@ constexpr unsigned kEngineVelocityScenePrevCb = 2;
 void engineVelocityConfigure(bool on);
 void engineVelocityShutdown();
 bool engineVelocityActive() noexcept;
+// Private diagnostic snapshot: cached descriptor bytes, no driver calls.
+void engineVelocityMemoryPins(uint64_t& count, uint64_t& bytes);
 // Engine motion's diagnostics wanted (temporal_pass: advanced.temporal_aa_
 // diagnostics or an eye run): the emit's census runs only
 // then (the 2026-09-23 performance review).

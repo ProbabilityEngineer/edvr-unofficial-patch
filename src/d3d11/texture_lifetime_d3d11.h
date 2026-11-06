@@ -53,10 +53,11 @@ private:
     bool armed_ = false;
 };
 
-// Called once per successful CreateTexture2D result, while the caller owns
-// its initial resource reference. No locks span a driver/COM call.
+// Called once per resource/tag GUID, while the caller owns its initial
+// resource reference. No locks span a driver/COM call.
 template<class Resource>
-void attach(Ledger& ledger, Resource* resource, const Key& key, uint64_t bytes) {
+void attach(Ledger& ledger, Resource* resource, const Key& key, uint64_t bytes,
+            REFGUID tagGuid = kTagGuid) {
     const unsigned slot = ledger.reserve(key);
     if (slot == kInvalid) return;
     auto* tag = new (std::nothrow) Tag(ledger, slot, bytes);
@@ -64,7 +65,7 @@ void attach(Ledger& ledger, Resource* resource, const Key& key, uint64_t bytes) 
         ledger.failed();
         return;
     }
-    const HRESULT hr = resource->SetPrivateDataInterface(kTagGuid, tag);
+    const HRESULT hr = resource->SetPrivateDataInterface(tagGuid, tag);
     if (SUCCEEDED(hr)) tag->arm();
     else ledger.failed();
     tag->Release();

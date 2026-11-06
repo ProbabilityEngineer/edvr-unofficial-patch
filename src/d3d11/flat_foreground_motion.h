@@ -1,4 +1,5 @@
 #pragma once
+#include "aa_memory_scope.h"
 #include "animated_vertex_history.h"
 #include "flat_animated_identity_ledger.h"
 #include "flat_foreground_identity_sample.h"
@@ -272,6 +273,8 @@ public:
     }
     bool capture(ID3D11DeviceContext* ctx,PanelCurveDrawFn draw,unsigned count,unsigned instances,
                   unsigned start,int base,unsigned startInstance,unsigned frame,const Inputs& inputs) {
+        aa_memory::Scope allocationScope(aa_memory::Owner::Foreground);
+        aa_memory::note(aa_memory::Work::ForegroundCapture);
         beginFrame(frame);++stats_.attempts;drawRefusal_=nullptr;Draw d;d.inputs=inputs;
         // The identity samples a few frames old are read once a frame, here, without waiting.
         if(polledFrame_!=frame){polledFrame_=frame;pollIdentity(ctx,frame);pollSibling(ctx,frame);history_.pollExtents(ctx,frame);shadow_.poll(ctx,frame);}
@@ -360,6 +363,7 @@ public:
     }
     bool prepareH(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* owners,ID3D11ShaderResourceView* rawDepth,
                   const float worldCamera[6][4],unsigned frame,unsigned width,unsigned height,Output& out) {
+        aa_memory::Scope allocationScope(aa_memory::Owner::Foreground);
         out=Output{};out.frame=frame;hFrame_=frame;
         auto refuse=[&](const char* reason){out.refusal=reason;return false;};
         if(frame!=frame_ || refusal_)return refuse(refusal_?refusal_:"foreground-frame");

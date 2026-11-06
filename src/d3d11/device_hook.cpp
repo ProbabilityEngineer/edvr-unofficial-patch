@@ -58,6 +58,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "hdr_output.h"   // fix.hdr: the swapchain's format, the widened post-tone targets, the two substituted shaders and the output transform
 #include "present_dispatch.h"
 #include "texture_lifetime_diagnostics.h"
+#include "aa_memory_diagnostics.h"
 #include "vr_display_observer.h"  // the game window's state (read only) and its handle
 #include "desktop_window.h"  // visual.desktop_window: the eye image drawn into Elite's desktop window at its Present
 #include "mode_watch.h"     // modeWatchFrameBoundary: the 3D mode watch's commit, at the frame boundary
@@ -925,6 +926,7 @@ HRESULT STDMETHODCALLTYPE hookedCreateTexture2D(ID3D11Device* self,
                 const uint64_t bytes = texture2DBytes(actual) *
                     (actual.SampleDesc.Count ? actual.SampleDesc.Count : 1u);
                 texture_lifetime::observe(*out, actual, fromEdvr, bytes);
+                aa_memory::observe(*out, false, fromEdvr, bytes);
             }
             g_createTextures.fetch_add(1, std::memory_order_relaxed);
             g_createTextureBytes.fetch_add(texture2DBytes(*desc), std::memory_order_relaxed);
@@ -1107,6 +1109,7 @@ __declspec(noinline) void noteDeviceCreateFailure(size_t slot, HRESULT hr, const
 template <size_t Slot, bool FirstIsResource>
 HRESULT STDMETHODCALLTYPE hookedDevCreate(ID3D11Device* self, const void* first,
                                           const void* second, void** out) {
+    const bool fromEdvr = Slot == kDevCreateBuffer && addressInEdvr(_ReturnAddress());
     const HRESULT hr = g_state->realDevCreate[Slot](self, first, second, out);
     // Patching in place hooks the CLASS, so another device sharing the table
     // arrives here too. It gets the same forward; only ours gets the line.
@@ -1115,6 +1118,13 @@ HRESULT STDMETHODCALLTYPE hookedDevCreate(ID3D11Device* self, const void* first,
             noteDeviceCreateFailure(Slot, hr, first, second, FirstIsResource);
         } else if constexpr (Slot == kDevCreateBuffer) {
             const auto* desc=static_cast<const D3D11_BUFFER_DESC*>(first);
+            if (out && *out && runtimeFlatProfile() &&
+                (fromEdvr || aa_memory::current != aa_memory::Owner::None)) {
+                D3D11_BUFFER_DESC actual{};
+                auto* buffer = static_cast<ID3D11Buffer*>(*out);
+                buffer->GetDesc(&actual);
+                aa_memory::observe(buffer, true, fromEdvr, actual.ByteWidth);
+            }
             if(out && *out)engineVelocityBufferCreated(static_cast<ID3D11Buffer*>(*out),desc);
             // A destroyed buffer's address can be reused by a fresh one; a watched planet-patch buffer would otherwise
             // inherit that buffer's stale shadow. Guarded like the Map/Unmap tees (celestial_motion.h): with nothing
@@ -2051,8 +2061,13 @@ void notePresentStatus(UINT flags, HRESULT result) {
                     PresentStatusCounters::kMaxReports,
                     snapshot.report == PresentStatusCounters::kMaxReports
                         ? " reporting-stopped=session-cap" : "");
-    if (runtimeFlatProfile())
+    if (runtimeFlatProfile()) {
         texture_lifetime::report(snapshot.report, PresentStatusCounters::kMaxReports);
+        uint64_t pinnedCount = 0, pinnedBytes = 0;
+        engineVelocityMemoryPins(pinnedCount, pinnedBytes);
+        aa_memory::report(snapshot.report, PresentStatusCounters::kMaxReports,
+            engineVelocityActive(), pinnedCount, pinnedBytes);
+    }
 }
 
 HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,

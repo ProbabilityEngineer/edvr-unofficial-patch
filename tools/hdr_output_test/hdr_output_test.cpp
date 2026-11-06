@@ -7,6 +7,7 @@
 #include "../../src/d3d11/hdr_shader_identity.h"
 #include "../../src/d3d11/present_dispatch.h"
 #include "texture_lifetime_tests.h"
+#include "aa_memory_tests.h"
 #ifdef _WIN32
 #include "hdr_shader_tests.h"
 #endif
@@ -319,7 +320,7 @@ int main(int argc, char** argv) {
                         "rule over the tone target, the exclusions and the inexact views, and read "
                         "src/common/flat_profile_keys.h to check fix.hdr is gated in, and run the "
                         "display-mode retry rule, HDR shader identities, TEST-Present dispatch/counters "
-                        "and bounded texture-lifetime accounting. On Windows, also "
+                        "and bounded texture-lifetime / AA allocation-scope accounting. On Windows, also "
                         "check compressed-texture lifetimes through production state capture, "
                         "compile/reflect tone variants and execute exposure on WARP "
                         "(--hardware-self-test selects the hardware adapter). "
@@ -343,6 +344,7 @@ int main(int argc, char** argv) {
     shaderIdentities();
     presentStatusOnly();
     texture_lifetime_tests::run(check);
+    aa_memory_tests::run(check);
 #ifdef _WIN32
     texture_lifetime_tests::runCom(check);
     hdr_shader_tests::run(check, hardware);

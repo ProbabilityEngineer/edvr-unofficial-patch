@@ -1,6 +1,7 @@
 #pragma once
 #include "../../src/d3d11/hdr_output_shaders.h"
 #include "texture_lifetime_tests.h"
+#include "aa_memory_tests.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -67,6 +68,7 @@ template<class Check> void run(Check check, bool hardware) {
     if (!device) return;
     texture_lifetime_tests::runDevice(check, device.Get());
     texture_lifetime_tests::runCapture(check, device.Get());
+    aa_memory_tests::runDevice(check, device.Get());
     ComPtr<ID3D11ComputeShader> shader;
     if (FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader))) {
         check(false, "exposure compute shader"); return;

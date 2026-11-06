@@ -1,6 +1,7 @@
 #include "flat_origin_capture.h"
 #include "flat_forward_light.h"
 #include "engine_velocity.h"
+#include "aa_memory_scope.h"
 #include "temporal_shader_bytecode.h"
 #include "dxbc_flat_overlay.h"
 
@@ -924,7 +925,7 @@ bool snapshotOverlayBase(ID3D11DeviceContext* ctx, Eye& e) {
         d.MiscFlags = 0;
         Ptr<ID3D11Device> dev;
         ctx->GetDevice(&dev);
-        if (FAILED(dev->CreateTexture2D(&d, nullptr, &e.overlayBase)) ||
+        if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateTexture2D(&d, nullptr, &e.overlayBase); })) ||
             FAILED(dev->CreateShaderResourceView(e.overlayBase.Get(), nullptr, &e.overlayBaseSrv))) {
             e.overlayBase.Reset(); e.overlayBaseSrv.Reset();
             return false;
@@ -1244,7 +1245,7 @@ FlatMarkerPlane* flatMarkerPlane(ID3D11DeviceContext* ctx, ID3D11Texture2D* dept
         d.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;d.Usage=D3D11_USAGE_DEFAULT;
         d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
         Ptr<ID3D11Device> dev;ctx->GetDevice(&dev);
-        if(FAILED(dev->CreateTexture2D(&d,nullptr,&plane->slots)) ||
+        if(FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateTexture2D(&d,nullptr,&plane->slots); })) ||
            FAILED(dev->CreateRenderTargetView(plane->slots.Get(),nullptr,&plane->rtv)) ||
            FAILED(dev->CreateShaderResourceView(plane->slots.Get(),nullptr,&plane->srv))) {
             *plane=FlatMarkerPlane{};++g_draw.createFailed;return nullptr;
@@ -1269,7 +1270,7 @@ void makeSkinTarget(ID3D11DeviceContext* ctx, Eye& e, int eye, unsigned width, u
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     Ptr<ID3D11Device> dev;
     ctx->GetDevice(&dev);
-    if (FAILED(dev->CreateTexture2D(&d, nullptr, &e.skin)) || FAILED(dev->CreateRenderTargetView(e.skin.Get(), nullptr, &e.skinRtv)) ||
+    if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateTexture2D(&d, nullptr, &e.skin); })) || FAILED(dev->CreateRenderTargetView(e.skin.Get(), nullptr, &e.skinRtv)) ||
         FAILED(dev->CreateShaderResourceView(e.skin.Get(), nullptr, &e.skinSrv))) {
         e.skin.Reset(); e.skinRtv.Reset(); e.skinSrv.Reset();
         e.skinFailed = true;
@@ -1329,7 +1330,7 @@ bool ensureSlots(ID3D11DeviceContext* ctx, Eye& e, int eye, ID3D11Texture2D* dep
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     Ptr<ID3D11Device> dev;
     ctx->GetDevice(&dev);
-    if (FAILED(dev->CreateTexture2D(&d, nullptr, &e.slots)) ||
+    if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateTexture2D(&d, nullptr, &e.slots); })) ||
         FAILED(dev->CreateRenderTargetView(e.slots.Get(), nullptr, &e.slotsRtv)) ||
         FAILED(dev->CreateShaderResourceView(e.slots.Get(), nullptr, &e.slotsSrv))) {
         e.slots.Reset(); e.slotsRtv.Reset(); e.slotsSrv.Reset(); e.depth.Reset();
@@ -1406,7 +1407,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         D3D11_BUFFER_DESC d = pd;
         d.Usage = D3D11_USAGE_DEFAULT; d.CPUAccessFlags = 0; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         d.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-        if (FAILED(dev->CreateBuffer(&d, nullptr, &e.pool)) || FAILED(dev->CreateShaderResourceView(e.pool.Get(), nullptr, &e.poolSrv))) {
+        if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateBuffer(&d, nullptr, &e.pool); })) || FAILED(dev->CreateShaderResourceView(e.pool.Get(), nullptr, &e.poolSrv))) {
             e.pool.Reset(); e.poolSrv.Reset(); e.poolBytes = 0; ++g_draw.createFailed;
             invalidate(e, kCreate);
             return false;
@@ -1420,7 +1421,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         D3D11_BUFFER_DESC d{};
         d.ByteWidth = std::max<UINT>(sd.ByteWidth, kStampBytes); d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        for (auto& b : e.scene) if (FAILED(dev->CreateBuffer(&d, nullptr, &b))) {
+        for (auto& b : e.scene) if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateBuffer(&d, nullptr, &b); }))) {
             for (auto& c : e.scene) c.Reset();
             e.sceneBytes = 0; ++g_draw.createFailed;
             invalidate(e, kCreate);
@@ -1456,7 +1457,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         if (!e.stampCell) {
             D3D11_BUFFER_DESC cd{};
             cd.ByteWidth = 16; cd.Usage = D3D11_USAGE_DEFAULT;
-            if (FAILED(dev->CreateBuffer(&cd, nullptr, &e.stampCell))) {
+            if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateBuffer(&cd, nullptr, &e.stampCell); }))) {
                 ++g_draw.createFailed;
                 invalidate(e, kCreate);
                 return false;
@@ -2648,6 +2649,14 @@ void clearLocked() {
 using namespace engine_velocity_detail;
 
 bool engineVelocityActive() noexcept { return live.load(std::memory_order_acquire); }
+void engineVelocityMemoryPins(uint64_t& count, uint64_t& bytes) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    count = bytes = 0;
+    for (const auto& slot : g_primaryMaps) if (slot.buffer) {
+        ++count;
+        bytes += slot.bytes;
+    }
+}
 
 int engineVelocityFormatUnkeyed(char* out, size_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
@@ -2685,6 +2694,7 @@ void armSkinLocked() {
 }  // namespace engine_velocity_detail
 
 void engineVelocityConfigure(bool on) {
+    on = on && aa_memory::engineRecordsAllowed(runtimeFlatProfile());
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (on && live.load(std::memory_order_acquire) && !g_emitAttached) { attachEmitLocked(true); return; }
     if (on == live.load(std::memory_order_acquire)) return;
@@ -2822,6 +2832,7 @@ void engineVelocityAfterFlatDraw(ID3D11DeviceContext* ctx) {
 bool engineVelocityFlatDomainBeginDraw(ID3D11DeviceContext* ctx,ID3D11Texture2D* depth,
     const void* vsBytes,size_t vsSize,const void* psBytes,size_t psSize,
     FlatEngineDomain domain,const char** reason,bool coverage,unsigned writerToken,unsigned primitiveCount) {
+    aa_memory::note(aa_memory::Work::DomainAttempt);
     const bool pool=domain!=FlatEngineDomain::World;
     auto fail=[&](const char* why){if(reason)*reason=why;return false;};
     if(reason)*reason=nullptr;
@@ -2926,7 +2937,7 @@ bool engineVelocityFlatDomainBeginDraw(ID3D11DeviceContext* ctx,ID3D11Texture2D*
         if(!g_flatDomainTokenBuffer) {
             Ptr<ID3D11Device> dev;ctx->GetDevice(&dev);D3D11_BUFFER_DESC d{};
             d.ByteWidth=16;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
-            if(FAILED(dev->CreateBuffer(&d,nullptr,&g_flatDomainTokenBuffer)))return fail("flat-domain-token-buffer-allocation");
+            if(FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateBuffer(&d,nullptr,&g_flatDomainTokenBuffer); })))return fail("flat-domain-token-buffer-allocation");
         }
         saved.tokenSlot=shader->tokenSlot;
         ctx->QueryInterface(IID_PPV_ARGS(&saved.rangedContext));
@@ -2952,6 +2963,7 @@ bool engineVelocityFlatDomainBeginDraw(ID3D11DeviceContext* ctx,ID3D11Texture2D*
     }
     for(auto* view:verified)if(view)view->Release();
     if(!bound){engineVelocityFlatDomainEndDraw(ctx);return fail("flat-domain-slot-bind-refused");}
+    aa_memory::note(aa_memory::Work::DomainIssued);
     return true;
 }
 bool engineVelocityFlatSourceShaders(ID3D11DeviceContext* ctx,uint64_t vsHash,uint64_t psHash) {
@@ -3008,6 +3020,7 @@ bool engineVelocityFlatDomainSlots(ID3D11Texture2D* depth,ID3D11ShaderResourceVi
 }
 
 bool engineVelocityFlatBeginDraw(ID3D11DeviceContext* ctx, bool* gameHadTarget6) {
+    aa_memory::note(aa_memory::Work::EngineAttempt);
     const bool wasBound = g_flatPending.load(std::memory_order_relaxed);
     flatSaveTargets(ctx);
     if (gameHadTarget6) *gameHadTarget6 = g_flatGame.rtv[kEngineVelocityTarget] != nullptr;
@@ -3019,6 +3032,7 @@ bool engineVelocityFlatBeginDraw(ID3D11DeviceContext* ctx, bool* gameHadTarget6)
     }
     gpuRunBegin(ctx);   // a no-op inside a run the bracket kept bound
     if (wasBound) ++g_draw.flatKept; else ++g_draw.flatRuns;
+    aa_memory::note(aa_memory::Work::EngineSubstituted);
     return true;
 }
 
@@ -3050,6 +3064,7 @@ void engineVelocityFlatFrameEnd() noexcept {
     g_flatGame = FlatGame{};
     g_gameBlendMemo = GameBlendMemo{};
     g_keptMemo = KeptMemo{};
+    aa_memory::note(aa_memory::Work::FrameCleanup);
 }
 
 void engineVelocityFlatAbandon() noexcept {
@@ -3581,7 +3596,7 @@ bool engineVelocityPrepareSourceFree(ID3D11DeviceContext* ctx, ID3D11Texture2D* 
         D3D11_BUFFER_DESC d{};
         d.ByteWidth = emit::kItemBytes; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; d.StructureByteStride = emit::kItemBytes;
-        if (FAILED(dev->CreateBuffer(&d, nullptr, &e.pool)) || FAILED(dev->CreateShaderResourceView(e.pool.Get(), nullptr, &e.poolSrv))) {
+        if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateBuffer(&d, nullptr, &e.pool); })) || FAILED(dev->CreateShaderResourceView(e.pool.Get(), nullptr, &e.poolSrv))) {
             e.pool.Reset(); e.poolSrv.Reset(); e.poolBytes = 0; ++g_draw.createFailed;
             invalidate(e, kCreate);
             return false;
@@ -3595,7 +3610,7 @@ bool engineVelocityPrepareSourceFree(ID3D11DeviceContext* ctx, ID3D11Texture2D* 
         e.sceneFrame[0] = e.sceneFrame[1] = ~0u;
         D3D11_BUFFER_DESC d{};
         d.ByteWidth = std::max<UINT>(sceneBytes, kStampBytes); d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        for (auto& b : e.scene) if (FAILED(dev->CreateBuffer(&d, nullptr, &b))) {
+        for (auto& b : e.scene) if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateBuffer(&d, nullptr, &b); }))) {
             for (auto& c : e.scene) c.Reset();
             e.sceneBytes = 0; ++g_draw.createFailed;
             invalidate(e, kCreate);
@@ -3606,7 +3621,7 @@ bool engineVelocityPrepareSourceFree(ID3D11DeviceContext* ctx, ID3D11Texture2D* 
     if (!e.rowsCell) {
         D3D11_BUFFER_DESC cd{};
         cd.ByteWidth = kRowsBytes + 16; cd.Usage = D3D11_USAGE_DEFAULT;
-        if (FAILED(dev->CreateBuffer(&cd, nullptr, &e.rowsCell))) { ++g_draw.createFailed; invalidate(e, kCreate); return false; }
+        if (FAILED(aa_memory::create(aa_memory::Owner::Engine, [&] { return dev->CreateBuffer(&cd, nullptr, &e.rowsCell); }))) { ++g_draw.createFailed; invalidate(e, kCreate); return false; }
     }
     uint8_t cell[kRowsBytes + 16] = {};
     std::memcpy(cell, rows, kRowsBytes);

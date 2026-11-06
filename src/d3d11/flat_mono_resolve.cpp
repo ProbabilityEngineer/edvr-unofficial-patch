@@ -1,5 +1,6 @@
 #include "flat_origin_capture.h"
 #include "flat_mono_resolve.h"
+#include "aa_memory_scope.h"
 #include "dlaa.h"
 #include "fsr3_engine.h"
 #include "xess_engine.h"
@@ -1012,6 +1013,8 @@ static FlatMonoResolvePreflightResult preflightBody(ID3D11Device* device,
 }
 FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
     ID3D11DeviceContext* context,const FlatMonoResolvePreflight& planned) {
+    aa_memory::Scope allocationScope(aa_memory::Owner::Resolver);
+    aa_memory::note(aa_memory::Work::ResolvePreflight);
     // The HDR route's plan, at the Present that ends the frame that made it: the route's crumbs bracket the whole preflight
     // and, through g_crumbOn, every creation inside it (flat_hdr_crumbs.h). A copy-route plan writes nothing.
     CrumbScope crumbs(planned.hdr);
@@ -1054,6 +1057,8 @@ void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpa
 
 bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& f,
                      ID3D11ShaderResourceView** output,const char** reason) {
+    aa_memory::Scope allocationScope(aa_memory::Owner::Resolver);
+    aa_memory::note(aa_memory::Work::ResolveAttempt);
     CrumbScope crumbs(f.hdr);   // the HDR route's breadcrumbs (flat_hdr_crumbs.h) for every step below
     ++stats.calls;
     if(output)*output=nullptr;

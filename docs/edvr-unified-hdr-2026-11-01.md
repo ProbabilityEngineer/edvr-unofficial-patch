@@ -434,6 +434,69 @@ work versus genuine progressive retention, including driver backing storage
 not measured by texture-object tags. No runtime code, settings, or artifacts
 were changed for this review.
 
+#### Prepared AA allocation-scope control and record-velocity isolation
+
+The private control candidate adds `aa_memory_scope.h` and
+`aa_memory_diagnostics.h`. Successful hooked buffer and Texture2D creations
+are tagged without retaining the resource, using a GUID separate from the
+existing texture-lifetime tag. The original all-origin texture measurement
+remains intact. Allocations are attributed to engine-motion creation sites,
+foreground capture/map preparation, resolver preflight/resolve (including
+synchronous SDK calls), or other EDVR call sites. This is **allocation-scope
+attribution, not proof of the current retaining owner**.
+
+Buffer accounting uses full descriptor `ByteWidth`, so retained pool capacity
+continues to count even when logical history records shrink. Texture bytes
+remain estimates. No driver physical backing storage is measured. Unscoped
+external buffers, pre-hook resources, swapchain images and other creation
+entrypoints are excluded; allocations on other threads do not inherit the
+calling thread's scope. Owner texture totals overlap the original texture
+totals and must not be added to them. Each owner/kind has its own 65536-tag cap,
+with observed, failure, skipped and pending counts. Reporting shares the
+existing 30-second / 120-sample limit.
+
+The same report snapshots the engine's up-to-16 pinned game buffers using
+cached descriptor bytes, and gives cumulative execution counters for record
+substitution attempts/successes, independent domain-marker attempts/successes,
+foreground capture attempts, resolve preflights/attempts and completed
+engine frame cleanup. Existing detailed foreground and backend reports remain
+necessary to distinguish attempts, refusals and successful treatment.
+Pinned-buffer bytes describe held references, not additional allocations;
+they must not be blindly added to the allocation totals.
+
+The control builds with `aa_memory::kIsolateEngineRecords = false`. Its
+isolation derivative changes only this compile-time constant to true.
+`engineVelocityConfigure` then takes the existing off/stand-down path in the
+flat profile, without changing `fix.temporal_aa` or live settings. VR is
+unchanged. This prevents the record emit/copy observers, pool-family
+substitutions and their private copies from being enabled.
+
+The independent domain-marker bracket in `engine_velocity.cpp` intentionally
+remains available to foreground capture. Disabling that whole source module
+would conflate the two paths. Existing engine-view accessors refuse missing
+record-velocity inputs; consumers retain their normal refusal/fallback rules.
+This is a diagnostic isolation, not a usable AA mode or a memory-leak fix.
+
+For a future authorized flight, verify the DLL revision and
+`isolate-engine-records=1`, `engine-active=0`, zero pinned engine buffers and
+zero record substitutions. Then inspect whether foreground/domain work
+actually continued. If it did not, disappearance of the symptom only
+implicates the disabled group of work, not record copying alone. Keep HDR,
+supersampling and gameplay comparable; record the glass-decals outcome
+separately from memory. Flat owner totals versus physical allocation and the
+ordinary texture lifetime curves distinguish persistent working memory from
+progressive object growth, but stable owner counts cannot clear all driver
+backing-storage behavior.
+
+Local control checks: 75 portable checks and 116 CrossOver checks requesting
+WARP passed, including dual-tag coexistence, final texture/buffer-view release,
+full-capacity counting and thread-local scope restoration. ARM64EC test-TU
+syntax passed. Device-hook syntax has the same 29 MinGW errors as the parent
+under `-fms-extensions` / unlimited diagnostics (same error multiset).
+Full engine/resolver/foreground compilation is blocked locally by the absent
+generated `temporal_shader_bytecode.h`. These are not Windows DLL validation
+or Elite/DXMT gameplay results. No remote CI or deployment was performed.
+
 ## Original status
 
 State: implemented, flown once, DID NOT RUN, cause found and fixed, rebuilt.
