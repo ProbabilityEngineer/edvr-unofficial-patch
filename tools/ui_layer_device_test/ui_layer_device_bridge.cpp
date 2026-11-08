@@ -62,6 +62,25 @@ bool newCachesCleared() {
            !g_rip.cb && !g_rip.cs && !g_rip.csTried && !g_rip.stage && !g_rip.check && !g_rip.filter &&
            !g_rip.gainZ && !g_rip.gainY;
 }
+// The Galaxy Map's cached states (the depth-stencil states, the cloned rasterizer, the two blend states) as the first map issue makes them.
+bool mapStatesReady(ID3D11DeviceContext* ctx) {
+    return mapDepthState(ctx, false) && mapDepthState(ctx, true) && mapDepthRaster(ctx, nullptr) && mapBlend(ctx, 2) && mapBlend(ctx, 3);
+}
+bool mapStatesOwnedBy(ID3D11Device* dev) {
+    const auto own = [&](ID3D11DeviceChild* c) {
+        if (!c) return false;
+        ID3D11Device* d = nullptr;
+        c->GetDevice(&d);
+        const bool same = d == dev;
+        if (d) d->Release();
+        return same;
+    };
+    return own(g_mapDss[0].Get()) && own(g_mapDss[1].Get()) && own(g_mapRsBias.Get()) && own(g_mapBlend[0].Get()) && own(g_mapBlend[1].Get());
+}
+bool mapStatesCleared() {
+    return !g_mapDss[0] && !g_mapDss[1] && !g_mapDssTried[0] && !g_mapDssTried[1] && !g_mapRsBias && !g_mapRsGame && !g_mapBlend[0] && !g_mapBlend[1] &&
+           !g_mapTone.copy && !g_mapTone.patch && !g_mapTone.width;
+}
 ID3D11VertexShader* sharpVs() { return g_srcVs; }
 ID3D11PixelShader* sharpPs() { return g_srcPs; }
 ID3D11BlendState* sharpSourceBlend() { return g_sharpStates.sourceBlend.Get(); }
@@ -183,6 +202,16 @@ bool missingConsumerLeavesCurrentDrawStock(ID3D11DeviceContext* ctx) {
     g_draw = Draw{};
     return ok;
 }
+
+// The eye-draw note's early exit (item 3 of the VR draw-path test build): the out-of-line body's first act is to clear the
+// pending tonemap record, so a record that survives a call is proof the body was not entered. Arm the record, with or
+// without the header flag, then ask whether it is still pending.
+void crispProbeArm(bool headerFlag) {
+    g_crispPending = CrispTonePending{};
+    g_crispPending.pending = true;
+    detail::g_uiLayerCrispPending = headerFlag;
+}
+bool crispProbeRecordPending() { return g_crispPending.pending; }
 
 // ---- The back-off of the HDR HUD path and the weapons layer (2026-11-03). Each returns null when every step held, else the step that did not.
 // They read the production state directly and move the production clock (g_backOffSkewMs) instead of waiting.

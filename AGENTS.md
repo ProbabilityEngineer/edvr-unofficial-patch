@@ -91,10 +91,12 @@ If a required project gate exceeds the approved scope, explain once and ask.
 - The full build runs tests and installer gates and produces a receipt.
   `--dll-only` is receipt-guarded; it is not a shortcut around validation.
   Compile-only outputs are not validated release artifacts.
-- For an explicitly unvalidated graphics test DLL, the supported path is
-  `--compile-only --graphics-only`, or manual CI input `graphics_only=true`;
-  see `docs/building.md`. This does not require full validation and is not a
-  bypass of receipt-guarded promotion. Remote CI still requires approval.
+- On private branches that provide the graphics-only tooling, an explicitly
+  unvalidated graphics test DLL uses `--compile-only --graphics-only`, or
+  manual CI input `graphics_only=true`. Stock RC7 does not provide those
+  additions: check the current branch's scripts and `docs/building.md` rather
+  than assuming these flags exist. Remote CI still requires approval, and
+  compile-only output never bypasses receipt-guarded promotion.
 - Use `tools/worktree.py` for build-capable worktrees. Never use a bare
   stash/pop across worktrees; the stash stack is shared.
 - Read targeted source and documentation ranges. Delegate only when useful

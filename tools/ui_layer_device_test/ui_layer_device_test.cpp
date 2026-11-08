@@ -25,6 +25,9 @@ bool sharpReady(ID3D11DeviceContext* ctx);
 bool rippleReady(ID3D11DeviceContext* ctx);
 bool rippleFirstDrawPending(ID3D11DeviceContext* ctx);
 bool newCachesCleared();
+bool mapStatesReady(ID3D11DeviceContext* ctx);
+bool mapStatesOwnedBy(ID3D11Device* dev);
+bool mapStatesCleared();
 ID3D11VertexShader* sharpVs();
 ID3D11PixelShader* sharpPs();
 ID3D11BlendState* sharpSourceBlend();
@@ -60,6 +63,8 @@ uint32_t layerWidth();
 bool hudFrame(ID3D11DeviceContext* ctx, uint64_t seq, const float ldr[4], const float hdr[4]);
 bool failedCoverageRetiresWithoutPublishing();
 bool missingConsumerLeavesCurrentDrawStock(ID3D11DeviceContext* ctx);
+void crispProbeArm(bool headerFlag);
+bool crispProbeRecordPending();
 // The back-off of the HDR HUD path and the weapons layer: null when every step held, else the step that did not.
 const char* vrHudPathBacksOffAndRearms(ID3D11DeviceContext* ctx);
 const char* backOffLadderRestartsAfterCleanMinutes();
@@ -303,8 +308,12 @@ int main(int argc, char** argv) {
     check(!allOwnedBy(ctxB.Get(), devB.Get()),
           "control: before the reset the retained children are not B's (the ownership check can fail)");
 
+    check(devtest::mapStatesReady(ctxA.Get()) && devtest::mapStatesOwnedBy(devA.Get()) && !devtest::mapStatesCleared(),
+          "device A: the Galaxy Map's depth, rasterizer and blend states are made, and are A's");
+
     uiLayerDeviceReset();  // the production device-change reset (flat_ui_layer.cpp flatUiLayerNoteDevice)
     check(devtest::newCachesCleared(), "device reset releases sharp and ripple children and clears creation and validation state");
+    check(devtest::mapStatesCleared(), "device reset releases the Galaxy Map's states and tone buffers and forgets that they were tried");
     detail::g_uiLayerLive = true;
     detail::g_uiQualityLive = true;
     detail::g_uiLayerCrispOn = true;
@@ -313,6 +322,7 @@ int main(int argc, char** argv) {
               devtest::rippleFirstDrawPending(ctxB.Get()),
           "device B: sharp and ripple creation and first-draw validation run again");
     check(sharpRippleOwnedBy(devB.Get()), "device B: every sharp and ripple child belongs to B");
+    check(devtest::mapStatesReady(ctxB.Get()) && devtest::mapStatesOwnedBy(devB.Get()), "device B: the Galaxy Map's states are made again, and are B's");
     check(allOwnedBy(ctxB.Get(), devB.Get()), "device B: every retained device child (blend, coverage shaders and context, seeder "
                                               "context, composite shader and buffer, both layers) is B's");
 
@@ -332,6 +342,18 @@ int main(int argc, char** argv) {
     check(allOwnedBy(ctxB.Get(), devB.Get()), "device B after the in-place composite: every retained device child is still B's");
     check(devtest::missingConsumerLeavesCurrentDrawStock(ctxB.Get()),
           "missing HUD consumer stands down before binding the layer and leaves the current draw stock");
+
+    // The eye-draw note's inline early exit: the body (which clears a pending record first) runs only for a pending
+    // tonemap draw or a draw of the tonemap's shape.
+    devtest::crispProbeArm(false);
+    check(!uiLayerCrispNoteEyeDraw(ctxB.Get(), 'D', 6, 1, 0) && devtest::crispProbeRecordPending(),
+          "eye-draw note: a non-matching draw with nothing pending does not enter the body");
+    check(!uiLayerCrispNoteEyeDraw(ctxB.Get(), 'D', 3, 1, 0) && !devtest::crispProbeRecordPending(),
+          "eye-draw note: a draw of the tonemap's shape enters the body");
+    devtest::crispProbeArm(true);
+    check(!uiLayerCrispNoteEyeDraw(ctxB.Get(), 'D', 6, 1, 0) && !devtest::crispProbeRecordPending() &&
+              !uiLayerCrispPending(),
+          "eye-draw note: a non-matching draw while a tonemap draw is pending clears it");
 
     // The back-off of the HDR HUD path and the weapons layer (2026-11-03): a stand-down is a back-off that lifts itself at a frame boundary, not the session's.
     const auto steps = [&](const char* step, const char* what) {

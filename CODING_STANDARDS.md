@@ -4,30 +4,37 @@ Apply these when reviewing a diff, your own included before you push it.
 They are the judgement calls no gate can
 make; the mechanical rules live in `build.bat`'s gates (the
 `tools\check_*.py` scripts). Each rule
-names the review that taught it. Every rule applied to every changed file is
-the bar; report each finding with the file, the line and the rule.
+names the review that taught it. Apply the rules relevant to the changed
+behavior; report actionable findings with the file, line and rule. Verification
+scope and approval boundaries are defined in AGENTS.md; these standards do
+not authorize remote CI, deployment, publication or unrelated work.
 
 ## Proven claims
 
-- **A command written in a doc or a PR has been run.** Run it, or capture
-  the request it would send (`GH_DEBUG=api` against a dead localhost host
-  with a dummy token sends nothing to GitHub), and check the result. A
-  command that only looks right is a finding. (#103: the protection
-  command's dotted `gh api` fields were sent as literal keys)
+- **Distinguish verified commands from proposed commands.** Check syntax
+  against current tool help or documentation. Claim execution only when it
+  actually ran and its result was inspected. Do not execute a paid, publishing
+  or destructive command merely to validate documentation; obtain the required
+  approval or label it unexecuted. (#103: dotted `gh api` fields were sent as
+  literal keys)
 - **A claim about how GitHub, git, Windows or a library behaves cites its
   source** (the doc's URL, the CLI version's source line) or a reproduction.
   Memory is not a source. (#103: "required checks apply only to PR merges"
   was wrong and dismissed a valid option)
-- **A fix comes with a test that fails without it.** Run the test on the
-  unfixed code first, and say so. (#103: the rename fixture; the census glue
-  test forced slow to show the flake)
+- **Cover changed behavior with a focused regression test where practical.**
+  Prefer demonstrating failure on the unfixed code, and say whether that was
+  done. If confirmation requires the real game/runtime, report that limitation;
+  a local test is not runtime proof. Do not add test frameworks or recursively
+  test helpers merely to satisfy a procedural requirement. (#103: the rename
+  fixture; the census glue test forced slow to show the flake)
 - **Test the inputs a reviewer will try:** a rename or a delete for a file
   filter, a read interleaved with a write and a list read in parts, a
   timeout after the side effect may have happened, a host path that
   contains the string an assertion searches for. (#103, #107, #113)
-- **Validation says what ran, on which commit, and what did not.** Name
-  each check or rig, the head it ran on and its result. Name every skipped
-  check and the reason. "Tests pass" with no list is a finding. (#107, #113)
+- **Validation says what ran and what it establishes.** Name the relevant
+  checks, revision or working-tree state, and results. Identify material
+  untested behavior and blockers, not every unrelated omitted check.
+  "Tests pass" without identifying the tests is insufficient. (#107, #113)
 
 ## One owner
 

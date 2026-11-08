@@ -244,6 +244,7 @@ python tools\run_jobs.py ^
     --gate "tools\package_native.py --self-test" ^
     --gate "tools\install_proton.py --self-test" ^
     --gate "tools\build_diff.py --self-test" ^
+    --gate "tools\effects_arc.py --self-test" ^
     --gate "tools\build_receipt.py --self-test" ^
     --gate "tools\compile_only.py --self-test" ^
     --gate "tools\linux_toolchain.py --self-test" ^
@@ -659,7 +660,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\native_menu.cpp" ^
     "src\d3d11\native_temporal.cpp" "src\d3d11\flat_temporal.cpp" "src\d3d11\flat_compute_capture.cpp" "src\d3d11\flat_compute_readback.cpp" ^
     "src\d3d11\flat_runtime.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\xess_engine.cpp" "src\d3d11\map_easu.cpp" "src\d3d11\map_smaa.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
-    "src\d3d11\flat_camera_producer_probe.cpp" "src\d3d11\flat_camera_inject.cpp" "src\d3d11\flat_stationary_camera_capture.cpp" ^
+    "src\d3d11\flat_camera_producer_probe.cpp" "src\d3d11\flat_camera_inject.cpp" "src\d3d11\flat_stationary_camera_capture.cpp" "src\d3d11\galaxy_map_pointer.cpp" "src\d3d11\galaxy_map_ui.cpp" ^
     "src\d3d11\vr_world_route.cpp" "src\d3d11\vr_world_mips.cpp" "src\d3d11\vr_camera_census.cpp" "src\d3d11\vr_star_glow.cpp" ^
     "src\d3d11\desktop_window.cpp" "src\d3d11\desktop_window_cursor.cpp" ^
     "src\d3d11\native_sharpen.cpp" ^
@@ -692,10 +693,11 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\cull_gate_probe.cpp" ^
     "src\d3d11\engine_velocity.cpp" "src\d3d11\skin_join_gpu.cpp" "src\d3d11\skin_entity_hook.cpp" ^
     "src\d3d11\celestial_motion.cpp" ^
+    "src\d3d11\cockpit_glass_probe.cpp" "src\d3d11\cockpit_glass.cpp" ^
     "src\d3d11\fss_res.cpp" ^
     "src\d3d11\fss_panel.cpp" ^
     "src\d3d11\fss_reveal.cpp" ^
-    "src\d3d11\vertex_resync_hook.cpp" "src\d3d11\light_grid_cache_hook.cpp" ^
+    "src\d3d11\vertex_resync_hook.cpp" "src\d3d11\light_grid_cache_hook.cpp" "src\d3d11\vehicle_rig.cpp" ^
     "src\d3d11\xinput_watch.cpp" ^
     "src\d3d11\fss_panel_rect.cpp" ^
     "src\d3d11\panel_curve.cpp" "src\d3d11\screen_motion.cpp" "src\d3d11\weapon_motion.cpp" ^
@@ -704,7 +706,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\wake_pulse.cpp" "src\d3d11\vr_ssaa_gate.cpp" "src\d3d11\vr_ssaa_hold.cpp" "src\d3d11\vr_display_observer.cpp" "src\d3d11\vr_window_trampolines.cpp" ^
     "src\d3d11\mode_watch.cpp" ^
     "src\d3d11\ui_depth.cpp" ^
-    "src\d3d11\ui_layer.cpp" "src\d3d11\scope_zoom.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" "src\d3d11\orbital_width.cpp" "src\d3d11\supercruise_bars.cpp" "src\d3d11\srv_turret.cpp" "src\d3d11\srv_radar_anchor.cpp" ^
+    "src\d3d11\ui_layer.cpp" "src\d3d11\scope_zoom.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" "src\d3d11\orbital_width.cpp" "src\d3d11\supercruise_bars.cpp" "src\d3d11\srv_turret.cpp" "src\d3d11\srv_turret_entry_fade.cpp" "src\d3d11\srv_turret_press.cpp" "src\d3d11\srv_radar_anchor.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
     "src\d3d11\backdrop_fix.cpp" ^
     "src\d3d11\scrim_fix.cpp" ^
@@ -722,7 +724,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
     "src\d3d11\sharpen_pass.cpp" ^
-    "src\d3d11\flat_sharpen.cpp" "src\d3d11\flat_ui_layer.cpp" "src\d3d11\flat_star_glow.cpp" ^
+    "src\d3d11\flat_sharpen.cpp" "src\d3d11\flat_ui_layer.cpp" "src\d3d11\flat_star_glow.cpp" "src\d3d11\flat_dof_blur.cpp" ^
     "src\d3d11\loader_panel.cpp" ^
     "src\d3d11\splash_dim.cpp" ^
     "src\d3d11\billboard_fix.cpp" ^
@@ -1060,6 +1062,7 @@ if not exist "%OBJ%\native_menu" mkdir "%OBJ%\native_menu"
     /link /INCREMENTAL:NO kernel32.lib user32.lib gdi32.lib version.lib dxgi.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: native menu test build failed & exit /b 1 )
 "%BUILD%\native_menu_test.exe" --dry-run || exit /b 1
+"%BUILD%\native_menu_test.exe" --layout || exit /b 1
 "%BUILD%\native_menu_test.exe" --self-test || exit /b 1
 exit /b 0
 
@@ -1075,7 +1078,7 @@ if errorlevel 1 ( echo [edvr] ERROR: weapon UI getter probe fixture assembly bui
     /Fo"%OBJ%\native_frame\\" /Fe"%BUILD%\native_frame_test.exe" ^
     "tools\native_frame_test\native_frame_test.cpp" "src\d3d11\native_frame.cpp" ^
     "%OBJ%\native_frame\weapon_ui_getter_probe.obj" "%OBJ%\native_frame\weapon_ui_getter_probe_test.obj" ^
-    "src\d3d11\native_render_settings.cpp" "src\common\vscreen_auto_state.cpp" ^
+    "src\d3d11\native_render_settings.cpp" "src\common\vscreen_auto_state.cpp" "src\common\iniedit.cpp" ^
     "src\common\config.cpp" "src\common\frame_flag.cpp" "src\common\log.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: native frame provider test build failed & exit /b 1 )
@@ -2314,6 +2317,32 @@ if errorlevel 1 ( echo [edvr] ERROR: celestial motion test build failed & exit /
 "%OBJ%\celestialmotion\celestial_motion_test.exe" || exit /b 1
 exit /b 0
 
+:rig_cockpit_glass_probe_test
+echo [edvr] === cockpit glass probe (TEMPORARY) ===
+REM The canopy table, register list and log formatting of src\d3d11\cockpit_glass_probe_core.h (docs\cockpit-glass-legacy-port.md
+REM section 5). Pure; no device. Goes with the probe.
+if not exist "%OBJ%\glassprobe" mkdir "%OBJ%\glassprobe"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\glassprobe\\" /Fe"%OBJ%\glassprobe\cockpit_glass_probe_test.exe" ^
+    "tools\cockpit_glass_probe_test\cockpit_glass_probe_test.cpp"
+if errorlevel 1 ( echo [edvr] ERROR: cockpit glass probe test build failed & exit /b 1 )
+"%OBJ%\glassprobe\cockpit_glass_probe_test.exe" || exit /b 1
+exit /b 0
+
+:rig_cockpit_glass_test
+echo [edvr] === cockpit glass test ===
+REM visual.cockpit_glass = legacy (docs\cockpit-glass-legacy-port.md section 8): src\d3d11\cockpit_glass_core.h (the key, which bound shader is replaced, the log lines) and the build's
+REM bytecode kCockpitGlassLegacyPsBytecode (src\d3d11\cockpit_glass_shader.h) on a WARP device with the D3D debug layer, drawn with a vertex shader that carries the game's canopy vertex shader's
+REM outputs: no coverage, dirt under the sun, a cascade's shadow, a hangar lit by the probe alone. Compiled /W4 /WX. Output under obj\ and System32's d3d11.
+if not exist "%OBJ%\cockpitglass" mkdir "%OBJ%\cockpitglass"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /I"src\d3d11" ^
+    /Fo"%OBJ%\cockpitglass\\" /Fe"%OBJ%\cockpitglass\cockpit_glass_test.exe" ^
+    "tools\cockpit_glass_test\cockpit_glass_test.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib dxguid.lib
+if errorlevel 1 ( echo [edvr] ERROR: cockpit glass test build failed & exit /b 1 )
+"%OBJ%\cockpitglass\cockpit_glass_test.exe" || exit /b 1
+exit /b 0
+
 :rig_on_foot_split_test
 echo [edvr] === on_foot_split_test.exe ===
 REM The ship split on foot (docs\per-object-motion.md, 2026-10-07; src\common\temporal_mode.h): Explorer Cam's ground within ten metres smeared
@@ -2562,6 +2591,19 @@ if errorlevel 1 ( echo [edvr] ERROR: light grid cache test build failed & exit /
 "%BUILD%\light_grid_cache_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_vehicle_rig_test
+echo [edvr] === vehicle_rig_test.exe ===
+REM The vehicle rig's pure half (src\d3d11\vehicle_rig_core.h, issue 186): a rig with a zero count, a rig torn down between frames, a vtable mismatch, a fault in a guarded read,
+REM an absurd count, the name and root sphere, the two largest record radii, the pose math against tools\flat_pixels_engine.py's, and the corrected reads
+REM (R = *(I+0x2F0)). No DLL and no game.
+if not exist "%OBJ%\vehiclerig" mkdir "%OBJ%\vehiclerig"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vehiclerig\\" ^
+    /Fe"%BUILD%\vehicle_rig_test.exe" "tools\vehicle_rig_test\vehicle_rig_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: vehicle rig test build failed & exit /b 1 )
+"%BUILD%\vehicle_rig_test.exe" --self-test || exit /b 1
+exit /b 0
 :rig_pad_state_test
 echo [edvr] === pad_state_test.exe ===
 REM The pad-state probe's pure half (src\d3d11\pad_state_core.h): the identity and prologue decision, change detection, the exact line texts, the
@@ -3195,7 +3237,7 @@ REM dimensions and the tightest runtime/D3D maximum is shared by both eyes.
 %CC% /nologo /W4 /O2 /EHsc /std:c++17 /MT ^
     /Fo"%OBJ%\native_render_settings\\" /Fe"%BUILD%\native_render_settings_test.exe" ^
     "tools\native_render_settings_test\native_render_settings_test.cpp" ^
-    "src\d3d11\native_render_settings.cpp" "src\common\vscreen_auto_state.cpp" ^
+    "src\d3d11\native_render_settings.cpp" "src\common\vscreen_auto_state.cpp" "src\common\iniedit.cpp" ^
     "src\common\config.cpp" "src\common\log.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib
 if errorlevel 1 ( echo [edvr] ERROR: native render settings test build failed & exit /b 1 )
@@ -3292,6 +3334,7 @@ python tools\run_jobs.py --jobs 4 ^
     --gate "tools\compile_variants.py --self-test" ^
     --gate "tools\dxbc_disasm.py --self-test" ^
     --gate "tools\eye_bmp_to_png.py --self-test" ^
+    --gate "tools\character_motion_check.py --self-test" ^
     --gate "tools\diff_eye_dump.py --self-test" ^
     --gate "tools\eye_run_fit.py --self-test" ^
     --gate "tools\eye_run_shimmer.py --self-test" ^
@@ -3861,6 +3904,38 @@ if errorlevel 1 ( echo [edvr] ERROR: billboard facing test build failed & exit /
 "%OBJ%\billboardfacing\billboard_facing_test.exe" --self-test "%ROOT%" || exit /b 1
 exit /b 0
 
+:rig_galaxy_map_vs_test
+echo [edvr] === galaxy_map_vs_test.exe ===
+REM The VR Galaxy Map's replacement shaders (src\d3d11\galaxy_map_vs.h; docs\galaxy-map-vr-2026-11-03.md Fix 3) on a WARP device with the D3D debug layer, through
+REM stream output: the icons' two transcriptions against the formula on every class of record (the UI frame's, the galactic plane, the identity quaternion, the map's
+REM facing records, both position encodings, a bone-indexed record), the faces case against the game's own maths with the eye equal to the map camera, the arrow
+REM transcription for both signs of the scale, and the probe on the GPU (the occlusion query, the mask blend, write mask 0). The comparison with the game's own bytecode
+REM is made by hand with a one-off program that includes the test (the bytecode is not in the repository).
+if not exist "%OBJ%\galaxymapvs" mkdir "%OBJ%\galaxymapvs"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" ^
+    /Fo"%OBJ%\galaxymapvs\\" /Fe"%OBJ%\galaxymapvs\galaxy_map_vs_test.exe" ^
+    "tools\galaxy_map_vs_test\galaxy_map_vs_test.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib dxguid.lib
+if errorlevel 1 ( echo [edvr] ERROR: galaxy map vs test build failed & exit /b 1 )
+"%OBJ%\galaxymapvs\galaxy_map_vs_test.exe" --dry-run || exit /b 1
+"%OBJ%\galaxymapvs\galaxy_map_vs_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_map_run_test
+echo [edvr] === map_run_test.exe ===
+REM The VR Galaxy Map's run of sprites (src\d3d11\map_run_core.h; docs\galaxy-map-vr-2026-11-03.md "After the fifth flight"): the state machine's binds (one begin and one end for a run of
+REM sprites, the test fails above two), the game's own sets of the same or other targets, the draws and calls that end a run, and a WARP run with the sprites' real depth-stencil states that
+REM leaves the game's targets bound again after the end (OMGetRenderTargets).
+if not exist "%OBJ%\maprun" mkdir "%OBJ%\maprun"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" ^
+    /Fo"%OBJ%\maprun\\" /Fe"%OBJ%\maprun\map_run_test.exe" ^
+    "tools\map_run_test\map_run_test.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib dxguid.lib
+if errorlevel 1 ( echo [edvr] ERROR: map run test build failed & exit /b 1 )
+"%OBJ%\maprun\map_run_test.exe" --dry-run || exit /b 1
+"%OBJ%\maprun\map_run_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_visor_axis_test
 echo [edvr] === visor_axis_test.exe ===
 REM F121: the on-foot helmet visor's axis-centred vertex shader (src\d3d11\visor_axis_vs.h, the build's bytecode kVisorAxisVsBytecode; src\d3d11\visor_axis_math.h) against the game's own
@@ -4175,9 +4250,9 @@ if errorlevel 1 ( echo [edvr] ERROR: supercruise bars test build failed & exit /
 "%OBJ%\supercruisebars\supercruise_bars_test.exe" --self-test || exit /b 1
 exit /b 0
 
-REM Rig: the SRV turret view's HUD (src\d3d11\srv_turret*.h, srv_turret.cpp, journal_vehicle_latch.h; issue 140): the build's own bytecode of the eight pass-through geometry shaders (kSrvTurretHudGsABytecode to
-REM kSrvTurretHudGsHBytecode, one for each distinct vertex-shader output signature, compiled from srv_turret_hud_shader.h's HLSL by tools\temporal_shader_build and checked here to be that text's
-REM compile), the production binding, constants and maths, run on WARP (with the D3D debug layer when the machine has it) in front of stand-ins for the nine families' shader pairs (the two hologram
+REM Rig: the SRV turret view's HUD (src\d3d11\srv_turret*.h, srv_turret.cpp, journal_vehicle_latch.h; issue 140): the build's own bytecode of the eleven pass-through geometry shaders (kSrvTurretHudGsABytecode to
+REM kSrvTurretHudGsKBytecode, one for each distinct vertex-shader output signature, compiled from srv_turret_hud_shader.h's HLSL by tools\temporal_shader_build and checked here to be that text's
+REM compile), the production binding, constants and maths, run on WARP (with the D3D debug layer when the machine has it) in front of stand-ins for the eleven families' shader pairs (the four hologram
 REM families, five radar-named billboard families and the target hologram sphere with either pixel shader) with their output signatures and clip rows: the 3D move about an anchor (every vertex
 REM translated forward, then pushed deeper or pulled nearer along its ray from the anchor), read vertex by vertex through the stream-output twin against a CPU reference in doubles and against the
 REM geometry itself (anchor at the eye, anchor off the eye, asymmetric tangents, the window, a pull, the translation alone and with the push, a vertex 15 cm from the anchor, the panels' and the radar's groups translated by their own keys in one frame, the three depth modes, the Scorpion hologram's lighting position moved by the camera's axes from a stand-in vertex constant buffer bound whole and ranged, the disc probe's register copy, the scissor opened to the whole target and the game's rectangles put back, the radar disc's quad in the seated frame from clip positions for a moved and turned head, the unmoved-draw list), the pictures against the
@@ -4196,6 +4271,24 @@ if not exist "%OBJ%\srvturrethud" mkdir "%OBJ%\srvturrethud"
 if errorlevel 1 ( echo [edvr] ERROR: srv turret hud test build failed & exit /b 1 )
 "%OBJ%\srvturrethud\srv_turret_hud_test.exe" --dry-run || exit /b 1
 "%OBJ%\srvturrethud\srv_turret_hud_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_srv_turret_entry_fade_test
+echo [edvr] === srv_turret_entry_fade_test.exe ===
+REM Rig: the SRV turret view's entry fade (src\d3d11\srv_turret_entry_fade.h, srv_turret_entry_fade.cpp; issue 140): the hold to black from the turret-view-on edge until the camera has settled, then
+REM a short fade back in. No device. The state machine run frame by frame as the module runs it (the edge, the move published in its frame, the applied-serial signal and its margin, a runtime that
+REM reports nothing, a signal that never comes and the cap, the view going off, no move key, a missing publish, a new edge in the fade-in, a retargeted move, no re-trigger while the view stays on, the level
+REM in range and never rising), the instrument's log lines (they fit the log, say FIRED only when the cap fired, tell a skipped hold from a run, and avoid the phrases the turret health rule reads), and a
+REM scan of the sources that connect it (the call after alignTick, the mix term, the move's publish, the luma probe's frame-by-frame mode, the Status.json cadence, the build list).
+if not exist "%OBJ%\srvturretentryfade" mkdir "%OBJ%\srvturretentryfade"
+%CC% /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /utf-8 ^
+    /Fo"%OBJ%\srvturretentryfade\\" /Fe"%OBJ%\srvturretentryfade\srv_turret_entry_fade_test.exe" ^
+    "tools\srv_turret_entry_fade_test\srv_turret_entry_fade_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: srv turret entry fade test build failed & exit /b 1 )
+"%OBJ%\srvturretentryfade\srv_turret_entry_fade_test.exe" --dry-run || exit /b 1
+"%OBJ%\srvturretentryfade\srv_turret_entry_fade_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_orbit_layer_test

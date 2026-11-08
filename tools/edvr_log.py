@@ -7,6 +7,7 @@
     python tools/edvr_log.py --target steam --tail 80
     python tools/edvr_log.py --target frontier --tally vh
     python tools/edvr_log.py --target frontier --tally vh --frame 1
+    python tools/edvr_log.py --target steam --tally offscreen
     python tools/edvr_log.py --target steam --tally pose
     python tools/edvr_log.py --target frontier --tally cover
     python tools/edvr_log.py --target frontier --tally periodic --expect-build HEAD
@@ -72,6 +73,11 @@ the totals row. The census caps its log output at 16384 lines
 (draw_census.cpp), so a long census keeps per-draw detail only for the
 first frames; --tally says which frames survive only as summaries
 rather than printing an empty table.
+
+--tally offscreen answers what the draws that are not eye-sized are (#157 B1). It reads the census's non-eye lines: the `DCO` lines (census_offscreen on) and the `DC`
+lines marked t=i (indirect), t=f (deferred context) or t=fi, whatever their target. Per census frame it groups them by the render target (r=) and depth target (d=) with each
+@N resolved through the census's `DC id @N tex WxH` table, and lists each group's count, draw kinds (the type letter) and top vertex shaders (vh=). It compares the DC frame
+line's off= with the number of DCO lines: DCO truncation is not in `truncated=`, so a smaller count means the census was cut short. --frame restricts to one census frame.
 
 --tally pose tables the pose-gap diagnostic: every `pose gap:` line in the RUNTIME log (it reads --tag openxr unless you name a tag or a file) by
 caller (thread, return address): how far a head pose is located from the drawn frame's display time, how far it is turned from the drawn pose, and the
@@ -288,7 +294,7 @@ The SRV turret view (experimental.srv_turret_camera_back, experimental.srv_turre
 ("srv turret: the vehicle is the Scorpion|not the Scorpion (event X)", written by the journal watcher) are kept whatever --since says; the last vehicle line is said in the detail, and
 vehicle lines alone are not the rule's lines (nothing is said for them). The pass acts in the Scorpion only: when the turret view bit is on in an SRV the journal does not call the Scorpion
 (a Scarab, a training scenario) the log says "srv turret view: not the Scorpion at frame ...", which is never a failure: with nothing else from the turret in the window the rule is IDLE
-("nothing applied, by design"), and beside a Scorpion visit the count goes into the detail. The pass covers nine hologram families in eight signatures, each signature with a geometry
+("nothing applied, by design"), and beside a Scorpion visit the count goes into the detail. The pass covers eleven hologram families in eleven signatures, each signature with a geometry
 shader, each family with a first-draw line, in two groups (the weapon panels and the radar) each pushed back by its own key; the 10 s line
 gives each group's window (a push-back is a negative gap: deeper) and counts the matched draws per family. It
 judges the camera half (a "camera: back ... published" line) and the HUD half (a first-draw line or a 10 s line with draws bound) on the keys in force, the HUD half being on when any of the
@@ -665,6 +671,136 @@ def print_vh_tally(text, frame):
     return 0
 
 
+# --tally offscreen (build 3, #180, B1): what the draws that are not eye-sized are. The census writes them as `DCO` lines (census_offscreen on), and the indirect draws
+# (`t=i`, `t=fi`) and the deferred-context draws (`t=f`) as `DC` lines whatever their target. Each line names its render target (r=) and depth target (d=) as texWxHfFMT or an
+# interned @N, whose size the census's `DC id @N tex WxH ...` table gives (written last, after the frames). One census per `DC begin`; the table belongs to its census.
+CENSUS_BEGIN_RE = re.compile(r"^(?:\[[\d:.]+\]\s*)?DC begin\b(?P<rest>.*)$")
+CENSUS_ID_RE = re.compile(r"^(?:\[[\d:.]+\]\s*)?DC id @(?P<id>\d+) (?P<what>.*)$")
+CENSUS_D_RE = re.compile(r"\sd=(\S+)")
+CENSUS_T_RE = re.compile(r"\st=(fi|i|f)(?=\s|$)")
+
+
+def parse_offscreen(text):
+    """The census's non-eye draws, per census: a list of dicts begin (the DC begin line's text, or None), ids ({id: what}), draws (dicts cls, frame, type, r, d, vh) and frames
+    ({frame: the DC frame line's groups}). cls is DCO, or `DC t=i` / `DC t=f` / `DC t=fi` for the DC lines the provenance tail marks; the other DC lines are eye draws and are not kept."""
+    censuses = []
+
+    def cur():
+        if not censuses:
+            censuses.append({"begin": None, "ids": {}, "draws": [], "frames": {}})
+        return censuses[-1]
+
+    for raw in text.splitlines():
+        m = CENSUS_BEGIN_RE.match(raw)
+        if m:
+            censuses.append({"begin": m.group("rest").strip(), "ids": {}, "draws": [], "frames": {}})
+            continue
+        m = CENSUS_ID_RE.match(raw)
+        if m:
+            cur()["ids"][m.group("id")] = m.group("what").strip()
+            continue
+        m = CENSUS_FRAME_RE.match(raw)
+        if m:
+            cur()["frames"][int(m.group("frame"))] = m.groupdict()
+            continue
+        m = CENSUS_DRAW_RE.match(raw)
+        if not m:
+            continue
+        t = CENSUS_T_RE.search(raw)
+        if m.group("kind") == "DCO":
+            cls = "DCO"
+        elif t:
+            cls = "DC t=" + t.group(1)
+        else:
+            continue   # an eye-sized draw: --tally vh's
+        d = CENSUS_D_RE.search(raw, m.end("r"))
+        vh = VH_RE.search(raw)
+        cur()["draws"].append({"cls": cls, "frame": int(m.group("frame")), "type": m.group("type"), "r": m.group("r"), "d": d.group(1) if d else "-",
+                               "vh": vh.group(1).upper() if vh else None})
+    return censuses
+
+
+def offscreen_target(token, ids):
+    """A census target token for a table row: @N resolved through the census's id table (`@12 = 1920x1080 fmt=87`), an inline texWxHfFMT as `tex 1920x1080 fmt 87`, else as written."""
+    if token.startswith("@"):
+        what = ids.get(token[1:])
+        if what is None:
+            return token + " (not in the id table)"
+        m = re.match(r"tex (\d+x\d+)(?: fmt=(\d+))?", what)
+        if m:
+            return "%s = %s%s" % (token, m.group(1), " fmt=" + m.group(2) if m.group(2) else "")
+        if what.startswith("?"):
+            return token + " (unresolved)"
+        return "%s = %s" % (token, " ".join(what.split()[:2]))
+    m = re.match(r"tex(\d+x\d+)f(\d+)$", token)
+    if m:
+        return "%s fmt=%s (inline)" % (m.group(1), m.group(2))
+    return token
+
+
+def offscreen_groups(draws, ids):
+    """Group one frame's draws by (class, resolved r=, resolved d=): rows with count, kinds (type char -> count) and vh (hash -> count), the largest first."""
+    groups = {}
+    for d in draws:
+        key = (d["cls"], offscreen_target(d["r"], ids), offscreen_target(d["d"], ids))
+        g = groups.setdefault(key, {"count": 0, "kinds": {}, "vh": {}})
+        g["count"] += 1
+        g["kinds"][d["type"]] = g["kinds"].get(d["type"], 0) + 1
+        g["vh"][d["vh"] or "(no vh=)"] = g["vh"].get(d["vh"] or "(no vh=)", 0) + 1
+    rows = [dict(cls=k[0], r=k[1], d=k[2], **g) for k, g in groups.items()]
+    rows.sort(key=lambda r: (-r["count"], r["cls"], r["r"], r["d"]))
+    return rows
+
+
+def print_offscreen_tally(text, frame=None):
+    """The --tally offscreen report. Returns the process exit code."""
+    censuses = parse_offscreen(text)
+    if not censuses or not any(c["draws"] or c["frames"] or c["begin"] is not None for c in censuses):
+        print("[edvr] no draw-census lines (DC begin/DCO/DC frame) in this log")
+        return 0
+    for n, c in enumerate(censuses, 1):
+        print("[edvr] tally offscreen, census %d: %s" % (n, "DC begin " + c["begin"] if c["begin"] is not None else "no DC begin line (a log cut before it)"))
+        if c["begin"] is not None and "offscreen=no" in c["begin"]:
+            print("[edvr]   offscreen=no: census_offscreen did not load, so no DCO line was written; only the t=i / t=f DC lines below")
+        if not c["ids"]:
+            print("[edvr]   no `DC id` table: the census was cut off before it was written (the log cap), so an @N target stays unresolved")
+        frames = sorted({d["frame"] for d in c["draws"]} | set(c["frames"]))
+        if frame is not None:
+            frames = [f for f in frames if f == frame]
+        if not frames:
+            print("[edvr]   no frame in scope")
+            continue
+        for f in frames:
+            draws = [d for d in c["draws"] if d["frame"] == f]
+            counts = {}
+            for d in draws:
+                counts[d["cls"]] = counts.get(d["cls"], 0) + 1
+            dco = counts.get("DCO", 0)
+            others = ", ".join("%s %d" % (k, counts[k]) for k in sorted(counts) if k != "DCO")
+            rows = offscreen_groups(draws, c["ids"])
+            print("[edvr] census %d frame %d: %d non-eye draw line(s) in %d group(s): DCO %d%s" % (n, f, len(draws), len(rows), dco, ", " + others if others else ""))
+            s = c["frames"].get(f)
+            if s is None:
+                print("[edvr]   no `DC frame %d` line: off= unknown, so DCO truncation cannot be checked" % f)
+            else:
+                off = int(s["off"])
+                if off == dco:
+                    print("[edvr]   off= %d agrees with the %d DCO line(s): none cut" % (off, dco))
+                elif dco < off:
+                    print("[edvr]   DCO CUT SHORT: the DC frame line counts off=%d, the log holds %d DCO line(s) (%d missing: the census line cap, which `truncated=` does not count, "
+                          "or the log cap)" % (off, dco, off - dco))
+                else:
+                    print("[edvr]   MORE DCO lines (%d) than off=%d: the census frame line and its draws disagree" % (dco, off))
+            if not rows:
+                continue
+            print("%5s  %-8s  %-28s  %-28s  %-22s  %s" % ("count", "line", "r=", "d=", "kinds", "top vh"))
+            for r in rows:
+                kinds = " ".join("%s:%d" % kv for kv in sorted(r["kinds"].items(), key=lambda kv: (-kv[1], kv[0])))
+                top = " ".join("%s:%d" % kv for kv in sorted(r["vh"].items(), key=lambda kv: (-kv[1], kv[0]))[:3])
+                print("%5d  %-8s  %-28s  %-28s  %-22s  %s" % (r["count"], r["cls"], r["r"], r["d"], kinds, top))
+    return 0
+
+
 def _mean_sd(values):
     n = len(values)
     if not n:
@@ -874,6 +1010,83 @@ def print_cover_tally(parsed):
     print("[edvr] How to read it: a heartbeat says the hook was live. On a headset whose eye reaches further out (or down) than the centred frustum the game culls terrain against "
           "(a Quest 3, a cropped Crystal Super) every call over a planet is widened, and the call count is about 20 a frame; 0 of 0 is a window with no planet in view (loading, a "
           "station, supercruise); 0 of M with M above 0 is a headset the cull already covers. No heartbeat after ten minutes means the hook is not live: see the `hook live` or `inert` line.")
+    return 0
+
+
+# --tally reissue: the re-issue counter (src/d3d11/draw_reissue_line.h writes the line, perf_monitor.cpp every 1800 frames beside `draw hook CPU:`). Always on, no key.
+#
+#   draw reissue CPU: 1800-frame window ending N; M ms/sampled frame mean, X ms max, S sampled frames (one in E); T re-issues in the window, P of them on sampled frames; ...
+#       Callers (ms a sampled frame, calls on sampled frames): name 0.600 ms 150, name2 ... | none.
+#
+# A window with no re-issue prints 0 and `none`; no line at all means the build has no counter (or the monitor never reached the window edge).
+
+REISSUE_RE = re.compile(r"draw reissue CPU: 1800-frame window ending (?P<frame>\d+); (?P<mean>[\d.]+) ms/sampled frame mean, (?P<max>[\d.]+) ms max, "
+                        r"(?P<samples>\d+) sampled frames \(one in (?P<every>\d+)\); (?P<total>\d+) re-issues in the window, (?P<sampled>\d+) of them on sampled frames; .*?"
+                        r"Callers \(ms a sampled frame, calls on sampled frames\): (?P<callers>none|.*?)\.\s*$")
+REISSUE_CALLER_RE = re.compile(r"(?P<name>[a-z_]+) (?P<ms>[\d.]+) ms (?P<calls>\d+)")
+
+
+def parse_reissue(text):
+    """Every `draw reissue CPU:` window, in order: dicts of frame, mean (ms a sampled frame), max, samples, every, total (re-issues in the window), sampled (of them on sampled
+    frames), callers ([(name, ms a sampled frame, calls on sampled frames)], empty for `none`) and hook (the `draw hook CPU:` mean of the same window, or None)."""
+    hooks = {w["end"]: w for w in perf_windows(text)}   # the sibling line's parse (--perf-windows)
+    out = []
+    for line in text.splitlines():
+        m = REISSUE_RE.search(line)
+        if not m:
+            continue
+        callers = [] if m.group("callers") == "none" else [(c.group("name"), float(c.group("ms")), int(c.group("calls")))
+                                                              for c in REISSUE_CALLER_RE.finditer(m.group("callers"))]
+        out.append({"frame": int(m.group("frame")), "mean": float(m.group("mean")), "max": float(m.group("max")), "samples": int(m.group("samples")),
+                    "every": int(m.group("every")), "total": int(m.group("total")), "sampled": int(m.group("sampled")), "callers": callers})
+    for w in out:
+        h = hooks.get(w["frame"])
+        w["hook"] = h["mean"] if h else None
+    return out
+
+
+# The GPU census items that are re-issue sections, and the callers that count the same work. A census window that shows one ran while every reissue window counts none of its
+# callers means the helper was bypassed or the sites are not wired: the line's own `none` could not tell. (The census is a 30 s window and the re-issue line an 1800-frame one, so
+# the check reads the whole log.)
+REISSUE_CENSUS_SECTIONS = (("hologram passes", ("ui_depth",)), ("UI depth coverage", ("ui_depth",)), ("planet", ("ui_depth",)), ("weapon motion", ("weapon_motion",)),
+                           ("UI layer reissues", ("ui_layer_second",)), ("FSS reveal replay", ("fss_reveal",)))
+REISSUE_CENSUS_RE = re.compile(r"EDVR GPU census: .*?in-frame [\d.]+ \((?P<items>.*?)\); application render")
+
+
+def reissue_census_gaps(windows, text):
+    """[(census section, callers)] for each re-issue section a `EDVR GPU census:` line shows ran (an item with a figure, not `-`) whose callers no `draw reissue CPU:` window counted."""
+    counted = {}
+    for w in windows:
+        for name, _, calls in w["callers"]:
+            counted[name] = counted.get(name, 0) + calls
+    ran = set()
+    for line in text.splitlines():
+        m = REISSUE_CENSUS_RE.search(line)
+        if not m:
+            continue
+        for section, _ in REISSUE_CENSUS_SECTIONS:
+            if re.search(r"(?:^|, )%s [\d.]+ \(" % re.escape(section), m.group("items")):
+                ran.add(section)
+    return [(section, callers) for section, callers in REISSUE_CENSUS_SECTIONS if section in ran and not any(counted.get(c, 0) for c in callers)]
+
+
+def print_reissue_tally(windows, text=""):
+    """The --tally reissue report. Returns the process exit code: 1 when the log has no `draw reissue CPU:` line."""
+    if not windows:
+        print("[edvr] no `draw reissue CPU:` lines in this log: a build without the re-issue counter, or a session shorter than one 1800-frame window -- this tally reads --tag gfx.")
+        return 1
+    for w in windows:
+        hook = "n/a" if w["hook"] is None else "%.3f ms" % w["hook"]
+        who = ", ".join("%s %.3f ms (%d)" % c for c in w["callers"]) if w["callers"] else "no caller"
+        print("[edvr] draw reissue CPU, window ending %d: %.3f ms/sampled frame (draw hook CPU %s); %d re-issues; %s" % (w["frame"], w["mean"], hook, w["total"], who))
+    print("[edvr] %d window(s). How to read it: the ms are the re-issue DRAW CALLS timed whole, the same sampled frames as `draw hook CPU:`; the Begin/End state work around a re-issue "
+          "(binds, copies, clears) is outside them, so a low figure does not rule a pass out. Every caller but flat_ui is inside `draw hook CPU:` (its clock stops "
+          "at the game's own draw); flat_ui is outside it (the flat branch has no hook clock), so do not read it as a share of that line. loader_panel never prints: its substitute "
+          "ignores the draw it is handed (a decline goes through the observed draw), so it is a name with no count. 0 re-issues with `no caller` is a window where the game was never "
+          "drawn twice; no line at all is a build without the counter." % len(windows))
+    for section, callers in reissue_census_gaps(windows, text):
+        print("[edvr] CHECK THE WIRING: a GPU census line shows the '%s' section ran, but no window counted %s: a re-issue site may bypass the helper (src/d3d11/vscreen.cpp ReissueClock)."
+              % (section, " or ".join(callers)))
     return 0
 
 
@@ -10404,7 +10617,12 @@ H_SRV_TURRET_STATE_KINDS = ("setting", "vehicle")
 H_SRV_TURRET_SETTING = (r"srv turret settings: camera back (?P<back>\d+) cm, (?:hud forward (?P<forward>\d+) cm, )?(?:radar forward (?P<rforward>\d+) cm, )?"
                         r"(?:panels back (?P<panels>\d+) cm, radar back (?P<radar>\d+) cm, )?"
                         r"hud gap (?P<gap>\d+) cm(?:, hud depth (?P<depth>game|real|front)(?:, hud scissor (?P<scissor>open|game)(?:, radar anchor (?P<ranchor>on|reversed|off|camera))?)?)?(?:, systems near (?P<systems>\d+) cm)?(?:, hud up (?P<hudup>\d+) cm)?(?:, gunner up (?P<gunnerup>\d+) cm)?(?:, cards up (?P<cardsup>\d+) cm)?(?:, bracket cut (?P<bracketcut>\d+) mm)? \(live; ")
-H_SRV_TURRET_VIEW = r"srv turret view: (?P<state>on|off) at frame (?P<frame>\d+) \(Status\.json Flags 0x(?P<flags>[0-9A-Fa-f]+), seat kind 0x(?P<seat>[0-9A-Fa-f]+)\)$"
+# An "on" edge the gunner sheet's draw raised before Status.json said so (the early edge, srv_turret_sheet_latch.h) carries the tail " (the gunner sheet drew; Status.json not yet)": the group "early".
+H_SRV_TURRET_VIEW = (r"srv turret view: (?P<state>on|off) at frame (?P<frame>\d+) \(Status\.json Flags 0x(?P<flags>[0-9A-Fa-f]+), seat kind 0x(?P<seat>[0-9A-Fa-f]+)\)"
+                     r"(?P<early> \(the gunner sheet drew; Status\.json not yet\))?$")
+# The early edge's other lines: Status.json caught up (its lag behind the sheet), and the latch ending without it.
+H_SRV_TURRET_AGREED = r"srv turret view: Status\.json agreed (?P<lag>\d+) ms after the sheet$"
+H_SRV_TURRET_LATCH_END = r"srv turret view: the gunner sheet latch (?P<how>expired|dropped) after (?P<held>\d+) ms: .+$"
 # The turret view bit is on in an SRV the journal does not call the Scorpion (a Scarab, a training scenario): said once per stay, and the camera and the HUD stay the game's own. The
 # "on" and "off" lines above are written only for a turret view in the Scorpion.
 H_SRV_TURRET_IGNORED = (r"srv turret view: not the Scorpion at frame (?P<frame>\d+) \(Status\.json Flags 0x(?P<flags>[0-9A-Fa-f]+), seat kind 0x(?P<seat>[0-9A-Fa-f]+)\): the turret view is on "
@@ -10426,8 +10644,8 @@ H_SRV_TURRET_HUD = (r"srv turret hud: (?:panels: " + H_SRV_TURRET_GROUP.format(p
 # shaderSwapCreateGs: "<who>: precompiled geometry shader <name> <outcome> (0x<HRESULT>, <ms> ms)." with the outcome created, creation FAILED; standing down, or creation faulted/refused; standing down.
 H_SRV_TURRET_GS = (r"srv turret hud: precompiled geometry shader (?P<name>.+?) (?P<outcome>created|creation FAILED; standing down|creation faulted/refused; standing down) "
                    r"\(0x(?P<hr>[0-9A-Fa-f]{8}), (?P<ms>[\d.]+) ms\)\.$")
-# Nine hologram families (srv_turret_math.h kFamilies: 1989E6D3, 2CECEC30, DF3503CD, 44DDCDEB, 9B34C331, 9611A454, B932058F, 5559BD94.EA02FAC2, 5559BD94.E95634B0: the first eight
-# hex digits of the vertex shader, and for the two that share one the pixel shader's as well) in eight signatures (kSignatures, named by the first family's vertex shader), each signature
+# Eleven hologram families (srv_turret_math.h kFamilies: 1989E6D3, 2CECEC30, DF3503CD, 44DDCDEB, 9B34C331, 9611A454, B932058F, 5559BD94.EA02FAC2, 5559BD94.E95634B0, 81216C77.A2965EC2, 81216C77.B4786E0A: the first eight
+# hex digits of the vertex shader, and for the four that share one the pixel shader's as well) in eleven signatures with the gunner sheet's (kSignatures, named by the first family's vertex shader), each signature
 # with its own geometry shader; the first-draw and state lines name the family. The flight HUD's vectors (B7790CBF) are no longer in the pass.
 # the anchor the move is made about (srv_turret.cpp cacheGeometry): the head's seated position, latched when the view comes on, a camera key changes, the head jumps (a recentre) or has
 # stayed more than 35 cm from it for 90 frames ("head away": the safety net, e.g. after a frozen pose)
@@ -15593,6 +15811,23 @@ def _hj_f95c_head_shadow(rows, ctx):
         return ("PARTIAL", text + "; " + "; ".join(notes))
     return ("OK", text)
 
+_TEE_HELD = (("h_measure", "measure"), ("h_pending", "pending"), ("h_bound", "bound"), ("h_census", "census"), ("h_check", "check"),
+             ("h_polled", "polled"), ("h_world0", "world 0"), ("h_world1", "world 1"), ("h_clear", "clear"))
+
+
+def _tee_held_text(sec):
+    """#155: the cost lines' tally of the terms that held the tee's fast frame back and the draws refused as not scene depth. Lines from a build before #155
+    carry none of it, which the text says."""
+    held = [r for r in sec if r.get("h_measure") is not None]
+    if not held:
+        return "; no #155 tally (a build before it)"
+    sums = [(name, sum(int(r[k]) for r in held)) for k, name in _TEE_HELD]
+    total = sum(n for _, n in sums)
+    terms = ", ".join("%s %d (%s)" % (name, n, _hpct(n, total)) for name, n in sums if n) or "no slow call"
+    text = "; held (#155) over %d lines: %s; not scene depth %d" % (len(held), terms, sum(int(r["notscene"]) for r in held))
+    return text
+
+
 def _hj_f100_tee(rows, ctx):
     """F100: the marker probe's draw tee. Per window (its cost line; 1 s before F125 and in the detail log, 10 s otherwise): the calls, the share the prefilter
     took, the frames, and the tee's clock (a mean call from one call in 64 on the perf monitor's sample frames, and the estimate a frame). Calls and no prefilter
@@ -15611,6 +15846,7 @@ def _hj_f100_tee(rows, ctx):
         text += "; the tee %.3f ms a frame (median of %d clocked %s, max %.3f), %.1f ns a call" % (ms[len(ms) // 2], len(ms), unit, ms[-1], ns[len(ns) // 2])
     else:
         text += "; the tee's clock took no call (no perf sample frame on foot)"
+    text += _tee_held_text(sec)
     if not calls:
         return ("IDLE", text)
     if not fast:
@@ -16633,7 +16869,7 @@ def _hj_srv_turret(rows, ctx):
     HUD keys all at 0 are that half off by key, IDLE, and so is the camera key at 0. PARTIAL: applied, but under SRV_TURRET_BOUND_MIN of the HUD draws bound, or draws refused for the
     geometry, the readiness or a game geometry shader. The status is the worst of the two halves; a log with the keys unread (no settings line) judges the camera half on nothing (a key it
     cannot see) and the HUD half on the 10 s line's own windows. No line at all is nothing to judge (None).
-    The pass covers nine hologram families in eight signatures, each signature with its own geometry shader (a creation line apiece: any one failing is NEVER APPLIED), each family
+    The pass covers eleven hologram families in eleven signatures, each signature with its own geometry shader (a creation line apiece: any one failing is NEVER APPLIED), each family
     with its first-draw line, in two groups (the weapon panels, the radar) each with its own push-back. The Scorpion only: a "not the Scorpion" line (the turret view bit
     is on in an SRV the journal does not call the Scorpion, a Scarab or a training scenario) is turret activity but never a failure; with nothing else from the turret in the window the rule
     is IDLE ("nothing applied, by design"), and beside a Scorpion visit its count goes into the detail. The vehicle latch's lines ("srv turret: the vehicle is ...") are state like the
@@ -17086,6 +17322,9 @@ HEALTH_RULES = (
                     r"(?:.*; over " + H_WL + r"$)?"),
         ("idle", r"marker fix \(F62c\): eye \d: no decision " + H_WL_THIS),
         ("win", r"marker fix \(F87c\) eye (?P<eye>\d): windows \d+ \([^)]*\), named (?P<named>\d+), outside (?P<outside>\d+)(?:.*; over " + H_WL + r"$)?"),
+        # build 3: the one Unmap copy both eyes share (requested against copied bytes, copy faults); the judge reads the eye lines, so the line is matched and not judged
+        ("_", r"marker fix \(F87c\) Unmap copy: \d+ Unmaps, requested \d+ bytes, copied \d+ bytes in \d+ ranges \(\d+ windows joined\), whole stream \d+ bytes, faults \d+, "
+              r"[\d.]+ ms; over " + H_WL + r"$"),
         # F198: the marker probe's cost line (marker composite draws that reached the draw tee) and the first draw an eye was named by the submitted textures
         ("probe", r"native on foot marker probe: cost: draw tee calls \d+, draws scanned past the VS hash \d+ \(on-foot HUD \d+, marker composite (?P<mc>\d+), world \d+\)"),
         ("seye", r"marker eye \(F198\): the eyes named by the submitted textures \(Anti-aliasing off\): eye 0 \S+, eye 1 \S+$"),
@@ -17636,7 +17875,11 @@ HEALTH_RULES = (
     ), _hj_f95c_head_shadow),
     _hrule("marker tee (F100)", ("F100",), ("tee (F100)",), (
         ("sec", r"tee \(F100\): fast path (?P<fast>\d+) of (?P<calls>\d+) calls, (?P<frames>\d+) frames, tee clock: (?:(?P<clocked>\d+) calls clocked, (?P<ns>-?[\d.]+) ns a "
-                r"call, est\. (?P<ms>-?[\d.]+) ms a frame|none)(?:; over " + H_WL + r")?"),   # F125: the window's seconds; none before F125 (1 s)
+                r"call, est\. (?P<ms>-?[\d.]+) ms a frame|none)(?:; over " + H_WL + r")?"   # F125: the window's seconds; none before F125 (1 s)
+                # #155: the slow calls by the term that held the fast frame back, the world draws refused as not scene depth
+                r"(?:; tee held \(#155\): measure (?P<h_measure>\d+), pending (?P<h_pending>\d+), bound (?P<h_bound>\d+), census (?P<h_census>\d+), "
+                r"check (?P<h_check>\d+), polled (?P<h_polled>\d+), world 0 (?P<h_world0>\d+), world 1 (?P<h_world1>\d+), clear (?P<h_clear>\d+); "
+                r"not scene depth (?P<notscene>\d+))?"),
         ("families", r"marker probe \(F100\): measurement families (?P<state>ON|off) "),
     ), _hj_f100_tee),
     _hrule("pose hook CPU (F100)", ("F100",), ("pose hook CPU (F100)",), (
@@ -17750,6 +17993,8 @@ HEALTH_RULES = (
         ("setting", H_SRV_TURRET_SETTING),
         ("vehicle", H_SRV_TURRET_VEHICLE),
         ("view", H_SRV_TURRET_VIEW),
+        ("agreed", H_SRV_TURRET_AGREED),
+        ("latch_end", H_SRV_TURRET_LATCH_END),
         ("ignored", H_SRV_TURRET_IGNORED),
         ("published", H_SRV_TURRET_PUBLISHED),
         ("cleared", H_SRV_TURRET_CLEARED),
@@ -18047,6 +18292,204 @@ def print_health(text, args, runtime_text=None):
     return rc
 
 
+# --perf-windows: the draw hook's CPU windows (src/d3d11/perf_monitor.cpp), one row each (docs\vr-draw-path-cpu-2026-11-01.md). The line:
+#   draw hook CPU: 1800-frame window ending N; M ms/sampled frame mean, ...        perf_monitor.cpp
+# A window ends at N and covers frames N-1799..N.
+PERF_EYES_RE = re.compile(r"eye draws counted this frame (\d+)")
+PERF_WINDOW_RE = re.compile(r"draw hook CPU: (?P<size>\d+)-frame window ending (?P<end>\d+); (?P<mean>[\d.]+) ms/sampled frame mean, (?P<max>[\d.]+) ms max, (?P<samples>\d+) sampled frames")
+
+
+def _perf_window_of(line):
+    """The `draw hook CPU:` window one log line holds, or None: dict end, start, mean, max, samples and eyes (the eye draws counted on the closing frame, None when the line
+    does not say)."""
+    m = PERF_WINDOW_RE.search(line)
+    if not m:
+        return None
+    end, size = int(m.group("end")), int(m.group("size"))
+    eyes = PERF_EYES_RE.search(line)
+    return {"end": end, "start": end - size + 1, "mean": float(m.group("mean")), "max": float(m.group("max")), "samples": int(m.group("samples")),
+            "eyes": int(eyes.group(1)) if eyes else None}
+
+
+# The lines laid beside each window (build 2, #168). All four are written by src/d3d11, the first two every window beside `draw hook CPU:`; the self-test holds the fragments to the sources.
+#   draw mask: 1800-frame window ending N; D draws through the full path; calls skipped by the vertex shader's may-want byte: ui_family A, ...        draw_mask_line.h
+#   gpu timing queries: 1800-frame window ending N; X EDVR timing-query Ends a frame over F frames (T in all); by owner a frame: other a, ...        gpu_query_count.h
+#   draw gate holders: K of 29 terms hold the gate open: a, b.        draw_gate_holders.h, when the set changes
+#   marker fix (F87c) eye E: ...; Unmap copy C copies, B bytes, M ms; ...        native_on_foot.cpp, per eye per window (build 2; build 3 writes "requested B bytes" and no ms)
+#   marker fix (F87c) Unmap copy: U Unmaps, requested R bytes, copied C bytes in N ranges (J windows joined), whole stream W bytes, faults F, M ms; over S s        build 3
+PERF_MASK_RE = re.compile(r"draw mask: \d+-frame window ending (?P<end>\d+); (?P<draws>\d+) draws through the full path; calls skipped by the vertex shader's may-want byte: (?P<rest>.*)\.$")
+PERF_QUERY_RE = re.compile(r"gpu timing queries: \d+-frame window ending (?P<end>\d+); (?P<per>[\d.]+) EDVR timing-query Ends a frame over \d+ frames \((?P<all>\d+) in all\); by owner a frame: (?P<rest>.*)\.$")
+PERF_GATE_RE = re.compile(r"draw gate holders: (?P<n>\d+) of (?P<of>\d+) terms hold the gate open: (?P<names>.*)\.$")
+PERF_COPY_RE = re.compile(r"marker fix \(F87c\) eye (?P<eye>\d): .*?Unmap copy (?P<copies>\d+) copies, (?P<bytes>\d+) bytes, (?P<ms>[\d.]+) ms")
+PERF_MERGED_RE = re.compile(r"marker fix \(F87c\) Unmap copy: (?P<unmaps>\d+) Unmaps, requested (?P<req>\d+) bytes, copied (?P<copied>\d+) bytes in (?P<ranges>\d+) ranges "
+                            r"\((?P<joined>\d+) windows joined\), whole stream (?P<whole>\d+) bytes, faults (?P<faults>\d+), (?P<ms>[\d.]+) ms; over (?P<secs>\d+) s")
+
+
+def perf_extra_of(msg):
+    """The build-2 or build-3 line one log message holds, or None: (kind, dict) for kind mask, query, gate, copy (build 2's per-eye figures) or merged (build 3's one line)."""
+    m = PERF_MASK_RE.search(msg)
+    if m:
+        return "mask", {"end": int(m.group("end")), "draws": int(m.group("draws")), "rest": m.group("rest")}
+    m = PERF_QUERY_RE.search(msg)
+    if m:
+        return "query", {"end": int(m.group("end")), "per": float(m.group("per")), "all": int(m.group("all")), "rest": m.group("rest")}
+    m = PERF_GATE_RE.search(msg)
+    if m:
+        return "gate", {"n": int(m.group("n")), "of": int(m.group("of")), "names": m.group("names")}
+    m = PERF_COPY_RE.search(msg)
+    if m:
+        return "copy", {"eye": int(m.group("eye")), "copies": int(m.group("copies")), "bytes": int(m.group("bytes")), "ms": float(m.group("ms"))}
+    m = PERF_MERGED_RE.search(msg)
+    if m:
+        d = {k: int(m.group(k)) for k in ("unmaps", "req", "copied", "ranges", "joined", "whole", "faults", "secs")}
+        d["ms"] = float(m.group("ms"))
+        return "merged", d
+    return None
+
+
+
+def perf_windows(text):
+    """Every `draw hook CPU:` window, in order: dicts end, start, mean, max, samples and eyes."""
+    return [w for w in map(_perf_window_of, text.splitlines()) if w]
+
+
+# The runtime log's frame cycle lines (src/openxr/native_runtime_host.h): per 30 s window the phase means (nested=0 are the top-level phases; `cycle` is the whole frame,
+# game_before_first_submit is R1, the game's own work before the first eye submit) and the window line, whose elapsed_ms gives the window its span back from its stamp.
+RT_CYCLE_PHASE_RE = re.compile(r"native_frame_cycle_phase,window=(?P<w>\d+),name=(?P<name>cycle|game_before_first_submit),mean=(?P<mean>[\d.]+),.*,nested=0")
+RT_CYCLE_WINDOW_RE = re.compile(r"native_frame_cycle_window,window=(?P<w>\d+),.*?,elapsed_ms=(?P<ms>\d+)")
+
+
+def _trimmed_mean(xs):
+    """Mean with the min and the max dropped; None under three values (nothing would be left worth the name)."""
+    if len(xs) < 3:
+        return None
+    return statistics.mean(sorted(xs)[1:-1])
+
+
+def _perf_stat(label, xs, fmt, qualifier=""):
+    """`R1 ms (2 with runtime data): mean 22.59, trimmed mean n/a (fewer than 3)`."""
+    if not xs:
+        return "%s ms%s: n/a" % (label, qualifier)
+    trimmed = _trimmed_mean(xs)
+    return "%s ms%s: mean %s, trimmed mean %s" % (label, qualifier, fmt % statistics.mean(xs), fmt % trimmed if trimmed is not None else "n/a (fewer than 3)")
+
+
+def print_perf_windows(text, gfx_path=None, rt_text=None, rt_path=None, since=None, until=None):
+    """The --perf-windows report. Each `draw hook CPU:` window on a line with its hook ms per eye draw and, from the runtime log (rt_text), R1 and the frame cycle: the mean of
+    the runtime windows whose span overlaps the window, weighted by the seconds they overlap. since and until: seconds of the day, bounding the window's closing stamp.
+    Returns the process exit code: 1 when there is no window to report."""
+    wins, rt = [], {}
+    extra = {"mask": {}, "query": {}}
+    gates, copies, merged = [], [], []   # (stamp, parsed) for the gate holders and for the marker fix's copy figures (build 2's per-eye lines, build 3's merged line)
+
+    def on_gfx(msg, t):
+        w = _perf_window_of(msg)
+        if w:
+            w["close"] = t
+            wins.append(w)
+            return
+        e = perf_extra_of(msg)
+        if e:
+            if e[0] in extra:
+                extra[e[0]][e[1]["end"]] = e[1]
+            elif e[0] == "gate":
+                gates.append((t, e[1]))
+            elif e[0] == "merged":
+                merged.append((t, e[1]))
+            else:
+                copies.append((t, e[1]))
+
+    def on_rt(msg, t):
+        m = RT_CYCLE_PHASE_RE.match(msg)
+        if m:
+            e = rt.setdefault(int(m.group("w")), {})
+            e["close"] = t
+            e["cycle" if m.group("name") == "cycle" else "r1"] = float(m.group("mean"))
+            return
+        m = RT_CYCLE_WINDOW_RE.match(msg)
+        if m:
+            e = rt.setdefault(int(m.group("w")), {})
+            e["close"] = t
+            e["span"] = int(m.group("ms")) / 1000.0
+
+    gscan, _, _ = scan_flight(gfx_path, text, rt_path, rt_text, gfx_on_line=on_gfx, rt_on_line=on_rt if rt_text is not None else None)
+    if not wins:
+        print("[edvr] no `draw hook CPU:` window in this log: a log shorter than 1800 frames, a build without the line, or not the graphics log (this reads --tag gfx).")
+        return 1
+    prev = gscan["first"]
+    for w in wins:   # a window runs from the previous one's closing stamp (the first, from the log's first stamped line) to its own
+        w["from"], prev = prev, w["close"]
+    runtime = [(e["close"] - e["span"], e["close"], e["r1"], e["cycle"]) for e in rt.values() if "span" in e and "r1" in e and "cycle" in e]
+
+    def clock(t):
+        return fmt_clock(t, int(t // DAY))
+
+    def keep(w):
+        if since is None and until is None:
+            return True
+        c = w["close"] % DAY
+        if since is not None and until is not None and since > until:   # across midnight
+            return c >= since or c <= until
+        return (since is None or c >= since) and (until is None or c <= until)
+
+    shown = [w for w in wins if keep(w)]
+    if not shown:
+        print("[edvr] no `draw hook CPU:` window between %s and %s in this log (%d window(s) outside)." % (
+            "%02d:%02d:%02d" % (since // 3600, since % 3600 // 60, since % 60) if since is not None else "start",
+            "%02d:%02d:%02d" % (until // 3600, until % 3600 // 60, until % 60) if until is not None else "end", len(wins)))
+        return 1
+    hooks, r1s, cycles = [], [], []
+    for w in shown:
+        parts = ["window ending %d: %.3f ms mean, %.3f ms max, %d sampled, closed %s" % (w["end"], w["mean"], w["max"], w["samples"], clock(w["close"]))]
+        if w["eyes"]:
+            parts.append("hook %.4f ms per eye draw (%d counted on the closing frame)" % (w["mean"] / w["eyes"], w["eyes"]))
+        else:
+            parts.append("hook ms per eye draw: n/a, no eye-draw count (the draw line counts eye draws only while a draw subscriber is on)")
+        if rt_text is None:
+            parts.append("runtime: no runtime log")
+        else:
+            hit = [(min(w["close"], b) - max(w["from"], a), r1, cyc) for a, b, r1, cyc in runtime if min(w["close"], b) - max(w["from"], a) > 0]
+            if hit:
+                secs = sum(h[0] for h in hit)
+                r1 = sum(h[0] * h[1] for h in hit) / secs
+                cyc = sum(h[0] * h[2] for h in hit) / secs
+                r1s.append(r1)
+                cycles.append(cyc)
+                parts.append("runtime: R1 %.2f ms, cycle %.2f ms (%d runtime window(s), %.1f s overlap)" % (r1, cyc, len(hit), secs))
+            else:
+                parts.append("runtime: NO RUNTIME DATA (no runtime frame cycle window overlaps this window)")
+        # build 2: what the may-want byte skipped, who issued the timing queries, what held the draw gate, the marker fix's Unmap copy
+        mk, qy = extra["mask"].get(w["end"]), extra["query"].get(w["end"])
+        parts.append("draw mask: %d draws through the full path, skipped %s" % (mk["draws"], mk["rest"]) if mk else "draw mask: NO LINE (a build without the may-want byte)")
+        parts.append("timing queries a frame: %.3f (%s)" % (qy["per"], qy["rest"]) if qy else "timing queries: NO LINE (a build without the counter)")
+        held = [g for t, g in gates if t <= w["close"]]
+        parts.append("gate held by %s" % ("%d of %d: %s" % (held[-1]["n"], held[-1]["of"], held[-1]["names"]) if held else "n/a (no `draw gate holders:` line before this window)"))
+        mine = [c for t, c in copies if w["from"] < t <= w["close"]]
+        mm = [c for t, c in merged if w["from"] < t <= w["close"]]
+        if mm:   # build 3: one copy for both eyes
+            u, rq, cp = sum(c["unmaps"] for c in mm), sum(c["req"] for c in mm), sum(c["copied"] for c in mm)
+            parts.append("marker copy (F87c merged, %d line(s) in window): %d Unmaps, requested %d bytes, copied %d bytes (%s of requested), %d ranges (%d windows joined), "
+                         "whole stream %d bytes, faults %d, %.3f ms (%s a Unmap)" % (
+                             len(mm), u, rq, cp, "%.1f%%" % (100.0 * cp / rq) if rq else "n/a", sum(c["ranges"] for c in mm), sum(c["joined"] for c in mm),
+                             sum(c["whole"] for c in mm), sum(c["faults"] for c in mm), sum(c["ms"] for c in mm),
+                             "%.3f ms" % (sum(c["ms"] for c in mm) / u) if u else "n/a"))
+        elif mine:
+            parts.append("marker copy (F87c lines in window): " + ", ".join("eye %d %d copies %d bytes %.3f ms" % (
+                eye, sum(c["copies"] for c in mine if c["eye"] == eye), sum(c["bytes"] for c in mine if c["eye"] == eye), sum(c["ms"] for c in mine if c["eye"] == eye))
+                for eye in sorted({c["eye"] for c in mine})))
+        else:
+            parts.append("marker copy: no F87c line in this window (marker fix off, or a build without the figures)")
+        hooks.append(w["mean"])
+        print("; ".join(parts))
+    if rt_text is None:
+        tail = "R1 ms: no runtime log; cycle ms: no runtime log"
+    else:
+        q = " (%d with runtime data)" % len(r1s)
+        tail = "%s; %s" % (_perf_stat("R1", r1s, "%.2f", q), _perf_stat("cycle", cycles, "%.2f", q))
+    print("[edvr] %d window(s). %s; %s" % (len(shown), _perf_stat("hook", hooks, "%.3f"), tail))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Locate and read EDVR flight logs.")
@@ -18074,11 +18517,14 @@ def main(argv=None):
                     help="print only lines matching this regular expression")
     ap.add_argument("--tail", type=int, default=None,
                     help="print only the last N lines (after --grep)")
-    ap.add_argument("--tally", choices=["vh", "periodic", "pose", "cover"], default=None,
+    ap.add_argument("--tally", choices=["vh", "offscreen", "periodic", "pose", "cover", "reissue"], default=None,
                     help="aggregate instead of dumping: pose tables the `pose gap:` "
                          "lines of the runtime log by caller; "
                          "cover tables the `terrain cull cover:` lines of the graphics log "
                          "(the hook, its first call, its ten-minute heartbeat); "
+                         "offscreen groups the census's non-eye draws (DCO, and the t=i / t=f DC lines) by "
+                         "resolved render target and depth target, with draw kinds and top vertex shaders, "
+                         "and checks the DC frame line's off= against the DCO line count; "
                          "vh counts eye-texture "
                          "DC lines per vh= hash, split by r= render-target "
                          "token, with the DC frame summaries as totals; "
@@ -18102,6 +18548,9 @@ def main(argv=None):
                          "the pass's rows), the on-foot naming runs and the "
                          "detour's CPU, and the stage 2 verdict (PASS / WARN / "
                          "STOP) on the world route's injected phase")
+    ap.add_argument("--perf-windows", action="store_true",
+                    help="table the graphics log's `draw hook CPU:` windows (docs\\vr-draw-path-cpu-2026-11-01.md), each with hook ms per eye draw and the paired runtime log's "
+                         "R1 (game_before_first_submit) and frame cycle; --since/--until bound the windows by closing time; ends with count, mean and trimmed mean")
     ap.add_argument("--maps-sharp", action="store_true",
                     help="report an on-foot maps gate flight (the gate is always on): every map or menu the layer took and handed back "
                          "(when, how long, how many eyes skipped the upscaler), the 5 s "
@@ -18243,8 +18692,11 @@ def main(argv=None):
               "its runtime log itself; drop --tag %s." % args.tag)
         return 1
 
-    if (args.since or args.until or args.health_all) and not args.health:
-        print("[edvr] --since, --until and --health-all belong to --health.")
+    if (args.since or args.until) and not (args.health or args.perf_windows):
+        print("[edvr] --since and --until belong to --health and --perf-windows.")
+        return 1
+    if args.health_all and not args.health:
+        print("[edvr] --health-all belongs to --health.")
         return 1
 
     native_dirs = None
@@ -18336,6 +18788,24 @@ def main(argv=None):
         return print_terrain_checkerboard(text)
     if args.camera_census:
         return print_camera_census(text)
+    if args.perf_windows:
+        try:
+            since = parse_health_time(args.since) if args.since else None
+            until = parse_health_time(args.until, end=True) if args.until else None
+        except ValueError as e:
+            print("[edvr] bad --since/--until time %s (use HH:MM or HH:MM:SS)" % e)
+            return 1
+        rt_why = None
+        if args.runtime_file:
+            rt_path = os.path.abspath(args.runtime_file)
+            if not os.path.isfile(rt_path):
+                print("[edvr] no such runtime log: %s" % rt_path)
+                return 1
+        else:
+            rt_path, rt_why = pair_runtime_log(path, native_dirs)
+        rt_text = read_text(rt_path) if rt_path else None
+        print("[edvr] runtime log: %s" % (rt_path if rt_path else "NONE FOUND (%s); only the draw hook figure is reported" % rt_why))
+        return print_perf_windows(text, path, rt_text, rt_path, since, until)
     if args.maps_sharp:
         return print_maps_sharp(text)
     if args.route_curve:
@@ -18354,6 +18824,10 @@ def main(argv=None):
         return print_pose_tally(text)
     if args.tally == "cover":
         return print_cover_tally(parse_cover(text))
+    if args.tally == "reissue":
+        return print_reissue_tally(parse_reissue(text), text)
+    if args.tally == "offscreen":
+        return print_offscreen_tally(text, args.frame)
     if args.tally:
         return print_vh_tally(text, args.frame)
 
@@ -19462,7 +19936,11 @@ def self_test_health():
             return R("native on foot marker fix (F62c): eye %d: no decision", eye, span)
 
         def mark_win(named=113, outside=8, eye=1, wl=1):
-            return R("marker fix (F87c) eye %d: windows", eye, 2, 1, 1, 13, named, outside, 2806, "first 1 last 2", wl)
+            return R("marker fix (F87c) eye %d: windows", eye, 2, 1, 1, 13, named, outside, 2806, 600, 4800000, eye, "first 1 last 2", wl)
+
+        def mark_copy(wl=1, faults=0):
+            """Build 3: the one Unmap copy line both eyes share."""
+            return R("marker fix (F87c) Unmap copy:", 600, 9600000, 7200000, 1200, 900, 0, faults, 150.25, wl)
 
         # F125: lines as a build before F125 wrote them (1 s, no window field), from the 10-25 flight
         MARK_OLD = ("native on foot marker fix (F62c/F64): eye 0: patch applied 95.7% (45 of 47 decisions bound at the issue, 0 through the newest rows); decided: "
@@ -19470,6 +19948,8 @@ def self_test_health():
                     "positive 0, |d| over 0.40 NDC 0, no P 0, other (ranged b0, no CPU b0 rows, no CPU o_hud) 0; bind refused 0")
         MARK_IDLE_OLD = "native on foot marker fix (F62c): eye 1: no decision this second (no marker composite draw of the eye reached the fix)"
         MARK_WIN_OLD = "marker fix (F87c) eye 0: windows 2 (F85 1, history 1, escalated 0), named 40, outside 2 (nearest 12); eye-1 first/last ring -"
+        MARK_WIN_B2 = ("marker fix (F87c) eye 0: windows 2 (F85 1, history 1, escalated 0), named 40, outside 2 (nearest 12); Unmap copy 600 copies, 4800000 bytes, "
+                       "120.500 ms; eye-1 first/last ring -; over 10 s")
 
         def anchor(s=11, u=0, i=1, key=-1, wl=1, focus_secs=None):
             return RWindowTail("prompt anchor (F87p) %u s: SetMarker", wl, s, u, i, key, 0.0, 0.0, 0.0, 0.0, 0, "none", 0, 0, 1, 10,
@@ -22849,10 +23329,11 @@ def self_test_health():
         # ---- marker tee (F100): the draw tee's prefilter and its clock; pose hook CPU (F100): the local avatar's Animate work ----
         T100, P100 = "marker tee (F100)", "pose hook CPU (F100)"
 
-        def tee100(fast=1800000, calls=2000000, frames=90, clocked=350, ns=25.0, ms=0.556, wl=1):
+        def tee100(fast=1800000, calls=2000000, frames=90, clocked=350, ns=25.0, ms=0.556, wl=1, held=None):
             head = R("native on foot marker probe: cost: draw tee calls %llu", calls, 300000, 1000, 900, 298100, 8900, 960, 44640, 0)
             tail = R(", tee clock: %llu calls clocked", clocked, ns, ms, wl) if clocked else R(", tee clock: none", wl)
-            return head + R("; tee (F100): fast path %llu", fast, calls, frames) + tail
+            # #155: the tally (measure .. world 1, clear), not scene depth; absent before #155
+            return head + R("; tee (F100): fast path %llu", fast, calls, frames) + tail + (R("; tee held (#155):", *held) if held else "")
 
         def pose100(calls=90, mean=42.5, mx=120.0, ms=3.825, wl=1):
             return R("native on foot pose hook CPU (F100) %u s:", wl, calls, mean, mx, ms)
@@ -22872,6 +23353,16 @@ def self_test_health():
               has=["14 s:", "median of 2 clocked windows"], lacks=["UNPARSED"])
         check("F100 tee: 10 s without a clock sample", [tee100(clocked=0, wl=10)], 0, [("PARTIAL", T100)],
               has=["10 s:", "the tee's clock took no call"], lacks=["UNPARSED"])
+        # #155: the tally on the cost line. AA off, key off: every slow call held by world 0, draws refused as not scene depth.
+        check("F100 tee: #155 tally, AA off and no world rows", [tee100(fast=0, wl=10, held=(0, 0, 0, 0, 0, 0, 900000, 0, 0, 450000))] * 2, 3,
+              [("NEVER APPLIED", T100)], has=["held (#155) over 2 lines: world 0 1800000 (100%)", "not scene depth 900000"], lacks=["UNPARSED", "world 1"])
+        # DLAA: mostly published, a few pending.
+        check("F100 tee: #155 tally with DLAA", [tee100(wl=10, held=(0, 30, 2, 0, 4, 64, 0, 0, 900, 0))], 0, [("OK", T100)],
+              has=["held (#155) over 1 lines: pending 30 (3%), bound 2 (0%), check 4 (0%), polled 64 (6%), clear 900 (90%)", "not scene depth 0"], lacks=["UNPARSED"])
+        check("F100 tee: #155 tally all zero still reads as run", [tee100(wl=10, held=(0,) * 10)], 0, [("OK", T100)],
+              has=["held (#155) over 1 lines: no slow call", "not scene depth 0"], lacks=["UNPARSED"])
+        check("F100 tee: a line without the #155 tally says so", [tee100(wl=10)], 0, [("OK", T100)],
+              has=["no #155 tally (a build before it)"], lacks=["UNPARSED", "held (#155) over"])
         check("F100 pose: the local Animate work clocked", [pose100(), pose100(ms=4.1)], 0, [("OK", P100)],
               has=["2 s: 180 calls (90 a second), 42.5 us a call (median second), max 120.0 us"], lacks=["UNPARSED"])
         check("F100 pose: no local work", [pose100(0, 0.0, 0.0, 0.0)] * 2, 0, [("IDLE", P100)], has=["no local Animate work clocked"])
@@ -23217,6 +23708,13 @@ def self_test_health():
               lacks=["IDLE", "UNPARSED"])
         check("marker fix: only F87c's windows, nothing named or outside", [F125_MK_OFF, mark_win(0, 0, 0, 10), mark_win(0, 0, 1, 10)], 0, [("IDLE", MK)],
               has=["no marker composite draw reached the fix"])
+        # build 3: the one Unmap copy line is matched (not UNPARSED) beside the eye lines, and a build-2 per-eye line (copies, bytes, ms) still parses
+        check("marker fix: build 3's Unmap copy line is matched", [F125_MK_OFF, mark(230, 250, 0, 10), mark(225, 250, 1, 10), mark_win(1130, 80, 0, 10), mark_win(1100, 90, 1, 10),
+              mark_copy(10)], 0, [("OK", MK)], has=["patch applied eye 0 92% (230 of 250), eye 1 90% (225 of 250); named 2230, outside 170 (F87c)"], lacks=["UNPARSED"])
+        check("marker fix: build 3's Unmap copy line with faults is matched", [F125_MK_OFF, mark(230, 250, 0, 10), mark_win(1130, 80, 0, 10), mark_copy(10, faults=3)], 0,
+              [("OK", MK)], lacks=["UNPARSED"])
+        check("marker fix: a build-2 per-eye line (Unmap copy copies, bytes, ms) still parses", [F125_MK_OFF, mark(230, 250, 0, 10), MARK_WIN_B2], 0, [("OK", MK)],
+              has=["named 40, outside 2 (F87c)"], lacks=["UNPARSED"])
         check("marker fix: only F87c's windows, mostly outside", [mark_win(10, 80, 0, 10), mark_win(10, 90, 1, 10)], 0, [("PARTIAL", MK)],
               has=["named 20 of 190"])
 
@@ -24457,18 +24955,27 @@ def self_test_health():
             return RT(stsrc, "srv turret settings: camera back %d cm", back, forward, rforward, panels, radar, gap, depth, scissor, anchor, systems, hud_up, gunner_up, cards_up)
 
         def st_view(on=True, frame=4100, flags=0x4000000, seat=0x2):
-            return RT(stsrc, "srv turret view: %s at frame %u", "on" if on else "off", frame, flags, seat)
+            return RT(stsrc, "srv turret view: %s at frame %u", "on" if on else "off", frame, flags, seat, "")
+
+        def st_view_early(frame=4100, flags=0x0, seat=0x4):   # the early edge: raised by the gunner sheet, Status.json not yet
+            return RT(stsrc, "srv turret view: %s at frame %u", "on", frame, flags, seat, " (the gunner sheet drew; Status.json not yet)")
+
+        def st_agreed(lag=187):
+            return RT(stsrc, "srv turret view: Status.json agreed %llu ms after the sheet", lag)
+
+        def st_latch_end(held=1043):
+            return RT(stsrc, "srv turret view: the gunner sheet latch expired after %llu ms", held)
 
         def st_cam(back=0.60, serial=3):
             if back:
                 return RT(stsrc, "srv turret camera: back %.2f m published", back, serial)
             return RT(stsrc, "srv turret camera: back cleared", serial)
 
-        # The nine hologram families the pass covers (srv_turret_math.h kFamilies: the first eight hex digits of each vertex shader, and the pixel shader's too for the two that share one) and the
-        # eight signatures they fall into (kSignatures, named by the first family's vertex shader), each with a geometry shader. The first-draw and state lines name the family.
-        # The first two are the weapon panels' group, the other seven the radar's. The flight HUD's vectors (B7790CBF) are no longer in the pass.
-        STF = ("1989E6D3", "2CECEC30", "DF3503CD", "44DDCDEB", "9B34C331", "9611A454", "B932058F", "5559BD94.EA02FAC2", "5559BD94.E95634B0")
-        STS = ("1989E6D3", "2CECEC30", "DF3503CD", "44DDCDEB", "9B34C331", "9611A454", "B932058F", "5559BD94")
+        # The eleven hologram families the pass covers (srv_turret_math.h kFamilies: the first eight hex digits of each vertex shader, and the pixel shader's too for the four that share one) and the
+        # eleven signatures they and the gunner sheets fall into (kSignatures, named by the first family's vertex shader), each with a geometry shader. The first-draw and state lines name the family.
+        # The first two and the last two are the weapon panels' group, the other seven the radar's. The flight HUD's vectors (B7790CBF) are no longer in the pass.
+        STF = ("1989E6D3", "2CECEC30", "DF3503CD", "44DDCDEB", "9B34C331", "9611A454", "B932058F", "5559BD94.EA02FAC2", "5559BD94.E95634B0", "81216C77.A2965EC2", "81216C77.B4786E0A")
+        STS = ("1989E6D3", "2CECEC30", "DF3503CD", "44DDCDEB", "9B34C331", "9611A454", "B932058F", "5559BD94", "5DAD41AA", "81216C77", "A888D510")
 
         # journal_watch.cpp: the vehicle latch's line, and srv_turret.cpp's line for a turret view in an SRV the journal does not call the Scorpion
         jwsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "journal_watch.cpp"))
@@ -24519,7 +25026,7 @@ def self_test_health():
             return RT(stsrc, "srv turret hud: family %s draws with the scissor test on", family, rects, *first, *target, "opened to the whole target" if opened else "kept as the game set it")
 
         def st_flight(back=60, forward=70, panels=110, radar=110, gap=0, hud=True, cam=True, rforward=70):
-            """A turret visit as the DLL writes it: the keys, the view on, the camera published, the eight signatures' geometry shaders, the first draws of two families, a 10 s line, the view off,
+            """A turret visit as the DLL writes it: the keys, the view on, the camera published, the eleven signatures' geometry shaders, the first draws of two families, a 10 s line, the view off,
             the camera cleared."""
             out = [(1, st_set(back, forward, panels, radar, gap, rforward)), (2, st_view())]
             if cam:
@@ -24561,6 +25068,21 @@ def self_test_health():
               [("NEVER APPLIED", ST)], has=["the turret view was on for 28 s", "draw(s) refused, said once per reason: no-geometry"])
         check("srv turret: the view on for 5 s and no 10 s line yet is idle for the hud, and no failure", st_ok + [(1, st_set()), (2, st_view()), (3, st_cam()), (7, st_view(False))], 0, [("OK", ST)],
               has=["camera back 0.60 m published 1 time(s)", "hud: turret view on under 12 s: no 10 s line yet"], lacks=["NEVER APPLIED"])
+        check("srv turret: an early edge raised by the gunner sheet, then Status.json agreeing, parse as the view's lines", st_ok + [(1, st_set()), (2, st_view_early()), (3, st_cam()), (3, st_agreed()), (7, st_view(False))], 0, [("OK", ST)],
+              has=["camera back 0.60 m published 1 time(s)"], lacks=["UNPARSED", "NEVER APPLIED"])
+        check("srv turret: an early edge whose latch expired, and the off edge after it, parse as the view's lines", st_ok + [(1, st_set()), (2, st_view_early()), (3, st_cam()), (4, st_latch_end()), (4, st_view(False))], 0, [("OK", ST)],
+              lacks=["UNPARSED"])
+        check("srv turret: the press watcher's, the fallback's and the entry press lines are not this rule's: no UNPARSED, no change of verdict",
+              st_ok + [(1, st_set()),
+                       (1, "srv turret press: Elite's ToggleBuggyTurretButton in Custom.4.2.binds: 1 bound slot(s): [0] GamePad:GamePad_FaceUp (xinput pad); 1 watched, 0 cannot be seen. The press opens the window in which the gunner sheet raises the turret view."),
+                       (2, st_view_early()), (3, st_cam()),
+                       (3, "srv turret entry fade: entry 1: press at frame 4100; sheet +310 ms after the press; Status.json +430 ms after the press"),
+                       (3, "srv turret entry fade: entry 2: no press was seen (the press watcher saw nothing before the view went on: fallback); the view was raised by Status.json"),
+                       (4, "srv turret entry fade: press at frame 4300: the press raised no view in 2000 ms; the black fades back in over 200 ms, no camera move"),
+                       (4, "srv turret press: falling back to the gunner-sheet watch for the rest of the session or until the bindings change (the gate stays open in the Scorpion with the view off, the hold starts at the sheet): the view went on with no press seen in the preceding 5000 ms, so the watcher is blind (a device it does not see)"),
+                       (5, "srv turret press: the bindings changed; the press is trusted again"), (7, st_view(False))], 0, [("OK", ST)],
+              has=["camera back 0.60 m published 1 time(s)"], lacks=["UNPARSED", "NEVER APPLIED"])
+        check("srv turret: a drifted early-edge tail is UNPARSED", st_ok + [st_view_early().replace("Status.json not yet", "status unknown")], 4, [("UNPARSED", ST)])
         check("srv turret: the camera off by key and the hud idle under 12 s is idle", st_ok + [(1, st_set(0)), (2, st_view()), (7, st_view(False))], 0, [("IDLE", ST)],
               has=["camera off by key", "hud: turret view on under 12 s: no 10 s line yet"], lacks=["NEVER APPLIED"])
         check("srv turret: all four keys at 0 is idle", st_ok + [(1, st_set(0, 0, 0, 0, rforward=0)), (2, st_view()), (20, st_view(False))], 0, [("IDLE", ST)],
@@ -24609,14 +25131,14 @@ def self_test_health():
               [("IDLE", ST)], has=["the turret view was not entered in this window (camera back 60 cm, hud forward 70 cm, radar forward 70 cm, panels back 110 cm, radar back 110 cm, hud gap 0 cm, hud depth front, hud scissor open)"], lacks=["NEVER APPLIED"], extra=["--since", "10:01:00"])
         check("srv turret: events inside --since are counted", st_ok + [(1, st_set())] + [(70 + i, m) for i, m in enumerate((st_view(), st_cam(), st_gs(), st_first(), st_sec(), st_view(False)))], 0,
               [("OK", ST)], has=["hud bound 480 of 480 draws"], extra=["--since", "10:01:00"])
-        # the nine families in eight signatures: the 10 s line's two comma lists, one geometry shader and twin per signature, the families that never reached the window
+        # the eleven families in eleven signatures: the 10 s line's two comma lists, one geometry shader and twin per signature, the families that never reached the window
         old_sec = st_sec().rsplit(" families[", 1)[0] + " families[1989E6D3,2CECEC30]=300,180"
         flight_sec = lambda *secs: st_ok + [(1, st_set()), (2, st_view()), (3, st_cam())] + st_gs_all() + [(5, st_first())] + list(secs) + [(40, st_view(False))]
-        check("srv turret families: the 10 s line of the nine families is read, and the families that drew are listed in its order", st_ok + st_flight(), 0, [("OK", ST)],
+        check("srv turret families: the 10 s line of the eleven families is read, and the families that drew are listed in its order", st_ok + st_flight(), 0, [("OK", ST)],
               has=["hud bound 480 of 480 draws (L 240, R 240), families 1989E6D3 300, 2CECEC30 180, first draw of family"], lacks=["UNPARSED", "DF3503CD 0", "no family drew"])
         check("srv turret families: the draws are summed per family over the 10 s lines, the dotted sphere families among them",
-              flight_sec((12, st_sec(fams=(300, 180, 0, 0, 0, 0, 0, 40, 0))), (22, st_sec(fams=(100, 0, 0, 0, 0, 0, 0, 0, 60)))), 0, [("OK", ST)],
-              has=["families 1989E6D3 400, 2CECEC30 180, 5559BD94.EA02FAC2 40, 5559BD94.E95634B0 60, first draw of family"], lacks=["UNPARSED", "DF3503CD 0", "B7790CBF"])
+              flight_sec((12, st_sec(fams=(300, 180, 0, 0, 0, 0, 0, 40, 0, 50, 0))), (22, st_sec(fams=(100, 0, 0, 0, 0, 0, 0, 0, 60, 0, 30)))), 0, [("OK", ST)],
+              has=["families 1989E6D3 400, 2CECEC30 180, 5559BD94.EA02FAC2 40, 5559BD94.E95634B0 60, 81216C77.A2965EC2 50, 81216C77.B4786E0A 30, first draw of family"], lacks=["UNPARSED", "DF3503CD 0", "B7790CBF"])
         check("srv turret families: a 10 s line in which no family drew says so", flight_sec((12, st_sec(fams=(0,)))), 0, [("OK", ST)],
               has=["hud bound 480 of 480 draws (L 240, R 240), no family drew, first draw of family"], lacks=["UNPARSED", "families 1989E6D3"])
         check("srv turret families: an old 10 s line with two family names still parses", flight_sec((12, old_sec)), 0, [("OK", ST)],
@@ -25137,6 +25659,75 @@ def self_test():
         if rc != 0 or "appears in no census line or summary" not in out:
             print("--tally vh --frame 9 rc=%d:\n%s" % (rc, out))
             ok = False
+
+        # --tally offscreen (build 3): DCO lines and the t=i / t=f DC lines grouped by resolved r= and d=; off= against the DCO line count.
+        off_lines = [
+            "[00:00:01.000] DC begin census=1 frames=2 frame=100 offscreen=yes capture_id=x\n",
+            "[00:00:01.001] DC 0 #0 X n=10 i=1 r=@10 d=@50 c=- s=-,-,-,- vs=@1 vh=AAAAAAAAAAAAAAAA ia=0,0,0 q=0\n",   # an eye draw: not tallied
+            "[00:00:01.002] DCO 0 #0 I n=5 i=1 r=@20 d=@51 c=- s=-,-,-,- vs=@4 vh=CCCCCCCCCCCCCCCC ia=0,0,0 q=1\n",
+            "[00:00:01.003] DCO 0 #1 I n=6 i=1 r=@20 d=@51 c=- s=-,-,-,- vs=@4 vh=CCCCCCCCCCCCCCCC ia=0,0,0 q=2\n",
+            "[00:00:01.004] DCO 0 #2 D n=7 i=1 r=@20 d=@51 c=- s=-,-,-,- vs=@5 vh=eeeeeeeeeeeeeeee ia=0,0,0 q=3\n",
+            "[00:00:01.005] DCO 0 #3 I n=8 i=1 r=tex256x256f28 d=- c=- s=-,-,-,- vs=@5 ia=0,0,0 q=4\n",
+            "[00:00:01.006] DC 0 #1 I n=0 i=0 r=@10 d=@50 c=- s=-,-,-,- vs=@1 vh=FFFFFFFFFFFFFFFF args=@7+0 t=i q=5\n",
+            "[00:00:01.007] DC 0 #2 I n=3 i=1 r=@21 d=- c=- s=-,-,-,- vs=@1 vh=BBBBBBBBBBBBBBBB t=f q=6\n",
+            "[00:00:01.008] DC frame 0 draws=7 off=5 copies=0 disp=0 clears=0 unseen=0\n",
+            "[00:00:01.009] DCO 1 #0 I n=5 i=1 r=@20 d=@51 c=- s=-,-,-,- vs=@4 vh=CCCCCCCCCCCCCCCC ia=0,0,0 q=7\n",
+            "[00:00:01.010] DC frame 1 draws=1 off=3 copies=0 disp=0 clears=0 unseen=0\n",
+            "[00:00:01.011] DC id @10 tex 1920x1080 fmt=87 res=0x1 vf=87\n",
+            "[00:00:01.012] DC id @20 tex 512x512 fmt=28 res=0x2\n",
+            "[00:00:01.013] DC id @21 ?\n",
+            "[00:00:01.014] DC id @50 tex 1920x1080 fmt=39 res=0x3\n",
+            "[00:00:01.015] DC id @51 tex 512x512 fmt=39 res=0x4\n",
+        ]
+        off_dir = os.path.join(tmp, "offscreen_logs")
+        os.makedirs(off_dir)
+        with open(os.path.join(off_dir, "edvr_gfx_20260910_080000.log"), "wb") as f:
+            f.write("".join(off_lines).encode("utf-8"))
+        cs = parse_offscreen("".join(off_lines))
+        if len(cs) != 1 or len(cs[0]["draws"]) != 7 or cs[0]["ids"].get("20") != "tex 512x512 fmt=28 res=0x2" or sorted(cs[0]["frames"]) != [0, 1] \
+                or [d["cls"] for d in cs[0]["draws"] if d["frame"] == 0] != ["DCO", "DCO", "DCO", "DCO", "DC t=i", "DC t=f"]:
+            print("parse_offscreen -> %r" % (cs,))
+            ok = False
+        rc, out = run_census_tally(["--dir", off_dir, "--tally", "offscreen"])
+        for want in ("census 1 frame 0: 6 non-eye draw line(s) in 4 group(s): DCO 4, DC t=f 1, DC t=i 1",
+                     "DCO CUT SHORT: the DC frame line counts off=5, the log holds 4 DCO line(s) (1 missing",
+                     "@20 = 512x512 fmt=28", "@51 = 512x512 fmt=39", "256x256 fmt=28 (inline)", "@10 = 1920x1080 fmt=87", "@21 (unresolved)",
+                     "I:2 D:1",
+                     "CCCCCCCCCCCCCCCC:2 EEEEEEEEEEEEEEEE:1",
+                     "census 1 frame 1: 1 non-eye draw line(s) in 1 group(s): DCO 1", "DCO CUT SHORT: the DC frame line counts off=3, the log holds 1 DCO line(s) (2 missing"):
+            if want not in out:
+                print("--tally offscreen lacks %r:\n%s" % (want, out))
+                ok = False
+        if rc != 0:
+            print("--tally offscreen rc=%d" % rc)
+            ok = False
+        rc, out = run_census_tally(["--dir", off_dir, "--tally", "offscreen", "--frame", "1"])
+        if rc != 0 or "frame 0:" in out or "frame 1:" not in out:
+            print("--tally offscreen --frame 1 did not restrict:\n%s" % out)
+            ok = False
+        agree = "".join(off_lines).replace("off=3 copies", "off=1 copies")
+        rc, out = run_census_tally(["--file", os.path.join(off_dir, "edvr_gfx_20260910_080000.log"), "--tally", "offscreen"])
+        if "DC t=i" not in out:
+            print("--tally offscreen --file did not read the log:\n%s" % out)
+            ok = False
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            print_offscreen_tally(agree)
+        if "off= 1 agrees with the 1 DCO line(s): none cut" not in buf2.getvalue():
+            print("--tally offscreen did not report off= agreeing with the DCO count:\n%s" % buf2.getvalue())
+            ok = False
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            print_offscreen_tally("[00:00:01.000] DC begin census=1 frames=1 frame=1 offscreen=no capture_id=x\n[00:00:01.001] DC frame 0 draws=1 off=0 copies=0 disp=0 clears=0 unseen=0\n")
+        if "offscreen=no: census_offscreen did not load" not in buf2.getvalue() or "off= 0 agrees with the 0 DCO line(s)" not in buf2.getvalue():
+            print("--tally offscreen did not say offscreen=no:\n%s" % buf2.getvalue())
+            ok = False
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            print_offscreen_tally("[00:00:01.000] version 1\n")
+        if "no draw-census lines" not in buf2.getvalue():
+            print("--tally offscreen on a log with no census:\n%s" % buf2.getvalue())
+            ok = False
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
@@ -25168,6 +25759,10 @@ def self_test():
     if not self_test_pose():
         ok = False
     if not self_test_cover():
+        ok = False
+    if not self_test_reissue():
+        ok = False
+    if not self_test_perf_windows():
         ok = False
     if not self_test_switches():
         ok = False
@@ -25407,6 +26002,156 @@ def self_test_pose():
 COVER_FIXTURE = "terrain_cover_fixture.log"
 
 
+def self_test_perf_windows():
+    r"""--perf-windows (docs\vr-draw-path-cpu-2026-11-01.md): the `draw hook CPU:` windows parsed and tabled. Returns ok."""
+    ok = True
+
+    def fail(message):
+        nonlocal ok
+        print("self_test_perf_windows: %s" % message)
+        ok = False
+
+    import contextlib
+    import io
+    win = ("[10:00:02.000] draw hook CPU: 1800-frame window ending %d; %s ms/sampled frame mean, 0.900 ms max, 30 sampled frames (one in 60); excludes forwarded game draw time, "
+           "includes EDVR reissues; zero samples means unavailable. Each sampled frame's figure is estimated from every 4th draw, scaled by 4. Temporal AA off; eye draws counted this frame 0 "
+           "(counted only while a draw subscriber is on).\n")
+    text = win % (1800, "0.500") + win % (3600, "0.700") + win % (5400, "0.600")
+    got = [(w["end"], w["start"], w["mean"], w["max"], w["samples"]) for w in perf_windows(text)]
+    if got != [(1800, 1, 0.5, 0.9, 30), (3600, 1801, 0.7, 0.9, 30), (5400, 3601, 0.6, 0.9, 30)]:
+        fail("the windows parsed to %r" % (got,))
+    if perf_windows("nothing here\n") != []:
+        fail("a line of another instrument parsed as a window")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = print_perf_windows(text)
+    out = buf.getvalue()
+    for want in ("window ending 1800: 0.500 ms mean", "window ending 3600: 0.700 ms mean", "window ending 5400: 0.600 ms mean", "[edvr] 3 window(s)."):
+        if want not in out:
+            fail("--perf-windows output lacks %r:\n%s" % (want, out))
+    if rc != 0:
+        fail("--perf-windows exited %d" % rc)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = print_perf_windows("nothing here\n")
+    if rc != 1 or "no `draw hook CPU:` window" not in buf.getvalue():
+        fail("a log with no window -> rc %d:\n%s" % (rc, buf.getvalue()))
+    # The frame, not just the hook clock: the runtime log's R1 (game_before_first_submit) and cycle joined by time, hook ms per eye draw, --since/--until, the summary.
+    def gwin(clock, end, mean, eyes):
+        return ("[%s] draw hook CPU: 1800-frame window ending %d; %s ms/sampled frame mean, 0.900 ms max, 30 sampled frames (one in 60); excludes forwarded game draw time, includes EDVR "
+                "reissues; zero samples means unavailable. Each sampled frame's figure is estimated from every 4th draw, scaled by 4. Temporal AA off; eye draws counted this frame %d "
+                "(counted only while a draw subscriber is on).\n" % (clock, end, mean, eyes))
+    gtext = ("[10:00:00.000] version v0.0.0 (build 00000000)\n" + gwin("10:00:02.000", 1800, "0.500", 4) + gwin("10:01:02.000", 3600, "0.700", 0) + gwin("10:02:02.000", 5400, "0.600", 0))
+
+    def rwin(utc, n, elapsed, r1, cyc):
+        # local = UTC - 5 h (the file name below says 10:00:00.309 local; the first line is 15:00:00 UTC)
+        pre = "2026-11-02 %s UTC pid=1 tid=2 " % utc
+        return (pre + "native_frame_cycle_phase,window=%d,name=cycle,mean=%s,p50=1,p95=1,p99=1,max=1,units=wall_ms,nested=0\n" % (n, cyc) +
+                pre + "native_frame_cycle_phase,window=%d,name=game_before_first_submit,mean=%s,p50=1,p95=1,p99=1,max=1,units=wall_ms,nested=0\n" % (n, r1) +
+                pre + "native_frame_cycle_window,window=%d,boundary=x,admitted=9,valid=9,first=1,last=9,elapsed_ms=%d,valid_cycle_sum_ms=1.000\n" % (n, elapsed))
+    rtext = "2026-11-02 15:00:00.500 UTC pid=1 tid=2 version v0.0.0\n" + rwin("15:00:30.000", 1, 30000, "20.0000", "30.0000") + rwin("15:01:00.000", 2, 30000, "30.0000", "40.0000")
+    gname, rname = "edvr_gfx_20261102_100000.log", "edvr_openxr_20261102_100000_309_1.log"
+
+    def run(**kw):
+        b = io.StringIO()
+        with contextlib.redirect_stdout(b):
+            try:
+                code = print_perf_windows(gtext, gfx_path=gname, rt_text=rtext, rt_path=rname, **kw)
+            except TypeError as e:
+                print("TypeError: %s" % e)
+                code = -1
+        return code, b.getvalue()
+    rc, out = run()
+    for want in ("window ending 1800: 0.500 ms mean", "hook 0.1250 ms per eye draw (4 counted on the closing frame)", "R1 20.00 ms, cycle 30.00 ms",
+                 "window ending 3600: 0.700 ms mean", "no eye-draw count", "R1 25.17 ms, cycle 35.17 ms",
+                 "window ending 5400: 0.600 ms mean", "NO RUNTIME DATA",
+                 "[edvr] 3 window(s). hook ms: mean 0.600, trimmed mean 0.600; R1 ms (2 with runtime data): mean 22.59, trimmed mean n/a (fewer than 3); "
+                 "cycle ms (2 with runtime data): mean 32.59, trimmed mean n/a (fewer than 3)"):
+        if want not in out:
+            fail("--perf-windows with a runtime log lacks %r:\n%s" % (want, out))
+    if rc != 0:
+        fail("--perf-windows with a runtime log exited %d" % rc)
+    rc, out = run(since=parse_health_time("10:01:00"), until=parse_health_time("10:03:00", end=True))
+    if "window ending 1800" in out or "window ending 3600" not in out or "[edvr] 2 window(s). hook ms: mean 0.650" not in out:
+        fail("--since 10:01:00 should keep the last two windows:\n%s" % out)
+    rc, out = run(since=parse_health_time("11:00:00"))
+    if rc != 1 or "no `draw hook CPU:` window between" not in out:
+        fail("--since past every window -> rc %d:\n%s" % (rc, out))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = print_perf_windows(gtext, gfx_path=gname)
+    if rc != 0 or buf.getvalue().count("no runtime log") < 3:
+        fail("no runtime log should be said on every window (rc %d):\n%s" % (rc, buf.getvalue()))
+    # Build 2: the lines beside the window. A window without them says so (never silent), a window with zeros prints the zeros.
+    bare = buf.getvalue()
+    if "draw mask: NO LINE" not in bare or "timing queries: NO LINE" not in bare or "no `draw gate holders:` line" not in bare or "marker copy: no F87c line" not in bare:
+        fail("a window with none of the build-2 lines should say each is absent:\n%s" % bare)
+    mask = ("draw mask: 1800-frame window ending 1800; 14000 draws through the full path; calls skipped by the vertex shader's may-want byte: "
+            "ui_family 0, screen_motion_ui 7, screen_motion 0, weapon_motion 3.")
+    qry = ("gpu timing queries: 1800-frame window ending 1800; 6.500 EDVR timing-query Ends a frame over 1800 frames (11700 in all); by owner a frame: "
+           "other 0.500, screen_motion 2.000, weapon_motion 0.000, gpu_census 4.000, particle_copy 0.000, ui_depth 0.000, ui_content 0.000.")
+    gate = "draw gate holders: 2 of 28 terms hold the gate open: ui_depth, footprint."
+    cp0 = ("marker fix (F87c) eye 0: windows 2 (F85 1, history 1, escalated 0), named 40, outside 2 (nearest 12); Unmap copy 600 copies, 4800000 bytes, 120.500 ms; "
+           "eye-1 first/last ring -; over 10 s")
+    cp1 = cp0.replace("eye 0", "eye 1").replace("600 copies", "300 copies")
+    mtext = ("[10:00:00.000] version v0.0.0 (build 00000000)\n[10:00:01.000] " + gate + "\n[10:00:01.500] " + cp0 + "\n[10:00:01.600] " + cp1 + "\n" +
+             gwin("10:00:02.000", 1800, "0.500", 4) + "[10:00:02.001] " + mask + "\n[10:00:02.002] " + qry + "\n")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = print_perf_windows(mtext)
+    mo = buf.getvalue()
+    for want in ("draw mask: 14000 draws through the full path, skipped ui_family 0, screen_motion_ui 7, screen_motion 0, weapon_motion 3",
+                 "timing queries a frame: 6.500 (other 0.500, screen_motion 2.000, weapon_motion 0.000, gpu_census 4.000, particle_copy 0.000, ui_depth 0.000, ui_content 0.000)",
+                 "gate held by 2 of 28: ui_depth, footprint", "marker copy (F87c lines in window): eye 0 600 copies 4800000 bytes 120.500 ms, eye 1 300 copies 4800000 bytes 120.500 ms"):
+        if want not in mo:
+            fail("--perf-windows with the build-2 lines lacks %r:\n%s" % (want, mo))
+    if perf_extra_of("draw mask: nothing like it") is not None:
+        fail("a line of another instrument parsed as a build-2 line")
+    if perf_extra_of("binding re-sets: 1800-frame window ending 1800; mapMemo lookups 52000, misses 310; bindingSet calls/same pointer/null to null: rtv0 9000/4200/0.") is not None:
+        fail("build 4's retired binding re-sets line still parses")
+    # Build 3: the merged copy line and the per-eye text it brings. A build-3 log prints the merged copy; an L2-style (build 2) log keeps the per-eye figures.
+    mg = ("marker fix (F87c) Unmap copy: 600 Unmaps, requested 9600000 bytes, copied 7200000 bytes in 1200 ranges (900 windows joined), whole stream 0 bytes, "
+          "faults 2, 150.250 ms; over 10 s")
+    pe3 = ("marker fix (F87c) eye 1: windows 2 (F85 1, history 1, escalated 0), named 40, outside 2 (nearest 12); Unmap copy 600 copies, requested 4800000 bytes; "
+           "eye-1 first/last ring first 1 last 2; over 10 s")
+    kind, d = perf_extra_of(mg) or (None, {})
+    if kind != "merged" or d.get("unmaps") != 600 or d.get("req") != 9600000 or d.get("copied") != 7200000 or d.get("ranges") != 1200 or d.get("joined") != 900 \
+            or d.get("whole") != 0 or d.get("faults") != 2 or d.get("secs") != 10 or abs(d.get("ms", 0) - 150.25) > 1e-9:
+        fail("the build-3 merged copy line did not parse: %r" % ((kind, d),))
+    if perf_extra_of(pe3) is not None:
+        fail("build 3's per-eye text (requested bytes, no ms) parsed as build 2's copy figures")
+    if perf_extra_of(cp0) is None or perf_extra_of(cp0)[0] != "copy":
+        fail("build 2's per-eye copy line stopped parsing")
+    m3 = ("[10:00:00.000] version v0.0.0 (build 00000000)\n[10:00:01.500] " + pe3 + "\n[10:00:01.600] " + mg + "\n" + gwin("10:00:02.000", 1800, "0.500", 4))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = print_perf_windows(m3)
+    m3o = buf.getvalue()
+    for want in ("marker copy (F87c merged, 1 line(s) in window): 600 Unmaps, requested 9600000 bytes, copied 7200000 bytes (75.0% of requested), 1200 ranges (900 windows joined), "
+                 "whole stream 0 bytes, faults 2, 150.250 ms (0.250 ms a Unmap)",):
+        if want not in m3o:
+            fail("--perf-windows on a build-3 log lacks %r:\n%s" % (want, m3o))
+    if "eye 1 " in m3o and "copies" in m3o:
+        fail("--perf-windows on a build-3 log printed per-eye copy figures too:\n%s" % m3o)
+    # The formatters' own text: the fragments the parser reads are held to the sources, so a formatter that drifts fails here.
+    srcdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "d3d11")
+    for name, frags in (("draw_mask_line.h", ("draw mask: 1800-frame window ending %u; %u draws through the full path; calls skipped by the vertex shader's may-want byte: ",)),
+                        ("gpu_query_count.h", ("gpu timing queries: 1800-frame window ending %u; %.3f EDVR timing-query Ends a frame over %u frames (%llu in all); by owner a frame: ",)),
+                        ("draw_gate_holders.h", ("draw gate holders: %u of %u terms hold the gate open: ",)),
+                        ("native_on_foot.cpp", ("Unmap copy %llu copies, requested %llu bytes; eye-%d first/last ring %s; over %u s",
+                                                "marker fix (F87c) Unmap copy: %llu Unmaps, requested %llu bytes, copied %llu bytes in %llu ranges (%llu windows joined), "
+                                                "whole stream %llu bytes, faults %llu, %.3f ms; over %u s"))):
+        path = os.path.join(srcdir, name)
+        if not os.path.isfile(path):
+            fail("the formatter %s is missing" % name)
+            continue
+        body = read_text(path)
+        for frag in frags:
+            if frag not in body:
+                fail("%s no longer writes %r, which --perf-windows parses" % (name, frag))
+    return ok
+
+
 def self_test_cover():
     """--tally cover on tools\\terrain_cover_fixture.log (which tools\\terrain_cover_test holds to exactly what the production hook writes for the scripted session: the hook live at
     the known build's address, the first call that had the frusta on the cropped Crystal Super (aspect 1.0344 -> 1.2186, vFOV 91.65 unchanged), then three heartbeats: 60000 of 60001
@@ -25500,6 +26245,104 @@ def self_test_cover():
         rc, out = run(["--dir", logs, "--tally", "cover"])
         if rc != 1 or "no `terrain cull cover:` lines in this log" not in out:
             fail("a log with no cover line -> rc %d:\n%s" % (rc, out))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
+REISSUE_HEADER = "draw_reissue_line.h"
+
+
+def self_test_reissue():
+    """--tally reissue on `draw reissue CPU:` lines: a window with callers, a window with none (prints 0, never an absent line), the sibling `draw hook CPU:` line laid
+    beside them, a log with no such line (a build without the counter, exit 1), and the header's own text (src\\d3d11\\draw_reissue_line.h writes the line; the fragments the
+    parser reads are held to it, so a formatter that drifts fails here). Returns ok."""
+    ok = True
+
+    def fail(message):
+        nonlocal ok
+        print("self_test_reissue: %s" % message)
+        ok = False
+
+    import contextlib
+    import io
+    import shutil
+    hook1 = ("[10:10:03.000] draw hook CPU: 1800-frame window ending 1800; 5.900 ms/sampled frame mean, 7.000 ms max, 112 sampled frames (one in 16); excludes forwarded game draw "
+             "time, includes EDVR reissues; zero samples means unavailable. Each sampled frame's figure is estimated from every 64th draw, scaled by 64. Temporal AA on; eye draws counted "
+             "this frame 0 (counted only while a draw subscriber is on).")
+    rei1 = ("[10:10:03.001] draw reissue CPU: 1800-frame window ending 1800; 1.250 ms/sampled frame mean, 2.000 ms max, 112 sampled frames (one in 16); 5400 re-issues in the window, "
+            "380 of them on sampled frames; every re-issue of a sampled frame is timed, so nothing is scaled; excludes the forwarded game draw, inside the draw hook CPU figure. "
+            "Callers (ms a sampled frame, calls on sampled frames): screen_motion 0.600 ms 150, panel_curve 0.400 ms 100, crisp_hud 0.250 ms 130.")
+    hook2 = hook1.replace("ending 1800", "ending 3600").replace("5.900", "3.000")
+    rei2 = ("[10:20:03.001] draw reissue CPU: 1800-frame window ending 3600; 0.000 ms/sampled frame mean, 0.000 ms max, 112 sampled frames (one in 16); 0 re-issues in the window, "
+            "0 of them on sampled frames; every re-issue of a sampled frame is timed, so nothing is scaled; excludes the forwarded game draw, inside the draw hook CPU figure. "
+            "Callers (ms a sampled frame, calls on sampled frames): none.")
+    text = "\n".join([hook1, rei1, hook2, rei2]) + "\n"
+    w = parse_reissue(text)
+    if len(w) != 2:
+        fail("two windows expected, parsed %r" % (w,))
+        return False
+    a, b = w
+    if (a["frame"], a["mean"], a["max"], a["samples"], a["total"], a["sampled"], a["hook"]) != (1800, 1.25, 2.0, 112, 5400, 380, 5.9) or \
+            a["callers"] != [("screen_motion", 0.6, 150), ("panel_curve", 0.4, 100), ("crisp_hud", 0.25, 130)]:
+        fail("the window with callers parsed to %r" % (a,))
+    if (b["frame"], b["mean"], b["total"], b["sampled"], b["hook"]) != (3600, 0.0, 0, 0, 3.0) or b["callers"] != []:
+        fail("the window with no re-issue parsed to %r" % (b,))
+    if parse_reissue("[00:00:00.001] draw hook CPU: 1800-frame window ending 1800; 5.900 ms/sampled frame mean\n") != []:
+        fail("a draw hook line alone parsed as a re-issue window")
+    # The header: the fragments the parser reads.
+    header = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "d3d11", REISSUE_HEADER)
+    if not os.path.isfile(header):
+        fail("the formatter %s is missing" % REISSUE_HEADER)
+    else:
+        src = read_text(header)
+        for frag in ("draw reissue CPU: 1800-frame window ending %u; ", " ms/sampled frame mean, ", " ms max, ", " sampled frames (one in ", " re-issues in the window, ",
+                     " of them on sampled frames; ", "Callers (ms a sampled frame, calls on sampled frames): ", "none"):
+            if frag not in src:
+                fail("%s lacks the text %r the parser reads" % (REISSUE_HEADER, frag))
+    head = "[00:00:00.001] version 0.19.0-1-gabcdef0 (build 68C0A1F2) -- this DLL was linked 2026-10-10 12:00:00 UTC\n"
+    tmp = tempfile.mkdtemp(prefix="edvr_reissue_selftest_")
+    try:
+        logs = os.path.join(tmp, "edvr_logs")
+        os.makedirs(logs)
+
+        def run(argv):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(argv)
+            return rc, buf.getvalue()
+
+        name = os.path.join(logs, "edvr_gfx_20261010_100000.log")
+        with open(name, "wb") as f:
+            f.write((head + text).encode("utf-8"))
+        rc, out = run(["--dir", logs, "--tally", "reissue"])
+        for want in ("[edvr] draw reissue CPU, window ending 1800: 1.250 ms/sampled frame (draw hook CPU 5.900 ms); 5400 re-issues; screen_motion 0.600 ms (150), panel_curve 0.400 ms (100), crisp_hud 0.250 ms (130)",
+                     "[edvr] draw reissue CPU, window ending 3600: 0.000 ms/sampled frame (draw hook CPU 3.000 ms); 0 re-issues; no caller",
+                     "[edvr] 2 window(s)"):
+            if want not in out:
+                fail("--tally reissue output lacks %r:\n%s" % (want, out))
+        if rc != 0:
+            fail("--tally reissue exited %d" % rc)
+        with open(name, "wb") as f:
+            f.write((head + hook1 + "\n").encode("utf-8"))
+        rc, out = run(["--dir", logs, "--tally", "reissue"])
+        if rc != 1 or "no `draw reissue CPU:` lines in this log" not in out:
+            fail("a log with no re-issue line -> rc %d:\n%s" % (rc, out))
+        # The cross-check: a GPU census line that shows a re-issue section ran, against re-issue windows that count none of its callers.
+        census = ("[10:10:00.500] EDVR GPU census: 30 s, 1800 frames; EDVR ~1.000 ms/frame = door 0.000 (x) + in-frame 1.000 (hologram passes -, UI depth coverage 0.400 (1.00/frame), "
+                  "planet -, screen motion -, weapon motion -, engine velocity -, UI layer reissues -, world layer -, FSS reveal replay -); application render p50 -; timer floor -; spans timed 9, failed 0.\n")
+        census_idle = census.replace("UI depth coverage 0.400 (1.00/frame)", "UI depth coverage -")
+        for label, body, wantflag in (("census ran a ui_depth section, no ui_depth caller", head + census + hook1 + "\n" + rei1 + "\n", True),
+                                      ("census ran it and ui_depth is counted", head + census + hook1 + "\n" + rei1.replace("crisp_hud 0.250 ms 130", "ui_depth 0.250 ms 130") + "\n", False),
+                                      ("census ran nothing", head + census_idle + hook1 + "\n" + rei1 + "\n", False),
+                                      ("no census at all", head + hook1 + "\n" + rei1 + "\n", False)):
+            with open(name, "wb") as f:
+                f.write(body.encode("utf-8"))
+            rc, out = run(["--dir", logs, "--tally", "reissue"])
+            if ("CHECK THE WIRING" in out) != wantflag:
+                fail("cross-check (%s): flag %s, wanted %s:\n%s" % (label, "CHECK THE WIRING" in out, wantflag, out))
+            if wantflag and "UI depth coverage" not in out:
+                fail("the cross-check does not name the census section (%s):\n%s" % (label, out))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return ok

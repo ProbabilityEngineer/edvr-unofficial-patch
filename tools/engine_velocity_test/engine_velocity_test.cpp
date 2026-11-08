@@ -65,6 +65,7 @@
 #include "pin_tests.h"
 #include "copier_tests.h"
 #include "unkeyed_tests.h"
+#include "profile_switch_tests.h"
 #include "remember_cap_tests.h"
 #include "../../src/common/runtime_profile.h"
 #include "../../src/d3d11/engine_velocity_families.h"   // kSelfMarking
@@ -230,6 +231,8 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         {L"vs_114AF608F86D9ED8", L"ps_A17504A2627767F2", false}, {L"vs_D99AFDC250D19A3F", L"ps_E86271E464CCDC1D", false},
         // 2026-11-01 (Frontier 15:43, an NPC's hair): the hair's forward pass, keyed for VR with the second skin.
         {L"vs_A6A39338C06E03A1", L"ps_1AE6AB9A94C0456E", false},
+        // 2026-11-05 (Frontier 12:48, Holo-Me): the commander's suit and helmet, keyed for VR with the second skin.
+        {L"vs_01DA82F8D0EA0C99", L"ps_2C3ADCD2FCD47298", false},
     };
     for (const auto& p : pairs) onePair(device, context, root, p, &check);
     // Candidates: pairs seen drawing stock that are not keyed. Each is tried
@@ -406,6 +409,7 @@ int wmain(int argc, wchar_t** argv) {
         {0x8B589D25B2A0ADDCull, 0x7268762D11A610F2ull}, {0x7B0DC42D383F694Cull, 0x0DF03E64DF9DBEF1ull},
         {0x114AF608F86D9ED8ull, 0xA17504A2627767F2ull}, {0xD99AFDC250D19A3Full, 0xE86271E464CCDC1Dull},
         {0xA6A39338C06E03A1ull, 0x1AE6AB9A94C0456Eull},   // 2026-11-01: the NPC hair's forward pass
+        {0x01DA82F8D0EA0C99ull, 0x2C3ADCD2FCD47298ull},   // 2026-11-05: the commander's suit and helmet
     };
     static_assert(edvr::engine_velocity_family::kFamilyCount <= edvr::engine_velocity_detail::kMaxFamilies,
                   "every keyed family has its own substituted-draw counter");
@@ -447,6 +451,7 @@ int wmain(int argc, wchar_t** argv) {
     pin_tests::run({device.Get(), context.Get(), &check});
     copier_tests::run({device.Get(), context.Get(), &check});
     unkeyed_tests::run({&check});
+    profile_switch_tests::run({device.Get(), context.Get(), &check});
     if (!realLinkRoot.empty()) {
         const Pair edge{L"vs_DE545DC8EE4FBB87", L"ps_91F8937EDA723663", false};
         check(onePair(device.Get(), context.Get(), realLinkRoot, edge, &check),
