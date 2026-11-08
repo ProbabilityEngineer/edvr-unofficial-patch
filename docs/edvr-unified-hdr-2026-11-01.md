@@ -1,5 +1,22 @@
 # HDR output inside EDVR (fix.hdr)
 
+## Memory investigation retired — 2026-11-08
+
+At the owner's direction, use insufficient headroom on the 36 GB machine,
+not a demonstrated leak, as the working explanation for the reported pressure.
+The RC7 flight `edvr_gfx_20261108_135833.log` showed a long allocation plateau,
+a step up with larger supersampled render targets, and substantial recovery
+after reducing them. This does not mathematically exclude every possible leak,
+but does not justify continuing the leak-isolation experiment by default.
+
+Archive the texture-lifetime, allocation-owner, engine-record-isolation,
+bounce-isolation and earlier Present-investigation branches. Keep historical
+evidence and useful independent fixes recoverable; do not carry disabled
+engine records or forced bounce bypass into active AA work. No result from
+the bounce-bypass DLL has been supplied. HDR brightness and glass-decals
+remain separate issues; retirement of the memory investigation does not
+declare either fixed.
+
 ## RC6 private backport
 
 The baseline description below refers to `28c50afb`. The combined
