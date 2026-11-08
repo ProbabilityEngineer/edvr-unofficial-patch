@@ -90,6 +90,16 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
         ck(saturated.motionRecorded==edvr::FlatDrawAdmission::kQuota&&
            saturated.motionQuotaSkipped>0&&saturated.sceneRecorded==0,
            "motion quota reports selected draws omitted after saturation");
+        edvr::FlatDrawAdmission priority;
+        for(unsigned q=0;q<100;++q)priority.consider(true,501);
+        ck(priority.consider(true,501,true),"colour candidate bypasses sparse stride");
+        for(unsigned q=1;q<300;++q)priority.consider(true,501,true);
+        ck(priority.priorityEligible==300&&priority.priorityRecorded+priority.priorityQuotaSkipped==300&&
+           priority.motionRecorded==edvr::FlatDrawAdmission::kQuota&&priority.priorityQuotaSkipped>0,
+           "priority capture remains bounded and reports omitted candidates");
+        ck(edvr::flatDrawColourDecalCandidate(0x5B4D8E894EEDA8B4ull,0x4375B72964F386CDull)&&
+           !edvr::flatDrawColourDecalCandidate(0xBBE58E40FE88EC80ull,0x4375B72964F386CDull),
+           "capture priority requires the exact colour/mask pair");
         bool latePool=false;
         for(unsigned i=1;i<=240;++i)if(saturated.considerPool(0)&&i>200)latePool=true;
         ck(latePool&&saturated.poolSelected[0]==8&&saturated.poolCandidates[0]==240&&
@@ -218,7 +228,7 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
     // makes each admitted draw an explicit copy refusal without raster work.
     D3D11_TEXTURE2D_DESC unsupportedDesc{};unsupportedDesc.Width=W;unsupportedDesc.Height=H;
     unsupportedDesc.MipLevels=unsupportedDesc.ArraySize=unsupportedDesc.SampleDesc.Count=1;
-    unsupportedDesc.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;unsupportedDesc.BindFlags=D3D11_BIND_RENDER_TARGET;
+    unsupportedDesc.Format=DXGI_FORMAT_R16G16_FLOAT;unsupportedDesc.BindFlags=D3D11_BIND_RENDER_TARGET;
     ComPtr<ID3D11Texture2D> unsupported;ComPtr<ID3D11RenderTargetView> unsupportedView;
     ck(SUCCEEDED(device->CreateTexture2D(&unsupportedDesc,nullptr,&unsupported))&&
         SUCCEEDED(device->CreateRenderTargetView(unsupported.Get(),nullptr,&unsupportedView)),"cap target created");
@@ -244,6 +254,8 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
     // records an opaque underlay followed by a nearer, depth-write-off decal.
     // The decal changes color and MRT6 while the depth mirror must remain at
     // the underlay's value. The original frame_101/102 fixture stays intact.
+    for(const auto slotFormat : {DXGI_FORMAT_R32G32_FLOAT,DXGI_FORMAT_R32G32B32A32_FLOAT}) {
+    const UINT slotPixelBytes=slotFormat==DXGI_FORMAT_R32G32_FLOAT?8:16;
     D3D11_TEXTURE2D_DESC nativeDepthDesc{};nativeDepthDesc.Width=W;nativeDepthDesc.Height=H;
     nativeDepthDesc.MipLevels=nativeDepthDesc.ArraySize=nativeDepthDesc.SampleDesc.Count=1;
     nativeDepthDesc.Format=DXGI_FORMAT_R32G8X24_TYPELESS;
@@ -256,7 +268,7 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
        "native depth target created");
     D3D11_TEXTURE2D_DESC slotDesc{};slotDesc.Width=W;slotDesc.Height=H;
     slotDesc.MipLevels=slotDesc.ArraySize=slotDesc.SampleDesc.Count=1;
-    slotDesc.Format=DXGI_FORMAT_R32G32_FLOAT;slotDesc.BindFlags=D3D11_BIND_RENDER_TARGET;
+    slotDesc.Format=slotFormat;slotDesc.BindFlags=D3D11_BIND_RENDER_TARGET;
     ComPtr<ID3D11Texture2D> slot;ComPtr<ID3D11RenderTargetView> slotView;
     ck(SUCCEEDED(device->CreateTexture2D(&slotDesc,nullptr,&slot))&&
        SUCCEEDED(device->CreateRenderTargetView(slot.Get(),nullptr,&slotView)),"MRT6 slot target created");
@@ -275,8 +287,8 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
        "336-byte structured t33 pool created");
     const char* underlayVsText="float4 main(uint id:SV_VertexID):SV_Position { float2 p[3]={float2(-1,-1),float2(0,-1),float2(-1,1)}; return float4(p[id],0.5,1); }";
     const char* decalVsText="float4 main(uint id:SV_VertexID):SV_Position { float2 p[3]={float2(-1,-1),float2(0,-1),float2(-1,1)}; return float4(p[id],0.25,1); }";
-    const char* underlayPsText="struct Out { float4 color:SV_Target0; float2 slot:SV_Target6; }; Out main(){ Out o; o.color=float4(0,1,0,1); o.slot=float2(7,0.5); return o; }";
-    const char* decalPsText="struct Out { float4 color:SV_Target0; float2 slot:SV_Target6; }; Out main(){ Out o; o.color=float4(0,0,1,1); o.slot=float2(7,0.25); return o; }";
+    const char* underlayPsText="struct Out { float4 color:SV_Target0; float4 slot:SV_Target6; }; Out main(){ Out o; o.color=float4(0,1,0,1); o.slot=float4(7,0.5,23,29); return o; }";
+    const char* decalPsText="struct Out { float4 color:SV_Target0; float4 slot:SV_Target6; }; Out main(){ Out o; o.color=float4(0,0,1,1); o.slot=float4(7,0.25,31,37); return o; }";
     ComPtr<ID3DBlob> underlayVsCode,decalVsCode,underlayPsCode,decalPsCode;
     ComPtr<ID3D11VertexShader> underlayVs,decalVs;
     ComPtr<ID3D11PixelShader> underlayPs,decalPs;
@@ -300,8 +312,15 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
         if(decalDepth){
             edvr::FlatDrawCapture motion;motion.arm(500);const auto motionDir=fs::path(motion.directory());
             context->ClearState();context->RSSetState(rasterState.Get());context->RSSetViewports(1,&vp);
+            ComPtr<ID3D11RasterizerState> scissorState;
+            if(slotPixelBytes==16) {
+                D3D11_RASTERIZER_DESC rd{};rasterState->GetDesc(&rd);rd.ScissorEnable=TRUE;
+                ck(SUCCEEDED(device->CreateRasterizerState(&rd,&scissorState)),"scissor witness state created");
+                context->RSSetState(scissorState.Get());
+            }
             context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            context->OMSetBlendState(nullptr,nullptr,0xffffffffu);
+            const float factors[4]={0.125f,0.25f,0.5f,0.75f};
+            context->OMSetBlendState(nullptr,factors,0xa5u);
             context->VSSetConstantBuffers(0,3,cbs);
             ID3D11ShaderResourceView* t33=poolView.Get();context->VSSetShaderResources(33,1,&t33);
             ID3D11RenderTargetView* scene[7]{};scene[0]=rtv.Get();scene[6]=slotView.Get();
@@ -317,13 +336,20 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
                     context->OMSetDepthStencilState(decal?decalDepth.Get():depthState.Get(),0);
                     context->VSSetShader(decal?decalVs.Get():underlayVs.Get(),nullptr,0);
                     context->PSSetShader(decal?decalPs.Get():underlayPs.Get(),nullptr,0);
+                    const D3D11_RECT originalScissor{0,0,LONG(W/2),LONG(H)};
+                    const D3D11_RECT executedScissor{0,0,LONG(W),LONG(H)};
+                    context->RSSetScissorRects(1,&originalScissor);
                     ck(motion.before(context,1,'D',3,0,0,0,
-                        decal?0xBBE58E40FE88EC80ull:0x66DE2CADB1F4AE6Bull,
-                        decal?0xDB3E8D20CF53FBC0ull:0x864F1F949851B8DEull,
+                        decal?(slotPixelBytes==16?0x5B4D8E894EEDA8B4ull:0xBBE58E40FE88EC80ull):0x66DE2CADB1F4AE6Bull,
+                        decal?(slotPixelBytes==16?0x4375B72964F386CDull:0xDB3E8D20CF53FBC0ull):0x864F1F949851B8DEull,
                         decal?decalVs.Get():underlayVs.Get(),decal?decalPs.Get():underlayPs.Get(),true),
                         "native motion draw recorded before substitution");
                     context->OMSetRenderTargets(7,scene,nativeDsv.Get());
                     motion.motionBefore(context,true,true);
+                    // A later binding change must be captured at execution,
+                    // not confused with the earlier motion snapshot.
+                    context->RSSetScissorRects(1,&executedScissor);
+                    motion.execution(context);
                     context->Draw(3,0);motion.after(context);
                     ID3D11RenderTargetView* bound[7]{};ComPtr<ID3D11DepthStencilView> boundDepth;
                     context->OMGetRenderTargets(7,bound,&boundDepth);
@@ -350,6 +376,16 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
                    body.find("\"depth\":{\"resource\"")!=std::string::npos&&
                    body.find("\"format\":19,\"view_format\":20")!=std::string::npos,
                    "native depth and motion snapshots completed without refusals");
+                ck(body.find("\"original\":{\"observed\":true")!=std::string::npos&&
+                   body.find("\"executed\":{\"observed\":true")!=std::string::npos&&
+                   body.find("\"scissors\":[[0,0,32,64]]")!=std::string::npos&&
+                   body.find("\"scissors\":[[0,0,64,64]]")!=std::string::npos&&
+                   body.find("\"sample_mask\":165")!=std::string::npos&&
+                   body.find("\"factors\":[0.125,0.25,0.5,0.75]")!=std::string::npos,
+                   "pipeline evidence records original and actual execution state");
+                if(slotPixelBytes==16)ck(body.find("\"priority_eligible\":1,\"priority_recorded\":1")!=std::string::npos&&
+                   body.find("\"scissor_enabled\":1")!=std::string::npos,
+                   "colour candidate priority and enabled scissor are explicit");
                 std::ifstream pools(motionDir/(stem+"_pool.bin"),std::ios::binary);
                 const std::string poolRaw((std::istreambuf_iterator<char>(pools)),std::istreambuf_iterator<char>());
                 ck(poolRaw.size()==2*poolBytes.size()&&
@@ -374,7 +410,7 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
                 context->Unmap(staging.Get(),0);return true;
             };
             std::vector<uint8_t> capturedColor,capturedSlot,capturedDepth;
-            ck(readSurface(color.Get(),4,capturedColor)&&readSurface(slot.Get(),8,capturedSlot)&&
+            ck(readSurface(color.Get(),4,capturedColor)&&readSurface(slot.Get(),slotPixelBytes,capturedSlot)&&
                readSurface(nativeDepth.Get(),8,capturedDepth),"captured native outputs read back");
             context->ClearRenderTargetView(rtv.Get(),red);
             context->ClearRenderTargetView(slotView.Get(),sentinel);
@@ -388,16 +424,17 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
                 context->Draw(3,0);
             }
             std::vector<uint8_t> referenceColor,referenceSlot,referenceDepth;
-            ck(readSurface(color.Get(),4,referenceColor)&&readSurface(slot.Get(),8,referenceSlot)&&
+            ck(readSurface(color.Get(),4,referenceColor)&&readSurface(slot.Get(),slotPixelBytes,referenceSlot)&&
                readSurface(nativeDepth.Get(),8,referenceDepth),"no-capture reference outputs read back");
             ck(!capturedColor.empty()&&capturedColor==referenceColor&&capturedSlot==referenceSlot&&
                capturedDepth==referenceDepth,"capture leaves color, MRT6, and native depth bit-identical to reference");
-            if(!bad){std::ofstream file(fixtureRoot/L"flat_draw_motion_current_fixture.txt",std::ios::binary);
+            if(!bad){std::ofstream file(fixtureRoot/(slotPixelBytes==8?L"flat_draw_motion_current_fixture.txt":L"flat_draw_motion_rgba_current_fixture.txt"),std::ios::binary);
                 file<<fs::relative(motionDir,fixtureRoot).generic_u8string()<<"\n";
                 ck(file.good(),"native motion fixture pointer written");
                 std::printf("flat draw motion fixture: %ls\n",motionDir.c_str());}
             motion.cancel("test-end");
         }
+    }
     }
     if(!bad){std::ofstream file(pointer,std::ios::binary);file<<fs::relative(dir,fixtureRoot).generic_u8string()<<"\n";
         ck(file.good(),"fixture pointer written");std::printf("flat draw fixture: %ls\n",dir.c_str());}

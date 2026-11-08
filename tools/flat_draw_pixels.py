@@ -32,7 +32,7 @@ FIXTURE = re.compile(r"flat_draw_pixels/[0-9]{8}_[0-9]{6}_[0-9]{3}_[0-9]+_[0-9]+
 STATES = {"complete", "partial", "failed"}
 # Native resource formats accepted by the bounded GPU copy. Values are
 # DXGI_FORMAT numeric IDs; view formats can differ for typeless resources.
-NATIVE_BPP = {9: 8, 10: 8, 11: 8, 15: 8, 16: 8, 19: 8,
+NATIVE_BPP = {1: 16, 2: 16, 9: 8, 10: 8, 11: 8, 15: 8, 16: 8, 19: 8,
               23: 4, 24: 4, 26: 4, 27: 4, 28: 4, 29: 4,
               39: 4, 41: 4, 87: 4, 90: 4, 91: 4}
 
@@ -195,8 +195,17 @@ def load_frame(path):
                     pools["pool_skipped"][i] + pools["pool_quota_skipped"][i] or
                     pools["pool_selected"][i] > 8 for i in range(2))):
             raise CaptureError("pool selection counts disagree")
+        priority = None
+        if "priority_pair" in selection:
+            priority = {name: integer(selection.get("priority_" + name), "priority." + name, 0, seen)
+                        for name in ("eligible", "recorded", "quota_skipped")}
+            priority["pair"] = short_text(selection["priority_pair"], "priority.pair")
+            if (priority["eligible"] != priority["recorded"] + priority["quota_skipped"] or
+                    priority["eligible"] > counts["motion_eligible"] or
+                    priority["recorded"] > counts["motion_recorded"]):
+                raise CaptureError("priority selection counts disagree")
         selection = {"strategy": selection["strategy"], "stride": stride, "phase": phase,
-                     "quota_per_class": quota, **counts, **pools}
+                     "quota_per_class": quota, **counts, **pools, "priority": priority}
     pixels_path = path.with_name(f"frame_{frame}_pixels.bin")
     cb_path = path.with_name(f"frame_{frame}_cb.bin")
     if manifest.get("pixels_file") != pixels_path.name or manifest.get("cb_file") != cb_path.name:
@@ -217,6 +226,7 @@ def load_frame(path):
     changes = {}
     unknown = {}
     motion_windows = []
+    colour_decal_candidates = []
     cb_info = {}
     candidate_count = 0
     for index, draw in enumerate(draws):
@@ -308,7 +318,8 @@ def load_frame(path):
                 if target["valid"]:
                     if not motion["expected"] or (tw, th) != (width, height) or int(target["resource"], 16) == 0:
                         raise CaptureError("valid motion target lacks expected nonnull extent")
-                    allowed = (fmt in (15, 16) and vf == 16) if name == "slot" else (
+                    allowed = ((fmt in (15, 16) and vf == 16) or
+                               (fmt in (1, 2) and vf == 2)) if name == "slot" else (
                         (fmt, vf) in ((19, 20), (39, 40)))
                     if not allowed:
                         raise CaptureError("motion target has wrong native/view format")
@@ -353,6 +364,24 @@ def load_frame(path):
         for key in ("depth_state", "raster", "viewport", "ia"):
             if not isinstance(draw.get(key), dict):
                 raise CaptureError(f"draw {index}.{key} must be an object")
+        pipeline = draw.get("pipeline")
+        if pipeline is not None:
+            if not isinstance(pipeline, dict):
+                raise CaptureError("draw.pipeline must be an object")
+            for phase in ("original", "executed"):
+                state = pipeline.get(phase)
+                if not isinstance(state, dict) or type(state.get("observed")) is not bool:
+                    raise CaptureError("pipeline phase must explicitly report observed state")
+                if state["observed"]:
+                    for name, count, row_width in (("viewports", "viewport_count", 6),
+                                               ("scissors", "scissor_count", 4)):
+                        n = integer(state.get(count), count, 0, 16)
+                        rows = state.get(name)
+                        if not isinstance(rows, list) or len(rows) != n or any(
+                                not isinstance(row, list) or len(row) != row_width for row in rows):
+                            raise CaptureError("pipeline rectangle count/shape mismatch")
+                    if not isinstance(state.get("blend"), dict) or not isinstance(state.get("raster"), dict):
+                        raise CaptureError("observed pipeline lacks blend/raster descriptors")
         cbs = draw.get("cb")
         if not isinstance(cbs, list) or len(cbs) > 3:
             raise CaptureError(f"draw {index}.cb must be a list of at most three buffers")
@@ -435,6 +464,7 @@ def load_frame(path):
                 pairs[key][phase] = None
             else:
                 raise CaptureError("unknown copy status")
+        changed_colour_windows = 0
         expected_pairs = {(slot, point) for slot in matching_rt_indices for point in range(len(points))}
         for target, point in sorted(expected_pairs):
             samples = pairs.get((target, point), {})
@@ -451,6 +481,8 @@ def load_frame(path):
                                  for n in range(0, len(before), bpp))
             if not changed_pixels:
                 continue
+            if target < 4:
+                changed_colour_windows += 1
             row = {"q": q, "vs": vs, "ps": ps, "kind": kind, "count": count,
                    "instances": instances, "topology": topology,
                    "draw_args": {"start": start, "base": base, "start_instance": start_instance,
@@ -464,10 +496,18 @@ def load_frame(path):
                    "depth_format": draw["depth_format"],
                    "depth_view_format": draw["depth_view_format"],
                    "depth_state": draw["depth_state"],
-                   "viewport": draw["viewport"], "ia": draw["ia"],
+                   "viewport": draw["viewport"], "ia": draw["ia"], "pipeline": pipeline,
                    "shader_bytes": shader_bytes, "cb": summaries,
                    "pool": pool_summary}
             changes.setdefault(name, []).append(row)
+        if (int(vs, 16), int(ps, 16)) == (0x5B4D8E894EEDA8B4, 0x4375B72964F386CD):
+            colour_decal_candidates.append({
+                "q": q, "vs": vs, "ps": ps, "kind": kind, "count": count,
+                "instances": instances, "changed_colour_windows": changed_colour_windows,
+                "pipeline": pipeline, "viewport": draw["viewport"], "depth_state": draw["depth_state"],
+                "shader_bytes": shader_bytes,
+                "interpretation": "Candidate family, not identified glass; zero changes in sparse windows do not mean the draw wrote no pixels."
+            })
         if schema == 2 and motion["expected"]:
             for point in range(len(points)):
                 slot_pair = pairs.get((6, point), {})
@@ -483,12 +523,13 @@ def load_frame(path):
                 if (sx, sy) != (ax, ay) or (sx, sy) != (dx, dy) or (sx, sy) != (ex, ey):
                     raise CaptureError("motion slot/depth windows do not align")
                 depth_bpp = NATIVE_BPP[aux[7]["format"]]
+                slot_bpp = NATIVE_BPP[aux[6]["format"]]
                 before_codes, after_codes = {}, {}
                 before_exact = after_exact = slot_changed = depth_changed = 0
                 after_depth_deltas = []
                 seen_records = set()
                 for pixel in range(WINDOW * WINDOW):
-                    soff = pixel * 8
+                    soff = pixel * slot_bpp
                     doff = pixel * depth_bpp
                     cb = struct.unpack_from("<f", sb, soff)[0]
                     ca = struct.unpack_from("<f", sa, soff)[0]
@@ -499,7 +540,7 @@ def load_frame(path):
                             seen_records.add(int(code) >> 1)
                     before_exact += sb[soff+4:soff+8] == db[doff:doff+4]
                     after_exact += sa[soff+4:soff+8] == da[doff:doff+4]
-                    slot_changed += sb[soff:soff+8] != sa[soff:soff+8]
+                    slot_changed += sb[soff:soff+slot_bpp] != sa[soff:soff+slot_bpp]
                     depth_changed += db[doff:doff+depth_bpp] != da[doff:doff+depth_bpp]
                     if sa[soff+4:soff+8] != da[doff:doff+4]:
                         after_depth_deltas.append(struct.unpack_from("<f", da, doff)[0] -
@@ -518,6 +559,7 @@ def load_frame(path):
                                        "vs": vs, "ps": ps, "slot_resource": aux[6]["resource"],
                                        "depth_resource": aux[7]["resource"],
                                        "pool_resource": motion["pool_resource"],
+                                       "slot_format": aux[6]["format"], "slot_bpp": slot_bpp,
                                        "before_codes": before_codes, "after_codes": after_codes,
                                        "before_exact_depth": before_exact,
                                        "after_exact_depth": after_exact,
@@ -554,6 +596,8 @@ def load_frame(path):
             "draws_seen": seen, "draws_recorded": recorded, "overflow": overflow,
             "selection": selection,
             "changes": changes, "motion_windows": motion_windows, "unknown_pairs": unknown,
+            "colour_decal_candidates": colour_decal_candidates,
+            "readback_validation": "Complete means bytes are available, not that backend copy semantics are verified. Validate the GPU fixture on the capture backend before treating depth equality as evidence.",
             "interpretation": "Changes are native render-target bytes before and after a sampled draw. Omitted draws, final visible owner, and cross-frame draw identity are not inferred."}
 
 
@@ -652,13 +696,50 @@ def verify_fixture(root):
         if (not first_hash or first_hash != decal["pool_record_sha256"].get("3") or
                 underlay["pool_resource"] != decal["pool_resource"]):
             raise CaptureError("motion fixture does not prove the same unchanged t33 record")
+        # Check every source window, including empty ones, at distinct atlas
+        # destinations. A correct first pixel alone cannot qualify boxed copies.
+        windows = {(row["q"], row["point"]): row for row in frame["motion_windows"]}
+        if len(frame["motion_windows"]) != 16 or set(windows) != {
+                (q, point) for q in (1, 2) for point in range(8)}:
+            raise CaptureError("motion fixture lacks the complete eight-window chronology")
+        for (q, point), window in windows.items():
+            covered = {0: 136, 1: 20, 4: 25}.get(point, 0)
+            if (window["before_exact_depth"] != (covered if q == 2 else 0) or
+                    window["after_exact_depth"] != (covered if q == 1 else 0) or
+                    window["dsv_changed_pixels"] != (covered if q == 1 else 0) or
+                    window["slot_changed_pixels"] != covered):
+                raise CaptureError(f"motion fixture region mismatch at draw {q}, point {point}")
         motion_counts.append({"underlay_slot_changed": underlay["slot_changed_pixels"],
                               "decal_slot_changed": decal["slot_changed_pixels"],
                               "decal_dsv_changed": decal["dsv_changed_pixels"]})
+    rgba_directory = pointed_directory("flat_draw_motion_rgba_current_fixture.txt")
+    rgba_report = run(rgba_directory)
+    require_consecutive_fixture_frames(rgba_report, [501, 502], rgba_directory,
+                                       "RGBA motion fixture lacks two consecutive frames")
+    for legacy, rgba in zip(motion_frames, rgba_report["frames"]):
+        if not rgba["motion_complete"] or len(rgba["motion_windows"]) != len(legacy["motion_windows"]):
+            raise CaptureError("RGBA motion fixture is incomplete")
+        for old, new in zip(legacy["motion_windows"], rgba["motion_windows"]):
+            if new["slot_format"] != 2 or new["slot_bpp"] != 16 or any(
+                    old[key] != new[key] for key in (
+                        "q", "point", "before_codes", "after_codes", "before_exact_depth", "after_exact_depth",
+                        "slot_changed_pixels", "dsv_changed_pixels", "pool_record_sha256")):
+                raise CaptureError("RGBA slot/depth decoding differs from the legacy fixture")
+        candidates = rgba["colour_decal_candidates"]
+        if len(candidates) != 1 or rgba["selection"]["priority"]["recorded"] != 1:
+            raise CaptureError("RGBA fixture lost the colour candidate")
+        pipeline = candidates[0]["pipeline"]
+        for phase, right in (("original", 32), ("executed", 64)):
+            state = pipeline[phase]
+            if (not state["observed"] or state["scissors"] != [[0, 0, right, 64]] or
+                    state["raster"]["scissor_enabled"] != 1 or state["blend"]["sample_mask"] != 165 or
+                    state["blend"]["factors"] != [0.125, 0.25, 0.5, 0.75]):
+                raise CaptureError("candidate pipeline witness differs from the GPU fixture")
     return {"fixture_verified": True, "frames": [101, 102],
             "changed_window_counts": changed_counts,
             "motion_frames": [501, 502], "motion_counts": motion_counts,
-            "source": str(directory), "motion_source": str(motion_directory)}
+            "source": str(directory), "motion_source": str(motion_directory),
+            "rgba_motion_source": str(rgba_directory)}
 
 
 def self_test():
@@ -832,6 +913,40 @@ def self_test():
         assert row["dsv_changed_pixels"] == 0 and row["before_codes"] == {"7": 256}
         expected_hash = hashlib.sha256(pool_bytes[3*336:4*336]).hexdigest()
         assert row["pool_record_sha256"] == {"3": expected_hash}
+        # Four-channel ownership/provenance targets keep the code/depth in RG.
+        # Nonzero ZW must neither become the next pixel's code nor be discarded.
+        rgba = second / "rgba"
+        rgba.mkdir()
+        extended = json.loads(json.dumps(newer))
+        extended_draw = extended["draws"][0]
+        extended_draw["vs"], extended_draw["ps"] = "5B4D8E894EEDA8B4", "4375B72964F386CD"
+        extended_draw["pipeline"] = {"original": {"observed": False}, "executed": {"observed": False}}
+        extended_draw["motion"]["slot"].update(format=2, view_format=2)
+        extended_pixels = bytearray(pixels)
+        for copy in extended_draw["copies"]:
+            if copy["rt_index"] < 6:
+                continue
+            if copy["rt_index"] == 6:
+                payload = struct.pack("<ffff", 7, .5 if copy["phase"] == "before" else .25,
+                                      123, 456) * (WINDOW * WINDOW)
+                copy.update(format=2, bpp=16)
+            else:
+                payload = depth_native
+            copy.update(offset=len(extended_pixels), length=len(payload))
+            extended_pixels.extend(payload)
+        extended["pixels_bytes"] = len(extended_pixels)
+        (rgba / "frame_9_pixels.bin").write_bytes(extended_pixels)
+        (rgba / "frame_9_pool.bin").write_bytes(pool_bytes)
+        (rgba / "frame_9_cb.bin").write_bytes(cb)
+        (rgba / "frame_9.json").write_text(json.dumps(extended), encoding="utf-8")
+        extended_frame = load_frame(rgba / "frame_9.json")
+        extended_row = extended_frame["motion_windows"][0]
+        assert extended_row["slot_bpp"] == 16 and extended_row["slot_format"] == 2
+        for key in ("before_codes", "after_codes", "before_exact_depth", "after_exact_depth",
+                    "slot_changed_pixels", "dsv_changed_pixels", "pool_record_sha256"):
+            assert extended_row[key] == row[key], key
+        assert len(extended_frame["colour_decal_candidates"]) == 1
+        assert not extended_frame["colour_decal_candidates"][0]["pipeline"]["executed"]["observed"]
         newer["selection"] = {"strategy": "depth-matched-stratified-v1", "stride": 64,
                               "phase": 0, "quota_per_class": 256, "depth_matched": 1,
                               "scene_eligible": 0, "motion_eligible": 1,
