@@ -11,7 +11,7 @@ REM
 REM  Needs Visual Studio 2022 C++ and Python. Fetch the pinned loader once with
 REM  python tools\fetch_openxr_loader.py. The build verifies it offline.
 REM
-REM  Usage:  build.bat [--clean] [--jobs N] [--dll-only] [--compile-only] [--wait-lock]
+REM  Usage:  build.bat [--clean] [--jobs N] [--dll-only] [--compile-only [--graphics-only]] [--wait-lock]
 REM
 REM  Once the DLLs are built, the test rigs run concurrently, --jobs at a time
 REM  (default: one per logical core), through tools\run_jobs.py. Each rig is a
@@ -25,6 +25,8 @@ REM  --compile-only is the Linux test-flight path, run under Wine by
 REM  tools\linux_toolchain.py: the same production DLLs, into
 REM  build\compile-build, with no Python gates, no receipt check, no rigs and
 REM  no installer. It is never validation and never a release asset.
+REM  --compile-only --graphics-only is a Windows diagnostic route: only the
+REM  graphics DLL, in build\graphics-compile, under the normal build lock.
 REM
 REM  Only one top-level build runs at a time on this machine (tools\
 REM  build_lock.py): a second invocation is refused immediately with a
@@ -52,6 +54,7 @@ if /I "%~1"=="--clean" goto arg_clean
 if /I "%~1"=="--jobs" goto arg_jobs
 if /I "%~1"=="--dll-only" goto arg_dll_only
 if /I "%~1"=="--compile-only" goto arg_compile_only
+if /I "%~1"=="--graphics-only" goto arg_graphics_only
 if /I "%~1"=="--rig" goto arg_rig
 if /I "%~1"=="--wait-lock" goto arg_wait_lock
 echo [edvr] unknown argument: %~1
@@ -82,7 +85,19 @@ set "EDVR_RIG=%~2"
 shift
 shift
 goto parse_args
+:arg_graphics_only
+set "EDVR_GRAPHICS_ONLY=1"
+shift
+goto parse_args
 :args_done
+if defined EDVR_GRAPHICS_ONLY if not defined EDVR_COMPILE_ONLY (
+    echo [edvr] ERROR: --graphics-only requires --compile-only
+    exit /b 1
+)
+if defined EDVR_GRAPHICS_ONLY if defined EDVR_RIG (
+    echo [edvr] ERROR: --graphics-only cannot run test rigs
+    exit /b 1
+)
 if defined EDVR_DLL_ONLY if defined DO_CLEAN (
     echo [edvr] ERROR: --dll-only cannot be combined with --clean
     exit /b 1
@@ -97,11 +112,18 @@ REM validated build nor overwrite one. --clean then removes only that directory.
 REM tools\linux_toolchain.py holds its own lock on the host for the whole
 REM compile: under Wine, build_lock.py cannot name its owner (os.getppid fails).
 if defined EDVR_COMPILE_ONLY (
-    set "EDVR_DLL_ONLY=1"
-    set "EDVR_BUILD_GUARDED=1"
+    if not defined EDVR_GRAPHICS_ONLY set "EDVR_DLL_ONLY=1"
+    if not defined EDVR_GRAPHICS_ONLY set "EDVR_BUILD_GUARDED=1"
     set "BUILD=%ROOT%\build\compile-build"
     set "GEN=%ROOT%\build\compile-build\gen"
     set "OBJ=%ROOT%\build\compile-build\obj"
+)
+REM Graphics-only runs on Windows under the normal lock, not the Wine host
+REM wrapper. Keep its unvalidated outputs separate from both existing routes.
+if defined EDVR_GRAPHICS_ONLY (
+    set "BUILD=%ROOT%\build\graphics-compile"
+    set "GEN=%ROOT%\build\graphics-compile\gen"
+    set "OBJ=%ROOT%\build\graphics-compile\obj"
 )
 if defined EDVR_RIG goto run_rig
 
@@ -204,9 +226,11 @@ REM anything below can fail and skip it.
 python tools\run_jobs.py --sweep-exe-dir "%BUILD%" || exit /b 1
 
 REM Dependency cache survives --clean. Never discover a loader in SteamVR.
-python tools\fetch_openxr_loader.py --verify || exit /b 1
-copy /y "%ROOT%\third_party\openxr\loader\openxr_loader.dll" "%BUILD%\openxr_loader.dll" >nul || exit /b 1
-copy /y "%ROOT%\third_party\openxr\loader\OPENXR-LOADER-LICENSE.txt" "%BUILD%\OPENXR-LOADER-LICENSE.txt" >nul || exit /b 1
+if not defined EDVR_GRAPHICS_ONLY (
+    python tools\fetch_openxr_loader.py --verify || exit /b 1
+    copy /y "%ROOT%\third_party\openxr\loader\openxr_loader.dll" "%BUILD%\openxr_loader.dll" >nul || exit /b 1
+    copy /y "%ROOT%\third_party\openxr\loader\OPENXR-LOADER-LICENSE.txt" "%BUILD%\OPENXR-LOADER-LICENSE.txt" >nul || exit /b 1
+)
 REM A compile-only build is not validation and skips the Python gates; the
 REM full build runs every one of them.
 if defined EDVR_COMPILE_ONLY goto python_gates_done
@@ -398,8 +422,13 @@ REM (--stereo-output), so edvr_openxr_runtime.dll creates them from bytes and ca
 REM for four D3DCompile calls. The runtime and the two rigs that compile d3d11_stereo.cpp find the header through /I"%GEN%"; the PE gate below fails the
 REM build if either DLL imports the compiler again.
 "%OBJ%\temporalshader\temporal_shader_build.exe" --self-test || exit /b 1
-"%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" --stereo-output "%GEN%\openxr_stereo_shader_bytecode.h" --dry-run || exit /b 1
-"%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" --stereo-output "%GEN%\openxr_stereo_shader_bytecode.h" || exit /b 1
+if defined EDVR_GRAPHICS_ONLY (
+    "%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" --dry-run || exit /b 1
+    "%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" || exit /b 1
+) else (
+    "%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" --stereo-output "%GEN%\openxr_stereo_shader_bytecode.h" --dry-run || exit /b 1
+    "%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" --stereo-output "%GEN%\openxr_stereo_shader_bytecode.h" || exit /b 1
+)
 
 python tools\build_phases.py --mark "%PHASES%" "shader generation"
 echo [edvr] === d3d11.dll ===
@@ -512,7 +541,7 @@ if defined NGX (
     set NGXFLAGS=/DEDVR_HAVE_NGX=1 /I"%NGX%\include"
     set NGXLIB="%NGX%\lib\Windows_x86_64\x64\nvsdk_ngx_s.lib" advapi32.lib
     echo [edvr] DLSS SDK: %NGX%
-    copy /Y "%NGX%\lib\Windows_x86_64\rel\nvngx_dlss.dll" "%BUILD%\" >nul
+    if not defined EDVR_GRAPHICS_ONLY copy /Y "%NGX%\lib\Windows_x86_64\rel\nvngx_dlss.dll" "%BUILD%\" >nul
     copy /Y "%NGX%\LICENSE.txt" "%BUILD%\NVIDIA-DLSS-LICENSE.txt" >nul
 ) else (
     echo [edvr] ==================================================================
@@ -545,7 +574,7 @@ if defined XESS (
         exit /b 1
     )
     set XESSFLAGS=/DEDVR_HAVE_XESS=1 /I"%XESS%\include"
-    copy /Y "%XESS%\bin\libxess.dll" "%BUILD%\libxess.dll" >nul || exit /b 1
+    if not defined EDVR_GRAPHICS_ONLY copy /Y "%XESS%\bin\libxess.dll" "%BUILD%\libxess.dll" >nul || exit /b 1
     copy /Y "%XESS%\LICENSE.txt" "%BUILD%\INTEL-XESS-LICENSE.txt" >nul || exit /b 1
     copy /Y "%XESS%\third-party-programs.txt" "%BUILD%\INTEL-XESS-THIRD-PARTY.txt" >nul || exit /b 1
     echo [edvr] XeSS-SR SDK: %XESS%
@@ -761,6 +790,7 @@ if errorlevel 1 ( echo [edvr] ERROR: link failed & exit /b 1 )
 
 echo [edvr] built %BUILD%\d3d11.dll
 python tools\build_phases.py --mark "%PHASES%" "d3d11.dll"
+if defined EDVR_GRAPHICS_ONLY goto graphics_compile_only_finish
 copy /y "%BUILD%\d3d11.dll" "%BUILD%\edvr_openxr_graphics.dll" >nul || exit /b 1
 echo [edvr] built %BUILD%\edvr_openxr_graphics.dll
 
@@ -928,6 +958,14 @@ if defined EDVR_COMPILE_ONLY goto compile_only_finish
 echo [edvr] DLL-only build passed: production DLLs and loader are ready to install.
 echo [edvr] Test rigs and the self-contained installer were skipped; use a full build
 echo        before distributing an installer or accepting new source changes.
+exit /b 0
+
+:graphics_compile_only_finish
+python tools\openxr_pe.py --graphics "%BUILD%\d3d11.dll" --forbid-import d3dcompiler_47.dll || exit /b 1
+python tools\build_phases.py --report "%PHASES%"
+echo [edvr] GRAPHICS COMPILE-ONLY: %BUILD%\d3d11.dll
+echo [edvr] NOT Windows validated and NOT a release asset. No test rigs,
+echo        other runtime DLL builds, installer or packaging ran.
 exit /b 0
 
 :compile_only_finish
@@ -4445,4 +4483,3 @@ if errorlevel 1 ( echo [edvr] ERROR: addon_manager_test build failed & exit /b 1
 "%BUILD%\addon_manager_test.exe" --dry-run || exit /b 1
 "%BUILD%\addon_manager_test.exe" --self-test || exit /b 1
 exit /b 0
-

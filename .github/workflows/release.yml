@@ -12,6 +12,11 @@ on:
       - 'v*'
   pull_request:
   workflow_dispatch:
+    inputs:
+      graphics_only:
+        description: 'Diagnostic compile only: d3d11.dll, no other EDVR binaries or packages'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +37,7 @@ jobs:
   # required checks: each pull request runs exactly one of them. A release
   # branch's push builds its head, while its pull request tests the merge with main.
   changes:
+    if: ${{ !inputs.graphics_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -96,7 +102,7 @@ jobs:
 
   build:
     needs: changes
-    if: needs.changes.outputs.build == 'true'
+    if: ${{ !inputs.graphics_only && needs.changes.outputs.build == 'true' }}
     runs-on: windows-2022
     timeout-minutes: 180
     defaults:
@@ -362,3 +368,98 @@ jobs:
           path: |
             dist/edvr-*.zip
             dist/SHA256SUMS
+
+  graphics_compile_only:
+    name: d3d11.dll only (diagnostic, unvalidated)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.graphics_only && github.repository == 'ProbabilityEngineer/edvr-unofficial-patch' }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Check source identity and graphics route
+        run: |
+          $headCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $headCommit -cne $env:GITHUB_SHA) { throw 'Checkout identity mismatch' }
+          python tools\compile_only.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Compile-only self-tests failed' }
+          Write-Output "DIAGNOSTIC_SOURCE_SHA=$headCommit"
+      - name: Restore pinned graphics dependencies
+        id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            third_party/ngx
+            third_party/ffx-dx11
+            third_party/xess
+          key: edvr-graphics-deps-${{ runner.os }}-${{ hashFiles('tools/fetch_ngx.py', 'tools/fetch_ffx_dx11.py', 'tools/fetch_xess.py') }}
+      - name: Fetch pinned graphics dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: |
+          python tools\fetch_ngx.py --into third_party\ngx
+          if ($LASTEXITCODE -ne 0) { throw 'DLSS SDK fetch failed' }
+          python tools\fetch_ffx_dx11.py --dest third_party\ffx-dx11
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX DX11 fetch/build failed' }
+          python tools\fetch_xess.py --dest third_party\xess
+          if ($LASTEXITCODE -ne 0) { throw 'XeSS SDK fetch failed' }
+      - name: Verify pinned graphics dependencies
+        run: |
+          python tools\fetch_ngx.py --verify third_party\ngx
+          if ($LASTEXITCODE -ne 0) { throw 'DLSS SDK verification failed' }
+          python tools\fetch_ffx_dx11.py --verify third_party\ffx-dx11
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX DX11 verification failed' }
+          python tools\fetch_xess.py --verify third_party\xess
+          if ($LASTEXITCODE -ne 0) { throw 'XeSS SDK verification failed' }
+      - name: Save pinned graphics dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            third_party/ngx
+            third_party/ffx-dx11
+            third_party/xess
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+      - name: Compile only the graphics DLL
+        run: |
+          $batch = Join-Path $env:GITHUB_WORKSPACE 'build.bat'
+          if (-not (Test-Path -LiteralPath $batch)) { throw "Missing $batch" }
+          $stdout = Join-Path $env:RUNNER_TEMP 'edvr-graphics.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'edvr-graphics.stderr.log'
+          $command = 'call "{0}" --compile-only --graphics-only --wait-lock --jobs 4 > "{1}" 2> "{2}"' -f $batch, $stdout, $stderr
+          & $env:ComSpec /d /s /c $command
+          $code = $LASTEXITCODE
+          if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Tail 100 }
+          if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Tail 100 }
+          if ($code -ne 0) { throw "Graphics compile failed with exit code $code" }
+          if (-not (Select-String -LiteralPath $stdout -SimpleMatch '[edvr] GRAPHICS COMPILE-ONLY:')) {
+            throw 'Graphics-only completion marker missing'
+          }
+          $dlls = @(Get-ChildItem -LiteralPath 'build\graphics-compile' -Filter '*.dll')
+          if ($dlls.Count -ne 1 -or $dlls[0].Name -cne 'd3d11.dll') { throw 'Unexpected DLL output set' }
+          if (Test-Path -LiteralPath 'build\graphics-compile\full_build_receipt.json') { throw 'Diagnostic build must not claim full validation' }
+          $hash = (Get-FileHash -LiteralPath $dlls[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "DIAGNOSTIC_D3D11_SHA256=$hash"
+          "Diagnostic compile only; NOT full Windows validation or a release asset.`nSource: $env:GITHUB_SHA`nSHA256: $hash" |
+            Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Upload graphics compile diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: graphics-compile-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/edvr-graphics.stdout.log
+            ${{ runner.temp }}/edvr-graphics.stderr.log
+      - name: Upload only d3d11.dll
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: d3d11-diagnostic-${{ github.sha }}
+          if-no-files-found: error
+          path: build/graphics-compile/d3d11.dll

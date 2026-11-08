@@ -49,6 +49,15 @@ class FlatDrawCapture {
         Ptr<ID3D11Texture2D> texture; const void* resource=nullptr; const void* view=nullptr;
         unsigned format=0, viewFormat=0, width=0,height=0; bool valid=false;
     };
+    struct Pipeline {
+        bool observed=false,defaultBlend=true;
+        const void* vs=nullptr;const void* ps=nullptr;
+        D3D11_BLEND_DESC blend{};float factors[4]{};UINT sampleMask=0;
+        D3D11_RASTERIZER_DESC raster{};
+        UINT viewportCount=0,scissorCount=0;
+        D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+        D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    };
     struct Draw {
         unsigned q=0, instances=0, topology=0, indexFormat=0, indexOffset=0;
         char kind='?'; unsigned count=0,start=0,startInstance=0;int32_t base=0;
@@ -60,6 +69,7 @@ class FlatDrawCapture {
         unsigned depthEnable=0,depthWrite=0,depthFunc=0,stencilRef=0;
         int depthBias=0; float slopeBias=0,biasClamp=0;
         unsigned viewportCount=0; D3D11_VIEWPORT viewport{};
+        Pipeline originalPipeline,executedPipeline;
         Rt rt[4], motionSlot, motionDepth; Cb cb[3]; Pool pool; std::vector<Copy> copies;
         bool motionCandidate=false,motionExpected=false, motionBefore=false; const char* motionStatus="not-requested";
         const void* motionPool=nullptr; const void* motionPoolView=nullptr;
@@ -97,11 +107,59 @@ class FlatDrawCapture {
         case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
         case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_FLOAT:
         case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G8X24_TYPELESS: return 8;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_TYPELESS: return 16;
         default:return 0;
         }
     }
     static std::string hex(const void* p) { char s[32]{};std::snprintf(s,sizeof(s),"0x%llX",(unsigned long long)(uintptr_t)p);return s; }
     static std::string hash(uint64_t h) { char s[24]{};std::snprintf(s,sizeof(s),"%016llX",(unsigned long long)h);return s; }
+    // Getter-only snapshots around EDVR's substitutions. No retained shader/state
+    // references, and no work unless this draw was selected by a manual capture.
+    static void pipeline(ID3D11DeviceContext* ctx,Pipeline& p) {
+        Ptr<ID3D11VertexShader> vs;Ptr<ID3D11PixelShader> ps;
+        ctx->VSGetShader(&vs,nullptr,nullptr);ctx->PSGetShader(&ps,nullptr,nullptr);
+        p.vs=vs.Get();p.ps=ps.Get();
+        Ptr<ID3D11BlendState> blend;
+        ctx->OMGetBlendState(&blend,p.factors,&p.sampleMask);
+        p.defaultBlend=!blend;
+        if(blend)blend->GetDesc(&p.blend);
+        else for(auto& t:p.blend.RenderTarget) {
+            t.SrcBlend=t.SrcBlendAlpha=D3D11_BLEND_ONE;
+            t.DestBlend=t.DestBlendAlpha=D3D11_BLEND_ZERO;
+            t.BlendOp=t.BlendOpAlpha=D3D11_BLEND_OP_ADD;
+            t.RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
+        }
+        Ptr<ID3D11RasterizerState> raster;ctx->RSGetState(&raster);
+        if(raster)raster->GetDesc(&p.raster);
+        else {p.raster.FillMode=D3D11_FILL_SOLID;p.raster.CullMode=D3D11_CULL_BACK;p.raster.DepthClipEnable=TRUE;}
+        p.viewportCount=p.scissorCount=D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        ctx->RSGetViewports(&p.viewportCount,p.viewports);ctx->RSGetScissorRects(&p.scissorCount,p.scissors);
+        p.observed=true;
+    }
+    static void pipelineJson(std::ostringstream& o,const Pipeline& p) {
+        o<<"{\"observed\":"<<(p.observed?"true":"false");
+        if(!p.observed){o<<'}';return;}
+        o<<",\"vs_object\":\""<<hex(p.vs)<<"\",\"ps_object\":\""<<hex(p.ps)
+         <<"\",\"blend\":{\"default\":"<<(p.defaultBlend?"true":"false")
+         <<",\"alpha_to_coverage\":"<<p.blend.AlphaToCoverageEnable<<",\"independent\":"<<p.blend.IndependentBlendEnable
+         <<",\"sample_mask\":"<<p.sampleMask<<",\"factors\":[";
+        for(unsigned i=0;i<4;++i){if(i)o<<',';o<<p.factors[i];}
+        o<<"],\"targets\":[";
+        for(unsigned i=0;i<8;++i){if(i)o<<',';const auto& t=p.blend.RenderTarget[i];
+            o<<"{\"enabled\":"<<t.BlendEnable<<",\"src\":"<<t.SrcBlend<<",\"dst\":"<<t.DestBlend<<",\"op\":"<<t.BlendOp
+             <<",\"src_alpha\":"<<t.SrcBlendAlpha<<",\"dst_alpha\":"<<t.DestBlendAlpha<<",\"op_alpha\":"<<t.BlendOpAlpha
+             <<",\"write_mask\":"<<unsigned(t.RenderTargetWriteMask)<<'}';}
+        o<<"]},\"raster\":{\"fill\":"<<p.raster.FillMode<<",\"cull\":"<<p.raster.CullMode
+         <<",\"front_ccw\":"<<p.raster.FrontCounterClockwise<<",\"depth_clip\":"<<p.raster.DepthClipEnable
+         <<",\"depth_bias\":"<<p.raster.DepthBias<<",\"slope_bias\":"<<p.raster.SlopeScaledDepthBias<<",\"bias_clamp\":"<<p.raster.DepthBiasClamp
+         <<",\"scissor_enabled\":"<<p.raster.ScissorEnable<<"},\"viewport_count\":"<<p.viewportCount<<",\"viewports\":[";
+        for(UINT i=0;i<std::min<UINT>(p.viewportCount,D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);++i){
+            if(i)o<<',';const auto& v=p.viewports[i];o<<'['<<v.TopLeftX<<','<<v.TopLeftY<<','<<v.Width<<','<<v.Height<<','<<v.MinDepth<<','<<v.MaxDepth<<']';}
+        o<<"],\"scissor_count\":"<<p.scissorCount<<",\"scissors\":[";
+        for(UINT i=0;i<std::min<UINT>(p.scissorCount,D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);++i){
+            if(i)o<<',';const auto& r=p.scissors[i];o<<'['<<r.left<<','<<r.top<<','<<r.right<<','<<r.bottom<<']';}
+        o<<"]}";
+    }
     static bool write(const std::wstring& path,const void* p,size_t n) {
         FILE* f=nullptr;if(_wfopen_s(&f,path.c_str(),L"wb")||!f)return false;
         const bool ok=!n || std::fwrite(p,1,n,f)==n;return std::fclose(f)==0&&ok;
@@ -185,14 +243,20 @@ class FlatDrawCapture {
             D3D11_TEXTURE2D_DESC td{};d.motionDepth.texture->GetDesc(&td);
             const uint64_t bytes=uint64_t(td.Width)*td.Height*bpp(td.Format);
             if(!reserve(f,bytes,true))return false;
-            td.Usage=D3D11_USAGE_DEFAULT;td.BindFlags=td.CPUAccessFlags=td.MiscFlags=0;
+            td.Usage=D3D11_USAGE_STAGING;td.BindFlags=td.MiscFlags=0;
+            td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
             Ptr<ID3D11Device> dev;ctx->GetDevice(&dev);
             if(FAILED(dev->CreateTexture2D(&td,nullptr,&f.depthMirror))){allocated_-=bytes;f.bytesAllocated-=bytes;return false;}
             f.depthMirrorFormat=td.Format;
         }
         if(f.depthMirrorFormat!=d.motionDepth.format)return false;
-        // D3D11 forbids a boxed copy directly from a depth-stencil resource.
-        // Copy its whole subresource first, then box-copy the mirror's pixels.
+        // Read back the whole depth subresource before extracting windows.
+        // A DEFAULT mirror still takes DXMT's depth/stencil texture-readback
+        // path, which ignores boxes and destination offsets. A STAGING mirror
+        // makes stageCopy use region-aware staging-to-staging copies instead.
+        // Reuse this one full-size allocation per frame under the existing
+        // byte cap; command ordering preserves each before/after atlas window.
+        // There is no synchronous Map here and no game binding is changed.
         ctx->CopyResource(f.depthMirror.Get(),d.motionDepth.texture.Get());
         return true;
     }
@@ -278,6 +342,9 @@ class FlatDrawCapture {
            <<",\"motion_recorded\":"<<f.admission.motionRecorded<<",\"scene_skipped\":"<<f.admission.sceneSkipped
            <<",\"motion_skipped\":"<<f.admission.motionSkipped<<",\"scene_quota_skipped\":"<<f.admission.sceneQuotaSkipped
            <<",\"motion_quota_skipped\":"<<f.admission.motionQuotaSkipped
+           <<",\"priority_eligible\":"<<f.admission.priorityEligible<<",\"priority_recorded\":"<<f.admission.priorityRecorded
+           <<",\"priority_quota_skipped\":"<<f.admission.priorityQuotaSkipped
+           <<",\"priority_pair\":\"5B4D8E894EEDA8B4/4375B72964F386CD\""
            <<",\"pool_candidates\":["<<f.admission.poolCandidates[0]<<','<<f.admission.poolCandidates[1]
            <<"],\"pool_selected\":["<<f.admission.poolSelected[0]<<','<<f.admission.poolSelected[1]
            <<"],\"pool_skipped\":["<<f.admission.poolSkipped[0]<<','<<f.admission.poolSkipped[1]
@@ -291,7 +358,9 @@ class FlatDrawCapture {
         for(unsigned i=0;i<kPoints;++i){if(i)o<<',';o<<"{\"u\":"<<uv_[i][0]<<",\"v\":"<<uv_[i][1]<<",\"x\":"<<center(uv_[i][0],f.width)<<",\"y\":"<<center(uv_[i][1],f.height)<<"}";}
         o<<"],\"draws\":[";
         for(size_t i=0;i<f.draws.size();++i){const Draw& d=f.draws[i];if(i)o<<',';
-            o<<"{\"q\":"<<d.q<<",\"instances\":"<<d.instances<<",\"args_available\":"<<(d.kind=='?'?"false":"true")
+            o<<"{\"pipeline\":{\"original\":";pipelineJson(o,d.originalPipeline);
+            o<<",\"executed\":";pipelineJson(o,d.executedPipeline);
+            o<<"},\"q\":"<<d.q<<",\"instances\":"<<d.instances<<",\"args_available\":"<<(d.kind=='?'?"false":"true")
              <<",\"kind\":\""<<d.kind<<"\",\"count\":"<<d.count<<",\"start\":"<<d.start<<",\"base\":"<<d.base<<",\"start_instance\":"<<d.startInstance
              <<",\"vs\":\""<<hash(d.vs)
              <<"\",\"ps\":\""<<hash(d.ps)<<"\",\"vs_object\":\""<<hex(d.vsObject)<<"\",\"ps_object\":\""<<hex(d.psObject)
@@ -385,7 +454,7 @@ public:
             return std::wstring(leaf);
         };
         if(!ensureDirectory(Config::get().logDir())||!ensureDirectory(root)||!createFreshCaptureDirectory(root,leafFor,directory_)){armed_=false;Log::get().note("flat draw pixels: arm refused directory");return;}
-        Log::get().note("flat draw pixels: armed frame=%llu next-two-qualified-frames points=8 window=16 cap=512-draws/frame scene=256 motion=256 stride=64 complementary-phases memory=256MiB expiry=900frames/30s directory=%ls",
+        Log::get().note("flat draw pixels: armed frame=%llu next-two-qualified-frames points=8 window=16 cap=512-draws/frame scene=256 motion=256 stride=64 complementary-phases colour-priority=5B4D/4375 within-motion-quota pipeline=original+executed memory=256MiB expiry=900frames/30s directory=%ls",
             (unsigned long long)frame,directory_.c_str());
     }
     void begin(uint64_t frame,const void* priorDepth,unsigned width,unsigned height) {
@@ -422,15 +491,16 @@ public:
         const bool scene=depthDesc.DepthEnable&&depthDesc.DepthWriteMask==D3D11_DEPTH_WRITE_MASK_ALL;
         // A source candidate may be a depth-write-off decal. Keep a separate
         // quota so it cannot be displaced by the scene's numerous opaque draws.
-        if(!scene&&!motionEligible)return false;
-        if(!f.admission.consider(motionEligible,f.number))return false;
+        const bool priority=flatDrawColourDecalCandidate(vs,ps);
+        if(!scene&&!motionEligible&&!priority)return false;
+        if(!f.admission.consider(motionEligible||priority,f.number,priority))return false;
         Draw d;d.q=f.drawsSeen;d.instances=instances;d.kind=kind;d.count=count;d.start=start;d.base=base;d.startInstance=startInstance;
         d.vs=vs;d.ps=ps;d.vsObject=vsObject;d.psObject=psObject;
         d.dsv=dsv.Get();if(dsv){Ptr<ID3D11Resource> dr=depthResource;d.depthResource=dr.Get();
             Ptr<ID3D11Texture2D> dt;if(dr&&SUCCEEDED(dr.As(&dt))){D3D11_TEXTURE2D_DESC td{};dt->GetDesc(&td);d.depthFormat=td.Format;}
             D3D11_DEPTH_STENCIL_VIEW_DESC vd{};dsv->GetDesc(&vd);d.depthViewFormat=vd.Format;}
         for(unsigned i=0;i<4;++i)d.rt[i]=rt[i];
-        metadata(ctx,d);stageCb(ctx,f,d);
+        metadata(ctx,d);pipeline(ctx,d.originalPipeline);stageCb(ctx,f,d);
         const auto captureStage=[&](char stage,uint64_t h) {
             if(!h)return false;const auto key=std::make_pair(stage,h);auto it=shaderBytes_.find(key);if(it!=shaderBytes_.end())return it->second;
             const bool saved=shaderBytes_.size()<256&&captureFlatProbeShader(stage,h);shaderBytes_.emplace(key,saved);return saved;
@@ -445,8 +515,9 @@ public:
         if(!active()||!ctx||current_->draws.empty())return;
         Frame& f=*current_;Draw& d=f.draws.back();if(!d.before)return;
         const bool targetPair=(d.vs==0x66DE2CADB1F4AE6Bull&&d.ps==0x864F1F949851B8DEull)||
-                              (d.vs==0xBBE58E40FE88EC80ull&&d.ps==0xDB3E8D20CF53FBC0ull);
-        if(!targetPair)return; // Bound diagnostic: the underlay and decal only.
+                              (d.vs==0xBBE58E40FE88EC80ull&&d.ps==0xDB3E8D20CF53FBC0ull)||
+                              flatDrawColourDecalCandidate(d.vs,d.ps);
+        if(!targetPair)return; // Bounded diagnostic: underlay and two decal candidates.
         d.motionCandidate=sourceCandidate;
         if(sourceCandidate&&!expectedEngineSlot){d.motionStatus="producer-declined";++f.motionRefusals;return;}
         if(!expectedEngineSlot)return;
@@ -472,8 +543,10 @@ public:
         d.motionSlot.format=sd.Format;d.motionSlot.viewFormat=sv.Format;d.motionSlot.width=sd.Width;d.motionSlot.height=sd.Height;
         d.motionSlot.valid=sd.Width==f.width&&sd.Height==f.height&&sd.MipLevels>=1&&sd.ArraySize==1&&
             sd.SampleDesc.Count==1&&sv.ViewDimension==D3D11_RTV_DIMENSION_TEXTURE2D&&sv.Texture2D.MipSlice==0&&
-            (sd.Format==DXGI_FORMAT_R32G32_FLOAT||sd.Format==DXGI_FORMAT_R32G32_TYPELESS)&&
-            sv.Format==DXGI_FORMAT_R32G32_FLOAT;
+            (((sd.Format==DXGI_FORMAT_R32G32_FLOAT||sd.Format==DXGI_FORMAT_R32G32_TYPELESS)&&
+              sv.Format==DXGI_FORMAT_R32G32_FLOAT)||
+             ((sd.Format==DXGI_FORMAT_R32G32B32A32_FLOAT||sd.Format==DXGI_FORMAT_R32G32B32A32_TYPELESS)&&
+              sv.Format==DXGI_FORMAT_R32G32B32A32_FLOAT));
         Ptr<ID3D11Resource> depthResource;dsv->GetResource(&depthResource);
         Ptr<ID3D11Texture2D> depth;if(!depthResource||FAILED(depthResource.As(&depth))){++f.motionRefusals;return;}
         D3D11_TEXTURE2D_DESC dd{};depth->GetDesc(&dd);D3D11_DEPTH_STENCIL_VIEW_DESC dv{};dsv->GetDesc(&dv);
@@ -488,6 +561,13 @@ public:
         if(!stageDepthMirror(ctx,f,d)){d.motionStatus="depth-mirror-unavailable";++f.motionRefusals;return;}
         d.motionStatus="captured";d.motionBefore=true;
         for(unsigned p=0;p<kPoints;++p){stageCopy(ctx,f,d,6,p,false);stageCopy(ctx,f,d,7,p,false);}
+    }
+    // Called at the actual draw issue boundary, after all substitutions, not
+    // from motionBefore (which precedes later projection/overlay bindings).
+    void execution(ID3D11DeviceContext* ctx) {
+        if(!active()||!ctx||current_->draws.empty())return;
+        Draw& d=current_->draws.back();
+        if(d.before)pipeline(ctx,d.executedPipeline);
     }
     void after(ID3D11DeviceContext* ctx) {
         if(!active()||!ctx)return;Frame& f=*current_;if(f.draws.empty())return;

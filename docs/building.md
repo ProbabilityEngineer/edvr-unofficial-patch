@@ -1,5 +1,27 @@
 # Building EDVR
 
+## Graphics-only diagnostic compile
+
+For a private Windows diagnostic DLL, invoke `build.bat` by absolute path with
+`--compile-only --graphics-only --wait-lock --jobs 4`. This uses the normal build
+lock and graphics compiler/link recipe, but exits before the graphics alias,
+OpenXR/OpenVR runtime, installer and packaging steps. It writes only the EDVR
+graphics DLL to `build/graphics-compile/d3d11.dll`; shader/compiler helpers and
+intermediate files stay in that separate directory. It does not copy vendor
+runtime DLLs or the OpenXR loader into that output directory.
+
+This is **not full Windows validation or a release artifact**. It emits no
+full-build receipt, does not run the test rigs, and is not a substitute for the
+receipt-guarded `--dll-only` promotion route. Existing full-build and Linux
+compile-only behavior is unchanged.
+
+The owner's fork can run this through the existing Native Windows build
+workflow's manual `graphics_only` input. That selects a separate job, skips
+the normal validation/package job, verifies pinned graphics dependencies,
+and uploads `d3d11.dll` as a diagnostic artifact. It also uploads build logs.
+Running CI and installing the resulting DLL still require separate approval;
+the workflow neither installs anything nor creates a release.
+
 How to build EDVR from source, check the build without the game or a headset,
 and what the optional DLSS mode and the release package need.
 

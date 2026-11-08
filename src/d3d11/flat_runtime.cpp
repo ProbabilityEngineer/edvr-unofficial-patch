@@ -6114,7 +6114,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         Ptr<ID3D11VertexShader> vs;Ptr<ID3D11PixelShader> ps;Ptr<ID3D11RenderTargetView> rtv;Ptr<ID3D11DepthStencilView> dsv;
         context->VSGetShader(&vs,nullptr,nullptr);context->PSGetShader(&ps,nullptr,nullptr);context->OMGetRenderTargets(1,&rtv,&dsv);
         drawPacketVs=lookupShaderHash(vs.Get());drawPacketPs=lookupShaderHash(ps.Get());const auto pair=std::make_pair(drawPacketVs,drawPacketPs);
-        const auto known=s.drawPacketRefusedPairs.find(pair);const bool priority=known!=s.drawPacketRefusedPairs.end();
+        const auto known=s.drawPacketRefusedPairs.find(pair);const bool priority = flatDrawColourDecalCandidate(pair.first,pair.second) || known != s.drawPacketRefusedPairs.end();
         Ptr<ID3D11Resource> color,depth;if(rtv)rtv->GetResource(&color);if(dsv)dsv->GetResource(&depth);
         Ptr<ID3D11DepthStencilState> stateDepth;UINT stencilRef=0;context->OMGetDepthStencilState(&stateDepth,&stencilRef);D3D11_DEPTH_STENCIL_DESC dd{};dd.DepthEnable=TRUE;dd.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;if(stateDepth)stateDepth->GetDesc(&dd);
         const unsigned representative=flat_mono_detail::toneHdrSlot(pair.first,pair.second)!=~0u?3:color.Get()==s.drawPacketOutput.Get()?4:dsv&&dd.DepthEnable&&dd.DepthWriteMask==D3D11_DEPTH_WRITE_MASK_ALL?1:2;
@@ -6288,7 +6288,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     if(s.drawPackets.armed()) {
         const auto pair=std::make_pair(k.vs,k.ps);const auto refused=s.drawPacketRefusedPairs.find(pair);
-        const bool priority=refused!=s.drawPacketRefusedPairs.end() && s.prefix.frame-refused->second<=900;
+        const bool priority = flatDrawColourDecalCandidate(k.vs,k.ps) || (refused != s.drawPacketRefusedPairs.end() && s.prefix.frame - refused->second <= 900);
         drawPacketPriority=priority;
         const bool tone=flat_mono_detail::toneHdrSlot(k.vs,k.ps)!=~0u;
         const bool output=k.color==s.prefix.output;
@@ -8237,6 +8237,7 @@ void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indir
     if(forwardIssue.kind!=forward_light::Issue::None&&ctx)forwardBeginIssue(state(),forwardIssue,indirectArgs!=nullptr);
     if(lightPayloadToken&&ctx){FlatComputeInternalScope internal;
         captureLightPreForward(state(),ctx,lightPayloadToken,lightPayloadPlan,indirectArgs!=nullptr);}
+    if(drawCaptureStarted&&ctx){FlatComputeInternalScope internal;state().drawCapture.execution(ctx);}
     if(!weaponFootprintStarted)return;
     const uint32_t actualStart=(weaponDrawKind=='D'||weaponDrawKind=='N')?
         static_cast<uint32_t>(weaponDrawBase):weaponDrawStart;
