@@ -106,6 +106,48 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
            saturated.poolSkipped[0]==232,
            "pool snapshots include late producers and remain at eight per family");
     }
+    {
+        // Sizes observed in flight 8230. Priority draws at the tail reproduce
+        // the old early-quota failure without claiming this is its exact order.
+        edvr::FlatDrawAdmission census;census.countOnly=true;
+        for(unsigned q=0;q<414;++q)census.consider(false,900);
+        for(unsigned q=0;q<2561;++q)census.consider(true,900,q>=1723);
+        ck(census.sceneEligible==414&&census.motionEligible==2561&&
+           census.sceneRecorded==0&&census.motionRecorded==0,"calibration counts without admitting copies");
+        std::array<bool,2561> covered{};std::array<bool,414> sceneCovered{};
+        for(unsigned sequence=0;sequence<12;++sequence) {
+            edvr::FlatDrawAdmission spread;spread.distribute(census.sceneEligible,census.motionEligible,sequence);
+            unsigned last=0;
+            for(unsigned q=0;q<414;++q)if(spread.consider(false,901+sequence))sceneCovered[q]=true;
+            for(unsigned q=0;q<2561;++q)if(spread.consider(true,901+sequence,q>=1723)){
+                if(sequence==1)ck(!covered[q],"paired motion phases are disjoint");
+                covered[q]=true;last=q;
+            }
+            ck(spread.sceneRecorded<=256&&spread.motionRecorded<=256&&
+               !spread.sceneQuotaSkipped&&!spread.motionQuotaSkipped&&last>2500,
+               "distributed quotas reach the tail without saturation");
+            ck(spread.priorityEligible==spread.priorityRecorded+spread.prioritySkipped+spread.priorityQuotaSkipped,
+               "distributed priority omissions are accounted for");
+        }
+        ck(std::all_of(covered.begin(),covered.end(),[](bool b){return b;})&&
+           std::all_of(sceneCovered.begin(),sceneCovered.end(),[](bool b){return b;}),
+           "advancing phases cover a stable chronology, not the same prefix");
+        edvr::FlatDrawAdmission drift;drift.distribute(414,2561,0);
+        for(unsigned q=0;q<4000;++q)drift.consider(true,901,true);
+        ck(drift.motionRecorded==256&&drift.motionQuotaSkipped>0,
+           "population growth remains capped and reports gaps");
+        std::array<bool,838> nonWriting{};
+        for(unsigned sequence=0;sequence<4;++sequence) {
+            edvr::FlatDrawAdmission spread;spread.distribute(2137,838,sequence);
+            for(unsigned q=0;q<2137;++q)spread.consider(false,901+sequence);
+            for(unsigned q=0;q<838;++q)if(spread.consider(true,901+sequence,true))nonWriting[q]=true;
+            ck(spread.sceneRecorded<=256&&spread.motionRecorded<=256&&
+               !spread.sceneQuotaSkipped&&!spread.motionQuotaSkipped,
+               "flight populations stay inside separate writing/non-writing quotas");
+        }
+        ck(std::all_of(nonWriting.begin(),nonWriting.end(),[](bool b){return b;}),
+           "four advancing samples cover the stable 838-draw non-writing population");
+    }
     constexpr UINT W=64,H=64;
     D3D11_TEXTURE2D_DESC td{};td.Width=W;td.Height=H;td.MipLevels=td.ArraySize=td.SampleDesc.Count=1;
     td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
@@ -437,7 +479,7 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
     }
     }
     {
-        edvr::FlatDrawCapture aimed;aimed.arm(900,true);
+        edvr::FlatDrawCapture aimed;aimed.arm(899,true);
         const fs::path aimedDir=aimed.directory();
         context->ClearState();
         context->RSSetState(rasterState.Get());
@@ -450,14 +492,22 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
         context->OMSetDepthStencilState(noWrite.Get(),0);
         ID3D11RenderTargetView* target=rtv.Get();context->OMSetRenderTargets(1,&target,dsv.Get());
         const float red[4]{1,0,0,1};
-        for(uint64_t frame=901;frame<=902;++frame) {
+        for(uint64_t frame=900;frame<=902;++frame) {
             context->ClearRenderTargetView(rtv.Get(),red);
             context->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);
             aimed.begin(frame,depth.Get(),W,H);
+            if(frame==900) {
+                context->OMSetDepthStencilState(depthState.Get(),0);
+                ck(!aimed.before(context,1,'D',3,0,0,0,0x9911,0x9922,vs.Get(),ps.Get(),true),
+                   "calibration counts opaque engine-motion without copying");
+                context->Draw(3,0);aimed.after(context);
+                context->OMSetDepthStencilState(noWrite.Get(),0);
+                context->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);
+            }
             // Unknown family, no depth writes and not marked motion-eligible:
             // crosshair discovery must not depend on the earlier colour guess.
-            ck(aimed.before(context,1,'D',3,0,0,0,0x9911,0x9922,vs.Get(),ps.Get()),
-               "crosshair admits unknown non-depth-writing family");
+            ck(aimed.before(context,1,'D',3,0,0,0,0x9911,0x9922,vs.Get(),ps.Get())==(frame!=900),
+               "crosshair counts calibration then admits unknown non-depth-writing family");
             aimed.execution(context);context->Draw(3,0);aimed.after(context);
             aimed.qualify(frame,depth.Get(),color.Get(),W,H);
             aimed.reference(context,frame,color.Get());
@@ -465,6 +515,8 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
             context->ClearRenderTargetView(rtv.Get(),red);
             aimed.present(context,frame);
         }
+        ck(!fs::exists(aimedDir/L"frame_900.json")&&!fs::exists(aimedDir/L"frame_900_reference.bin")&&
+           !fs::exists(aimedDir/L"frame_900_pixels.bin"),"calibration writes no capture payloads");
         context->Flush();
         for(unsigned i=0;i<100&&!fs::exists(aimedDir/L"frame_902.json");++i){
             Sleep(1);aimed.present(context,903+i);

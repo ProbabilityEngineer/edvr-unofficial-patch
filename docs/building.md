@@ -28,9 +28,21 @@ The crosshair diagnostic uses the existing **full draw-capture trigger**
 (Shift + the configured `dump_draws` key). Aim the game's **centred crosshair**
 at a surviving, less-transparent decoration and hold the view steady. No new
 overlay or config key is added. Eight contiguous 16×16 windows cover a centred
-64×32 render-pixel region in the next two qualified frames. Non-depth-writing,
-matching-depth draws get priority regardless of shader family; existing draw,
-memory and expiry limits remain, and quota skips are still reported.
+64×32 render-pixel region. First, one qualified live frame counts eligible draws
+without pixel, constant-buffer, pool or reference copies. The next two qualified
+frames sample each class at a stride of `ceil(calibrated_count / 256)`, with
+separated phases. For this diagnostic, `scene` means depth-writing and `motion`
+means non-depth-writing, so opaque engine-motion draws no longer consume the
+non-depth-writing quota. Non-depth-writing draws remain eligible regardless of shader
+family, but no longer bypass the stride and exhaust the quota early.
+
+Each class still has 256 draws/frame, with two sampled frames and the existing
+256 MiB/30-second/900-frame bounds. Later captures in the same process advance
+the sampling phases; they do not claim stable draw identity or guaranteed full
+coverage. Metadata records calibration counts, actual counts, strides, phases,
+and both sampling and quota omissions. Population growth can still exhaust a
+quota and is reported. Source/extent changes require fresh calibration (or
+cancel an already-started two-frame sample).
 
 Each accepted frame also attempts a same-frame, pre-Present central output
 crop, at most 512×512 pixels. This currently supports RGBA8/BGRA8 SDR output;

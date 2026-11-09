@@ -217,10 +217,12 @@ def load_frame(path):
         raise CaptureError("complete frame has unrecorded matching draws")
     selection = manifest.get("selection")
     if selection is not None:
-        if not isinstance(selection, dict) or selection.get("strategy") != "depth-matched-stratified-v1":
+        if not isinstance(selection, dict) or selection.get("strategy") not in (
+                "depth-matched-stratified-v1", "depth-matched-distributed-v1"):
             raise CaptureError("invalid draw selection strategy")
-        stride = integer(selection.get("stride"), "selection.stride", 1, 1024)
-        phase = integer(selection.get("phase"), "selection.phase", 0, stride - 1)
+        legacy = selection["strategy"] == "depth-matched-stratified-v1"
+        stride = integer(selection.get("stride"), "selection.stride", 1, 1024) if legacy else None
+        phase = integer(selection.get("phase"), "selection.phase", 0, stride - 1) if legacy else None
         quota = integer(selection.get("quota_per_class"), "selection.quota_per_class", 1, cap)
         counts = {name: integer(selection.get(name), "selection." + name, 0, seen)
                   for name in ("depth_matched", "scene_eligible", "motion_eligible",
@@ -239,24 +241,55 @@ def load_frame(path):
                     counts[k + "_skipped"] + counts[k + "_quota_skipped"] for k in ("scene", "motion")) or
                 counts["scene_recorded"] > quota or counts["motion_recorded"] > quota or
                 (status == "complete" and recorded != seen) or
-                (motion_complete and (counts["motion_skipped"] or counts["motion_quota_skipped"]))):
+                (motion_complete and (counts["motion_skipped"] or counts["motion_quota_skipped"] or
+                    (not legacy and (counts["scene_skipped"] or counts["scene_quota_skipped"]))))):
             raise CaptureError("draw selection counts disagree")
-        if (sum(pools["pool_candidates"]) > counts["motion_recorded"] or
+        if (sum(pools["pool_candidates"]) > (counts["motion_recorded"] if legacy else recorded) or
                 any(pools["pool_candidates"][i] != pools["pool_selected"][i] +
                     pools["pool_skipped"][i] + pools["pool_quota_skipped"][i] or
                     pools["pool_selected"][i] > 8 for i in range(2))):
             raise CaptureError("pool selection counts disagree")
         priority = None
+        distribution = {}
+        if selection["strategy"] == "depth-matched-distributed-v1":
+            calibration = integer(selection.get("calibration_frame"), "calibration_frame", 1, frame-1)
+            sequence = integer(selection.get("sample_sequence"), "sample_sequence")
+            arrays = {}
+            for key in ("expected", "strides", "phases"):
+                values = selection.get(key)
+                if not isinstance(values, list) or len(values) != 2:
+                    raise CaptureError("distributed " + key + " must have two class entries")
+                arrays[key] = [integer(v, key, 0, 1_000_000) for v in values]
+            expected, strides, phases = (arrays[k] for k in ("expected", "strides", "phases"))
+            if not any(expected) or strides != [max(1, (n+quota-1)//quota) for n in expected]:
+                raise CaptureError("distributed strides disagree with calibration")
+            if phases != [(sequence//2 + ((s+1)//2 if sequence%2 else 0)) % s for s in strides]:
+                raise CaptureError("distributed phases disagree with sample sequence")
+            for i, key in enumerate(("scene", "motion")):
+                n = counts[key+"_eligible"]
+                selected = (n+strides[i]-1-phases[i])//strides[i]
+                if (counts[key+"_recorded"] != min(quota, selected) or
+                        counts[key+"_skipped"] != n-selected or
+                        counts[key+"_quota_skipped"] != max(0, selected-quota)):
+                    raise CaptureError("distributed counts disagree with stride/phase")
+            distribution = {"calibration_frame": calibration, "sample_sequence": sequence, **arrays,
+                            "population_delta": [counts[k+"_eligible"]-expected[i]
+                                                 for i, k in enumerate(("scene", "motion"))]}
         if "priority_pair" in selection:
             priority = {name: integer(selection.get("priority_" + name), "priority." + name, 0, seen)
                         for name in ("eligible", "recorded", "quota_skipped")}
             priority["pair"] = short_text(selection["priority_pair"], "priority.pair")
-            if (priority["eligible"] != priority["recorded"] + priority["quota_skipped"] or
+            priority["skipped"] = integer(selection.get("priority_skipped", 0), "priority.skipped", 0, seen)
+            if (priority["eligible"] != priority["recorded"] + priority["quota_skipped"] + priority["skipped"] or
                     priority["eligible"] > counts["motion_eligible"] or
-                    priority["recorded"] > counts["motion_recorded"]):
+                    priority["recorded"] > counts["motion_recorded"] or
+                    priority["skipped"] > counts["motion_skipped"] or
+                    (not distribution and priority["skipped"])):
                 raise CaptureError("priority selection counts disagree")
-        selection = {"strategy": selection["strategy"], "stride": stride, "phase": phase,
-                     "quota_per_class": quota, **counts, **pools, "priority": priority}
+        selection = {"strategy": selection["strategy"], "quota_per_class": quota,
+                     **counts, **pools, "priority": priority, **distribution}
+        if legacy:
+            selection.update(stride=stride, phase=phase)
     pixels_path = path.with_name(f"frame_{frame}_pixels.bin")
     cb_path = path.with_name(f"frame_{frame}_cb.bin")
     if manifest.get("pixels_file") != pixels_path.name or manifest.get("cb_file") != cb_path.name:
@@ -745,6 +778,10 @@ def verify_fixture(root):
                   for key, rows in frame["changes"].items()}
         if (frame["status"] != "complete" or frame["sample_layout"] != "crosshair-64x32-v1" or
                 frame["selection"]["priority"]["recorded"] != 1 or actual != expected or
+                frame["selection"].get("calibration_frame") != 900 or
+                frame["selection"].get("sample_sequence") != frame["frame"]-901 or
+                frame["selection"].get("expected") != [1, 1] or
+                frame["selection"].get("population_delta") != [-1, 0] or
                 ref["status"] != "ok" or ref["sampling_roi_in_crop"] != [0, 16, 64, 32] or
                 (aimed_directory / ref["file"]).read_bytes() != expected_reference):
             raise CaptureError("crosshair fixture windows or same-frame reference differ from GPU expectation")
@@ -900,6 +937,22 @@ def self_test():
         ref["frame"], ref["status"], ref["bytes"] = 7, "unsupported-output", 0
         aimed_path.write_text(json.dumps(aimed), encoding="utf-8")
         assert run(aimed_dir)["frames"][0]["reference"]["status"] == "unsupported-output"
+        aimed["selection"] = dict(strategy="depth-matched-distributed-v1", quota_per_class=256,
+            calibration_frame=6, sample_sequence=1, expected=[414, 2561], strides=[2, 11], phases=[1, 6],
+            depth_matched=0, scene_eligible=0, motion_eligible=0, scene_recorded=0, motion_recorded=0,
+            scene_skipped=0, motion_skipped=0, scene_quota_skipped=0, motion_quota_skipped=0,
+            pool_candidates=[0, 0], pool_selected=[0, 0], pool_skipped=[0, 0], pool_quota_skipped=[0, 0],
+            priority_pair="*/* (non-depth-writing)", priority_eligible=0, priority_recorded=0,
+            priority_skipped=0, priority_quota_skipped=0)
+        aimed_path.write_text(json.dumps(aimed), encoding="utf-8")
+        assert run(aimed_dir)["frames"][0]["selection"]["population_delta"] == [-414, -2561]
+        aimed["selection"]["phases"] = [1, 5]
+        aimed_path.write_text(json.dumps(aimed), encoding="utf-8")
+        try:
+            run(aimed_dir)
+            raise AssertionError("incorrect distributed phase accepted")
+        except CaptureError:
+            pass
         change = report["frames"][0]["changes"]["rt0/point0"][0]
         assert change["changed_pixels"] == 1 and change["changed_bytes"] == 4
         assert change["max_byte_delta"] == 7
