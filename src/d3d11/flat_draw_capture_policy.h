@@ -14,6 +14,20 @@ struct FlatDrawAdmission {
     unsigned sceneSkipped=0, motionSkipped=0, sceneQuotaSkipped=0, motionQuotaSkipped=0;
     unsigned poolCandidates[2]{},poolSelected[2]{},poolSkipped[2]{},poolQuotaSkipped[2]{};
     unsigned priorityEligible=0,priorityRecorded=0,priorityQuotaSkipped=0;
+    unsigned prioritySkipped=0;
+    bool countOnly=false,distributed=false;
+    unsigned expected[2]{},strides[2]{1,1},phases[2]{};
+    uint64_t sampleSequence=0;
+
+    void distribute(unsigned scene,unsigned motion,uint64_t sequence) {
+        distributed=true;expected[0]=scene;expected[1]=motion;sampleSequence=sequence;
+        for(unsigned i=0;i<2;++i) {
+            strides[i]=expected[i]?1+(expected[i]-1)/kQuota:1;
+            // Opposite halves within each pair; subsequent pairs advance by
+            // one residue. This is ordinal coverage, not stable object identity.
+            phases[i]=unsigned((sequence/2+(sequence%2?(strides[i]+1)/2:0))%strides[i]);
+        }
+    }
 
     bool consider(bool motion,uint64_t frame,bool priority=false) {
         if(priority)++priorityEligible;
@@ -23,7 +37,9 @@ struct FlatDrawAdmission {
         unsigned& quotaSkipped=motion?motionQuotaSkipped:sceneQuotaSkipped;
         const unsigned ordinal=++eligible;
         const unsigned phase=(frame&1)?0:kStride/2;
-        if(!priority&&ordinal>kInitial&&(ordinal+phase)%kStride!=0){++skipped;return false;}
+        const bool sampled=distributed?((ordinal-1)%strides[motion]==phases[motion]):
+            (priority||ordinal<=kInitial||(ordinal+phase)%kStride==0);
+        if(countOnly||!sampled){++skipped;if(priority)++prioritySkipped;return false;}
         if(recorded>=kQuota){++quotaSkipped;if(priority)++priorityQuotaSkipped;return false;}
         if(priority)++priorityRecorded;
         ++recorded;return true;

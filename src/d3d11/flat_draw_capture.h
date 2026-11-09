@@ -95,6 +95,7 @@ class FlatDrawCapture {
         unsigned poolSnapshots=0,poolByFamily[2]{};
         unsigned readbackFrames=0; bool readbackError=false,motionReadbackError=false;
         bool crosshair=false; Reference reference;
+        uint64_t calibrationFrame=0;
     };
     std::unique_ptr<Frame> current_;
     std::deque<std::unique_ptr<Frame>> pending_;
@@ -103,6 +104,9 @@ class FlatDrawCapture {
     unsigned unqualified_=0;
     std::map<std::pair<char,uint64_t>,bool> shaderBytes_;
     bool armed_=false,failed_=false,crosshair_=false;
+    uint64_t calibrationFrame_=0,sampleSequence_=0;
+    const void* calibrationDepth_=nullptr;
+    unsigned calibrationWidth_=0,calibrationHeight_=0,expected_[2]{};
     static unsigned bpp(DXGI_FORMAT f) {
         switch(f) {
         case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -365,8 +369,10 @@ class FlatDrawCapture {
           <<"\",\"selected_hdr\":\""<<hex(f.selectedHdr)<<"\",\"qualified\":"<<(f.qualified?"true":"false")
           <<",\"identity_match\":"<<(f.identity?"true":"false")<<",\"draw_cap\":"<<kDrawCap
            <<",\"draws_seen\":"<<f.drawsSeen<<",\"draws_recorded\":"<<f.draws.size()
-           <<",\"selection\":{\"strategy\":\"depth-matched-stratified-v1\",\"stride\":"<<FlatDrawAdmission::kStride
-           <<",\"phase\":"<<(f.number&1?0:FlatDrawAdmission::kStride/2)<<",\"quota_per_class\":"<<FlatDrawAdmission::kQuota
+           <<",\"selection\":{\"strategy\":\""<<(f.admission.distributed?"depth-matched-distributed-v1":"depth-matched-stratified-v1")<<"\"";
+        if(!f.admission.distributed)o<<",\"stride\":"<<FlatDrawAdmission::kStride
+           <<",\"phase\":"<<(f.number&1?0:FlatDrawAdmission::kStride/2);
+        o<<",\"quota_per_class\":"<<FlatDrawAdmission::kQuota
            <<",\"depth_matched\":"<<f.depthMatched<<",\"scene_eligible\":"<<f.admission.sceneEligible
            <<",\"motion_eligible\":"<<f.admission.motionEligible<<",\"scene_recorded\":"<<f.admission.sceneRecorded
            <<",\"motion_recorded\":"<<f.admission.motionRecorded<<",\"scene_skipped\":"<<f.admission.sceneSkipped
@@ -374,6 +380,11 @@ class FlatDrawCapture {
            <<",\"motion_quota_skipped\":"<<f.admission.motionQuotaSkipped
            <<",\"priority_eligible\":"<<f.admission.priorityEligible<<",\"priority_recorded\":"<<f.admission.priorityRecorded
            <<",\"priority_quota_skipped\":"<<f.admission.priorityQuotaSkipped
+           <<",\"priority_skipped\":"<<f.admission.prioritySkipped
+           <<",\"calibration_frame\":"<<f.calibrationFrame<<",\"sample_sequence\":"<<f.admission.sampleSequence
+           <<",\"expected\":["<<f.admission.expected[0]<<','<<f.admission.expected[1]<<"]"
+           <<",\"strides\":["<<f.admission.strides[0]<<','<<f.admission.strides[1]<<"]"
+           <<",\"phases\":["<<f.admission.phases[0]<<','<<f.admission.phases[1]<<"]"
            <<",\"priority_pair\":\""<<(f.crosshair?"*/* (non-depth-writing)":"5B4D8E894EEDA8B4/4375B72964F386CD")<<"\""
            <<",\"pool_candidates\":["<<f.admission.poolCandidates[0]<<','<<f.admission.poolCandidates[1]
            <<"],\"pool_selected\":["<<f.admission.poolSelected[0]<<','<<f.admission.poolSelected[1]
@@ -451,6 +462,7 @@ class FlatDrawCapture {
         if(f.crosshair&&std::strcmp(f.reference.status,"ok"))all=false;
         bool motionComplete=f.qualified&&f.identity&&!f.motionRefusals&&!f.motionReadbackError&&!timedOut&&
             !f.admission.motionSkipped&&!f.admission.motionQuotaSkipped;unsigned motionDraws=0;
+        if(f.admission.distributed&&(f.admission.sceneSkipped||f.admission.sceneQuotaSkipped))motionComplete=false;
         for(auto& d:f.draws){for(auto& c:d.copies)if(c.rt<4&&std::strcmp(c.status,"ok"))all=false;
             for(auto& c:d.cb)if(c.resource&&std::strcmp(c.status,"ok"))all=false;
             if(d.motionCandidate){++motionDraws;if(std::strcmp(d.motionStatus,"captured")||std::strcmp(d.pool.status,"ok"))motionComplete=false;
@@ -485,11 +497,14 @@ public:
     const std::wstring& directory() const {return directory_;}
     void cancel(const char* reason) {if(armed_&&!current_&&pending_.empty())
             Log::get().note("flat draw pixels: summary status=failed reason=%s qualified=%u unqualified=%u directory=%ls",reason,accepted_,unqualified_,directory_.c_str());
-        if(current_){current_->reason=reason;finish(*current_,true);current_.reset();}
+        if(current_){current_->reason=reason;
+            if(current_->admission.countOnly)Log::get().note("flat draw pixels: calibration cancelled reason=%s; no sampled frame",reason);
+            else finish(*current_,true);current_.reset();}
         while(!pending_.empty()){pending_.front()->reason=reason;finish(*pending_.front(),true);pending_.pop_front();}armed_=false;}
     void arm(uint64_t frame,bool crosshair=false) {
         cancel("rearmed");directory_.clear();accepted_=0;unqualified_=0;failed_=false;shaderBytes_.clear();armed_=true;armFrame_=frame;armMs_=GetTickCount64();
         crosshair_=crosshair;
+        calibrationFrame_=0;calibrationDepth_=nullptr;expected_[0]=expected_[1]=0;
         SYSTEMTIME t{};GetSystemTime(&t);wchar_t leaf[128]{};
         const auto root=Config::get().logDir()+L"\\flat_draw_pixels";
         const auto leafFor=[&](uint64_t captureId) {
@@ -497,17 +512,29 @@ public:
             return std::wstring(leaf);
         };
         if(!ensureDirectory(Config::get().logDir())||!ensureDirectory(root)||!createFreshCaptureDirectory(root,leafFor,directory_)){armed_=false;Log::get().note("flat draw pixels: arm refused directory");return;}
-        Log::get().note("flat draw pixels: armed frame=%llu next-two-qualified-frames points=8 window=16 cap=512-draws/frame scene=256 motion=256 stride=64 complementary-phases priority=%s within-motion-quota pipeline=original+executed memory=256MiB expiry=900frames/30s directory=%ls",
-            (unsigned long long)frame,crosshair_?"all-non-depth-writing":"5B4D/4375",directory_.c_str());
-        if(crosshair_)Log::get().note("flat draw pixels: aim=centred-game-crosshair ROI=64x32-render-pixels priority=all-non-depth-writing-within-quota reference=up-to-512x512-SDR-output-crop; aim at surviving less-transparent decoration and hold still; no colour or shader-family assumption");
+        Log::get().note("flat draw pixels: armed frame=%llu points=8 window=16 cap=512-draws/frame scene=256 motion=256 selection=%s pipeline=original+executed memory=256MiB expiry=900frames/30s directory=%ls",
+            (unsigned long long)frame,crosshair_?"count-only-calibration-then-two-distributed-frames":"two-qualified-frames-stride64-colour-priority",directory_.c_str());
+        if(crosshair_)Log::get().note("flat draw pixels: aim=centred-game-crosshair ROI=64x32-render-pixels selection=calibrate-then-distribute scene=256 motion=256 priority-tracked-without-stride-bypass next-sample-sequence=%llu reference=up-to-512x512-SDR-output-crop; hold still; no colour or shader-family assumption",
+            (unsigned long long)sampleSequence_);
     }
     void begin(uint64_t frame,const void* priorDepth,unsigned width,unsigned height) {
         if(!armed_||accepted_>=kFrames||current_)return;
         if(frame-armFrame_>900 || GetTickCount64()-armMs_>30000){cancel("arm-expired-no-qualified-frame");return;}
         if(!priorDepth||width<(crosshair_?64:kWindow)||height<(crosshair_?32:kWindow)){if(accepted_)cancel("second-frame-prior-source-unavailable");return;}
+        if(crosshair_&&calibrationFrame_&&(priorDepth!=calibrationDepth_||
+           width!=calibrationWidth_||height!=calibrationHeight_)) {
+            if(accepted_){cancel("second-frame-calibration-source-changed");return;}
+            calibrationFrame_=0;
+        }
         current_.reset(new Frame);current_->number=frame;current_->priorDepth=priorDepth;
         current_->crosshair=crosshair_;if(crosshair_)current_->reference.status="not-observed";
-        current_->width=width;current_->height=height;current_->startMs=GetTickCount64();current_->draws.reserve(kDrawCap);
+        if(crosshair_) {
+            current_->admission.countOnly=!calibrationFrame_;
+            current_->calibrationFrame=calibrationFrame_;
+            if(calibrationFrame_)current_->admission.distribute(expected_[0],expected_[1],sampleSequence_);
+        }
+        current_->width=width;current_->height=height;current_->startMs=GetTickCount64();
+        if(!current_->admission.countOnly)current_->draws.reserve(kDrawCap);
     }
     bool before(ID3D11DeviceContext* ctx,unsigned instances,char kind,uint32_t count,uint32_t start,int32_t base,uint32_t startInstance,
                 uint64_t vs,uint64_t ps,const void* vsObject,const void* psObject,bool motionEligible=false) {
@@ -534,11 +561,11 @@ public:
         if(depthState)depthState->GetDesc(&depthDesc);
         else {depthDesc.DepthEnable=TRUE;depthDesc.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;}
         const bool scene=depthDesc.DepthEnable&&depthDesc.DepthWriteMask==D3D11_DEPTH_WRITE_MASK_ALL;
-        // Non-depth-writing contributors share the existing motion quota;
-        // priority bypasses stride, not that quota or the matching-depth gate.
+        // Crosshair mode gives depth-writing and non-depth-writing draws their
+        // own quotas. Opaque engine-motion draws cannot consume the latter.
         const bool priority=f.crosshair?!scene:flatDrawColourDecalCandidate(vs,ps);
         if(!scene&&!motionEligible&&!priority)return false;
-        if(!f.admission.consider(motionEligible||priority,f.number,priority))return false;
+        if(!f.admission.consider(f.crosshair?!scene:(motionEligible||priority),f.number,priority))return false;
         Draw d;d.q=f.drawsSeen;d.instances=instances;d.kind=kind;d.count=count;d.start=start;d.base=base;d.startInstance=startInstance;
         d.vs=vs;d.ps=ps;d.vsObject=vsObject;d.psObject=psObject;
         d.dsv=dsv.Get();if(dsv){Ptr<ID3D11Resource> dr=depthResource;d.depthResource=dr.Get();
@@ -641,7 +668,7 @@ public:
     // Called before real Present, never after a flip. This bounded colour crop
     // is a same-frame visual reference, not a detector of crosshair geometry.
     void reference(ID3D11DeviceContext* ctx,uint64_t frame,ID3D11Texture2D* output) {
-        if(!active()||!ctx||!current_->crosshair||current_->number!=frame||
+        if(!active()||!ctx||!current_->crosshair||current_->admission.countOnly||current_->number!=frame||
            !current_->qualified||!current_->identity)return;
         Frame& f=*current_;auto& ref=f.reference;
         if(std::strcmp(ref.status,"not-observed"))return;
@@ -672,8 +699,21 @@ public:
     // F10 arm were exactly those, and the capture recorded only unjittered draws (2026-09-29).
     void present(ID3D11DeviceContext* ctx,uint64_t completedFrame,bool live=true) {
         if(current_&&current_->number==completedFrame) {
+            if(current_->admission.countOnly&&!current_->admission.sceneEligible&&!current_->admission.motionEligible)
+                current_->reason="calibration-no-eligible-draws";
             if(!live&&current_->qualified)current_->reason="reset-or-zero-phase";
-            if(current_->qualified&&current_->identity&&live){++accepted_;pending_.push_back(std::move(current_));}
+            if(current_->admission.countOnly&&current_->qualified&&current_->identity&&live&&
+               (current_->admission.sceneEligible||current_->admission.motionEligible)) {
+                calibrationFrame_=current_->number;calibrationDepth_=current_->priorDepth;
+                calibrationWidth_=current_->width;calibrationHeight_=current_->height;
+                expected_[0]=current_->admission.sceneEligible;expected_[1]=current_->admission.motionEligible;
+                Log::get().note("flat draw pixels: calibrated frame=%llu scene=%u motion=%u; no pixel/CB/pool/reference copies; next two qualified frames use distributed class quotas",
+                    (unsigned long long)calibrationFrame_,expected_[0],expected_[1]);
+                current_.reset();
+            }
+            else if(!current_->admission.countOnly&&current_->qualified&&current_->identity&&live){
+                if(current_->crosshair)++sampleSequence_;
+                ++accepted_;pending_.push_back(std::move(current_));}
             else {++unqualified_;if(accepted_){current_->reason="second-frame-unqualified";finish(*current_,true);armed_=false;}
                 else {allocated_-=current_->bytesAllocated;
                     if(unqualified_<=4||unqualified_%90==0)Log::get().note("flat draw pixels: unqualified frame=%llu reason=%s draws=%u attempts=%u; retrying while armed",
