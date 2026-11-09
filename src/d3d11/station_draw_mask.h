@@ -78,6 +78,12 @@ typedef void(STDMETHODCALLTYPE* SetDepthFn)(ID3D11DeviceContext*, ID3D11DepthSte
 // small, a handful at most, and the device they belong to is held with them).
 class Mask {
 public:
+    Mask() = default;
+    Mask(const Mask&) = delete;
+    Mask& operator=(const Mask&) = delete;
+    // A diagnostic releases its device-owned cache between experiments.
+    // The issue's RAII guard must restore bindings before clearing the cache.
+    void clear() noexcept { if (!active_) drop(nullptr); }
     // False, with nothing changed, when no device is reachable or a state could not be made; the caller then does not issue the draw.
     bool begin(ID3D11DeviceContext* ctx, SetBlendFn setBlend, SetDepthFn setDepth) noexcept {
         if (active_ || !ctx || !setBlend || !setDepth) return false;
@@ -139,7 +145,7 @@ private:
         used_ = 0;
         if (device_) device_->Release();
         device_ = device;
-        device_->AddRef();
+        if (device_) device_->AddRef();
     }
     ID3D11BlendState* blendState() noexcept {
         if (!blend_) {

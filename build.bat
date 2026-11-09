@@ -1713,7 +1713,7 @@ if not exist "%OBJ%\flat_mono_resolve_test" mkdir "%OBJ%\flat_mono_resolve_test"
     /Fe"%BUILD%\flat_mono_resolve_test.exe" "tools\flat_mono_resolve_test\flat_mono_resolve_test.cpp" ^
     "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\map_easu.cpp" "src\d3d11\map_smaa.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
     "src\common\iniedit.cpp" ^
-    "third_party\dxbc_hash\DxilHash.cpp" /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib
+    "third_party\dxbc_hash\DxilHash.cpp" /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib
 if errorlevel 1 ( echo [edvr] ERROR: flat mono resolve test build failed & exit /b 1 )
 "%BUILD%\flat_mono_resolve_test.exe" --dry-run || exit /b 1
 "%BUILD%\flat_mono_resolve_test.exe" --list-shards 5 || exit /b 1

@@ -57,6 +57,78 @@ This is contributor discovery, not a rendering fix or automatic selection of
 a replay-ready packet. A changed sample alone does not establish decoration
 ownership; use the matching reference and draw chronology.
 
+### Private draw-isolation diagnostic
+
+This is an **explicit intervention**, separate from the capture shortcut. It
+temporarily masks colour writes to every MRT (including EDVR's private target),
+depth writes and stencil writes for selected draw-signature groups. The actual
+draw and EDVR's surrounding bookkeeping still run. Known UI/canopy reissues of
+that draw are omitted while it is masked. Blend state/factors/sample mask and
+depth-stencil state/reference are restored immediately after each issue.
+`masked_issues` counts actual issues under the mask, not skipped calls or proven
+decoration ownership.
+
+With the diagnostic DLL installed, aim at the decoration and keep the view
+steady. Replace `LOG_DIR` below with the existing game's `edvr_logs` directory:
+
+```text
+python tools/flat_draw_isolation.py discover --log-dir LOG_DIR
+python tools/flat_draw_isolation.py test --log-dir LOG_DIR --dataset DATASET_ID --first 1 --last GROUP_NUMBER
+python tools/flat_draw_isolation.py report --log-dir LOG_DIR --id TEST_ID --preview-dir NEW_OUTPUT_DIR
+python tools/flat_draw_isolation.py cancel --log-dir LOG_DIR
+```
+
+Discovery observes one full frame without suppressing anything, then reports
+its dataset ID and group count. Split the inclusive group range and test **both
+halves**, narrowing groups that change the exact decoration. Use
+`report --groups FIRST LAST` to inspect shader pairs, arguments and counts.
+IDs remain tied to that frozen discovery, not subsequent draw order; rediscover
+after a view/scene change. A dataset expires after five minutes and is invalidated
+by the cancel command, resize, device/context or profile change. Requests expire after
+five seconds, so a queued request cannot silently activate on a later launch.
+The tool refuses to replace another pending request or an existing experiment.
+`--dry-run` writes nothing. Submission alone does not prove acceptance: inspect
+the manifest or the explicit game-log refusal.
+
+Tests save centred, at-most-512×512 **normal / suppressed / restored** SDR crops
+under `flat_draw_isolation/TEST_ID`. Suppression ends after two seconds or 240
+Presents, whichever comes first; a five-second hard deadline is also checked at
+draw boundaries, including when Presents stop. **Escape cancels masking** at the
+next polled draw/Present boundary (key checks are throttled to 16 ms); it is not
+consumed and may also open the game menu. Escape retains the discovery, but
+rediscover if the menu/view changed. The control-file cancel command is
+polled at Presents, up to four times per second. No configuration or AA history
+is reset. The restored crop waits another 500 ms or 120 Presents; temporal
+residue may remain. Pending readbacks are bounded and nonblocking; failure,
+timeout and missing images are not a complete test. The reference budget is
+8 MiB; discovery is capped at 8,192 groups. Do not run passive draw captures
+concurrently: active pixel/packet/discovery capture causes isolation refusal
+or cancellation.
+
+The initial domain is direct D/I/N/X geometry with known VS/PS hashes, an input
+layout, VB0, colour target and DSV (plus an index buffer for indexed draws).
+There is no guessed shader-family, depth-write or scene-size admission rule.
+This excludes depth-only passes, indirect/DrawAuto, depthless geometry and
+typical fullscreen `SV_VertexID` passes; it does **not** guarantee exclusion of
+every lighting or UI pass. Active/uncertain count-bearing queries, predication,
+stream output and pixel UAV bindings are refused. Excluded shader pairs and
+reasons are reported, with an explicit overflow count beyond 128 pair/reason
+entries. Unknown signatures in later frames are counted, never silently added
+to the selected range.
+
+Signatures combine shader hashes, draw arguments/topology and lifetime-tagged
+binding identities. They are **not unique object IDs**: resource contents can
+change, repeated signatures remain groups, and multiple instances may share a
+draw. No individual-instance narrowing or marker shader is implemented here.
+Only the game's selected issue and the named reissues are suppressed; unrelated
+EDVR passes, clears and compute work continue. Whole-scene disappearance only
+shows a broad dependency; a clearer decoration may identify an obscurer. No
+change may reflect duplicates, retained values, temporal history or excluded
+passes. `test_complete` means the bounded experiment and three references
+completed, **not** that an owner was found (`visual_effect` is unassessed).
+Confirm a narrowed candidate with suitable material/geometry evidence before
+claiming direct ownership or choosing a rendering fix.
+
 How to build EDVR from source, check the build without the game or a headset,
 and what the optional DLSS mode and the release package need.
 

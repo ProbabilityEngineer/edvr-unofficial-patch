@@ -21,6 +21,7 @@
 #include "../common/log.h"
 #include "flat_draw_capture_policy.h"
 #include "flat_capture_directory.h"
+#include "flat_output_reference.h"
 
 namespace edvr {
 bool captureFlatProbeShader(char stage,uint64_t hash);
@@ -77,12 +78,7 @@ class FlatDrawCapture {
     };
     struct Chunk { Ptr<ID3D11Texture2D> stage; unsigned format=0,bpp=0,used=0; bool mapped=false;
         uint64_t allocation=0; };
-    struct Reference {
-        Ptr<ID3D11Texture2D> stage;
-        unsigned outputWidth=0,outputHeight=0,x=0,y=0,width=0,height=0,format=0;
-        uint64_t allocation=0,bytes=0;
-        const char* status="not-requested";
-    };
+    using Reference=FlatOutputReference;
     struct Frame {
         uint64_t number=0, startMs=0, bytesAllocated=0; unsigned width=0,height=0, drawsSeen=0, overflows=0, refusals=0,motionRefusals=0;
         unsigned depthMatched=0; FlatDrawAdmission admission;
@@ -297,19 +293,9 @@ class FlatDrawCapture {
         const std::wstring stem=directory_+L"\\frame_"+std::to_wstring(f.number);
         auto& ref=f.reference;
         if(ref.stage&&!std::strcmp(ref.status,"queued")) {
-            D3D11_MAPPED_SUBRESOURCE map{};
-            const HRESULT hr=ctx->Map(ref.stage.Get(),0,D3D11_MAP_READ,D3D11_MAP_FLAG_DO_NOT_WAIT,&map);
-            if(hr==DXGI_ERROR_WAS_STILL_DRAWING)return false;
-            if(FAILED(hr)){ref.status="map-failed";f.readbackError=true;}
-            else {
-                std::vector<uint8_t> pixels(size_t(ref.width)*ref.height*4);
-                for(unsigned y=0;y<ref.height;++y)std::memcpy(pixels.data()+size_t(y)*ref.width*4,
-                    static_cast<const uint8_t*>(map.pData)+size_t(y)*map.RowPitch,ref.width*4);
-                ctx->Unmap(ref.stage.Get(),0);
-                if(write(stem+L"_reference.bin",pixels.data(),pixels.size())){ref.status="ok";ref.bytes=pixels.size();}
-                else {ref.status="write-failed";f.readbackError=true;}
-            }
-            ref.stage.Reset();allocated_-=ref.allocation;f.bytesAllocated-=ref.allocation;ref.allocation=0;
+            if(!ref.readback(ctx,[&](const void* p,size_t n){return write(stem+L"_reference.bin",p,n);},
+                [&](uint64_t n){allocated_-=n;f.bytesAllocated-=n;}))return false;
+            if(std::strcmp(ref.status,"ok"))f.readbackError=true;
         }
         if(!f.pixelFile&&_wfopen_s(&f.pixelFile,(stem+L"_pixels.bin").c_str(),L"wb")){f.readbackError=true;return true;}
         if(!f.cbFile&&_wfopen_s(&f.cbFile,(stem+L"_cb.bin").c_str(),L"wb")){f.readbackError=true;return true;}
@@ -672,27 +658,8 @@ public:
            !current_->qualified||!current_->identity)return;
         Frame& f=*current_;auto& ref=f.reference;
         if(std::strcmp(ref.status,"not-observed"))return;
-        if(!output){ref.status="output-unavailable";return;}
-        D3D11_TEXTURE2D_DESC td{};output->GetDesc(&td);
-        ref.outputWidth=td.Width;ref.outputHeight=td.Height;ref.format=td.Format;
-        if(td.SampleDesc.Count!=1||td.ArraySize!=1||td.MipLevels!=1||
-           (td.Format!=DXGI_FORMAT_R8G8B8A8_UNORM&&td.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB&&
-            td.Format!=DXGI_FORMAT_B8G8R8A8_UNORM&&td.Format!=DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
-            ref.status="unsupported-output";return;
-        }
-        ref.width=std::min(512u,td.Width);ref.height=std::min(512u,td.Height);
-        ref.x=td.Width/2-ref.width/2;ref.y=td.Height/2-ref.height/2;
-        ref.allocation=uint64_t(ref.width)*ref.height*8; // staging plus packed readback
-        if(!reserve(f,ref.allocation)){ref.allocation=0;ref.status="budget-cap";return;}
-        td.Width=ref.width;td.Height=ref.height;td.Usage=D3D11_USAGE_STAGING;
-        td.BindFlags=td.MiscFlags=0;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
-        Ptr<ID3D11Device> dev;ctx->GetDevice(&dev);
-        if(FAILED(dev->CreateTexture2D(&td,nullptr,&ref.stage))) {
-            allocated_-=ref.allocation;f.bytesAllocated-=ref.allocation;ref.allocation=0;
-            ref.status="create-failed";return;
-        }
-        const D3D11_BOX box{ref.x,ref.y,0,ref.x+ref.width,ref.y+ref.height,1};
-        ctx->CopySubresourceRegion(ref.stage.Get(),0,0,0,0,output,0,&box);ref.status="queued";
+        ref.capture(ctx,output,[&](uint64_t n){return reserve(f,n);},
+                    [&](uint64_t n){allocated_-=n;f.bytesAllocated-=n;});
     }
     // `live` false: the completed frame reset, or ran at phase (0,0). Its constants are ones no live
     // frame has (the camera rows carry no phase), so it is not a sample: the two frames right after an

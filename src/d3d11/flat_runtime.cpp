@@ -29,6 +29,7 @@
 #include "flat_camera_phase.h"
 #include "flat_live_phase.h"
 #include "flat_draw_capture.h"
+#include "flat_draw_isolation.h"
 #include "flat_draw_packet_capture.h"
 #include "flat_weapon_footprint.h"
 #include "flat_overlay_layer.h"
@@ -3443,7 +3444,12 @@ bool flatRuntimeSceneSizes(uint32_t* renderWidth, uint32_t* renderHeight, uint32
                               outputHeight);
 }
 
+bool flatRuntimeIsolationQueriesSafe(ID3D11DeviceContext* ctx) { return replayQueriesSafe(ctx); }
+bool flatRuntimeIsolationCaptureBusy() {
+    auto& s=state();return s.drawCapture.active()||s.drawPackets.active();
+}
 void flatRuntimeResize() {
+    flatDrawIsolation().cancel("runtime-resize");
     expireDeferredFailure(state(),"resize");
     // The game retries a refused ResizeBuffers every frame: thousands of calls in seconds with no Present between
     // them (2026-10-09 Epic logs). The reports below say it once per 5 s with the count of the calls they skipped.

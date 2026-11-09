@@ -84,6 +84,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "scheduler_stack_probe.h"
 #include "temporal_pass.h"   // temporalPassArmEyeDump: the eye dump key's job
 #include "flat_runtime.h"
+#include "flat_draw_isolation.h"
 #include "flat_hdr_crumbs.h"   // the flat HDR route's crash-safe breadcrumbs: the real Present's pair
 #include "format_support_log.h"   // the device capability log: the two hooks' reports and its closing tick
 #include "flat_temporal.h"   // flat profile discovery at owned Present
@@ -1820,6 +1821,11 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     if (runtimeFlatProfile()) menuFlatBeforePresent(self, flags);
     if (runtimeFlatProfile()) flatRuntimeWeaponFootprintBeforePresent(self, flags);
     if (runtimeFlatProfile()) flatRuntimeDrawCaptureBeforePresent(self, flags);
+    if(!(flags&DXGI_PRESENT_TEST)) {
+        if(runtimeFlatProfile()&&dev)flatDrawIsolation().present(self,dev,g_state->frameCounter,flags,
+            flatTemporalCapturing()||flatRuntimeIsolationCaptureBusy());
+        else flatDrawIsolation().cancel("profile-or-device-changed");
+    }
     // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): for the first frames that reach the resolver, the
     // real Present is bracketed, its result and the device's removed reason written. Both crumbs fall outside the clock
     // reads below, which time the call alone. The gate is one relaxed load.
@@ -1852,6 +1858,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, presentSync, flags);
     const int64_t presentT1 = qpcNow();
+    if(!(flags&DXGI_PRESENT_TEST)&&FAILED(hr))flatDrawIsolation().cancel("present-failed");
     // The stall sampler's heartbeat (stall_watch.h): the render thread has just presented. A relaxed store and a
     // compare; the first call starts the watchdog thread, or says that advanced.freeze_location turned it off.
     // frameCounter is the frame this Present ended, the number the long-frame lines call "frame".
