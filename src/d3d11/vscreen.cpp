@@ -90,6 +90,7 @@
 #include "vscreen_footprint.h"   // fix.vscreen_res_width = auto's footprint instrument (the on-foot screen's width in the eye)
 #include "map_wait.h"         // the game's time inside Map, for the native timing line
 #include "flat_runtime.h"
+#include "flat_draw_isolation.h"
 #include "flat_temporal.h"   // bounded, flat-profile-only scene discovery
 #include "cross_profile_cost.h"   // the flat PS constant-buffer observer's cost while VR is active (log only)
 #include "../common/runtime_profile.h"
@@ -5133,6 +5134,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
     mapRunBeforeIndirectDraw(self);
     if (runtimeFlatProfile()) {
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
+        flatDrawIsolation().observe(self,{'Z'},bindingShaderHash(BindSlot::Vs),bindingShaderHash(BindSlot::Ps));
         FlatRuntimeDrawScope flatDraw(self, 0, 'Z');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw(args, off);
         {
@@ -5175,6 +5177,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
     mapRunBeforeIndirectDraw(self);
     if (runtimeFlatProfile()) {
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
+        flatDrawIsolation().observe(self,{'Y'},bindingShaderHash(BindSlot::Vs),bindingShaderHash(BindSlot::Ps));
         FlatRuntimeDrawScope flatDraw(self, 0, 'Y');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw(args, off);
         {
@@ -5566,19 +5569,23 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
             args.base = static_cast<int32_t>(start);
             flatCensusDraw(self, 'D', count, 1, args);
         }
+        const auto isolation=flatDrawIsolation().observe(self,{'D',count,start,1,0,0},
+            bindingShaderHash(BindSlot::Vs),bindingShaderHash(BindSlot::Ps));
+        bool isolated=false;
         FlatRuntimeDrawScope flatDraw(self, 1, 'D', count, 0, static_cast<int32_t>(start));
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
         FlatStationSunGate sun(self, flatDraw, stationSkip);   // built 2026-10-21: only a skipped sun draw is changed (no real call, or a masked one)
         {
             FlatParticleScope particle(self, 'D', count, 1);
             ConcoursePaneScope pane(self, count, start, 0, 'D', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
-            if (sun.issues() && !pane.withheld()) g_state->realDraw(self, count, start);
+            if (sun.issues() && !pane.withheld()) isolated=flatDrawIsolation().issue(isolation,self,stationMaskSetBlend,stationMaskSetDepth,
+                [&]{g_state->realDraw(self,count,start);});
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         // visual.cockpit_glass = legacy (cockpit_glass.h): over the game's ice or condensation canopy draw, the legacy dirt, drawn again with EDVR's overlay; one relaxed load otherwise
-        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDraw(self, count, start); cockpitGlassOverlayEnd(self); }
-        if (!stationSkip) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDraw(self, count, start); });
+        if (!isolated && cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDraw(self, count, start); cockpitGlassOverlayEnd(self); }
+        if (!stationSkip && !isolated) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDraw(self, count, start); });
         return;
     }
     if (g_vrWorldInternal) { g_state->realDraw(self, count, start); return; }   // the world route's own draw (vr_world_route.h)
@@ -5634,6 +5641,7 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
     if (gpuPassProfileCapturing()) gpuPassProfileNoteDraw(self, 'A', 0, 1);
     if (runtimeFlatProfile()) {
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
+        flatDrawIsolation().observe(self,{'A'},bindingShaderHash(BindSlot::Vs),bindingShaderHash(BindSlot::Ps));
         FlatRuntimeDrawScope flatDraw(self, 0, 'A');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
         {
@@ -5672,6 +5680,9 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
             args.base = baseVertex;
             flatCensusDraw(self, 'I', count, 1, args);
         }
+        const auto isolation=flatDrawIsolation().observe(self,{'I',count,startIndex,1,0,baseVertex},
+            bindingShaderHash(BindSlot::Vs),bindingShaderHash(BindSlot::Ps));
+        bool isolated=false;
         FlatRuntimeDrawScope flatDraw(self, 1, 'I', count, startIndex, baseVertex);
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
         FlatStationSunGate sun(self, flatDraw, stationSkip);
@@ -5679,14 +5690,15 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
             FlatParticleScope particle(self, 'I', count, 1);
             ConcoursePaneScope pane(self, count, startIndex, baseVertex, 'I', kConcoursePaneCalls);
             if (sun.issues() && !pane.withheld()) {
-                g_state->realDrawIndexed(self, count, startIndex, baseVertex);
-                while (pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);   // the mirror: the same draw again (concourse_pane.h)
+                isolated=flatDrawIsolation().issue(isolation,self,stationMaskSetBlend,stationMaskSetDepth,
+                    [&]{g_state->realDrawIndexed(self,count,startIndex,baseVertex);});
+                while (!isolated && pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);   // the mirror: the same draw again (concourse_pane.h)
             }
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
-        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); cockpitGlassOverlayEnd(self); }
-        if (!stationSkip) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawIndexed(self, count, startIndex, baseVertex); });
+        if (!isolated && cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); cockpitGlassOverlayEnd(self); }
+        if (!stationSkip && !isolated) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawIndexed(self, count, startIndex, baseVertex); });
         return;
     }
     if (g_vrWorldInternal) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); return; }
@@ -5776,6 +5788,9 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
             args.startInstance = startInstance;
             flatCensusDraw(self, 'N', perInstance, instances, args);
         }
+        const auto isolation=flatDrawIsolation().observe(self,{'N',perInstance,startVertex,instances,startInstance,0},
+            bindingShaderHash(BindSlot::Vs),bindingShaderHash(BindSlot::Ps));
+        bool isolated=false;
         FlatRuntimeDrawScope flatDraw(self, instances, 'N', perInstance, 0,
                                       static_cast<int32_t>(startVertex), startInstance);
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
@@ -5783,12 +5798,13 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         {
             FlatParticleScope particle(self, 'N', perInstance, instances);
             ConcoursePaneScope pane(self, perInstance, startVertex, 0, 'N', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
-            if (sun.issues() && !pane.withheld()) g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
+            if (sun.issues() && !pane.withheld()) isolated=flatDrawIsolation().issue(isolation,self,stationMaskSetBlend,stationMaskSetDepth,
+                [&]{g_state->realDrawInstanced(self,perInstance,instances,startVertex,startInstance);});
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
-        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); cockpitGlassOverlayEnd(self); }
-        if (!stationSkip) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); });
+        if (!isolated && cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); cockpitGlassOverlayEnd(self); }
+        if (!stationSkip && !isolated) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); });
         return;
     }
     if (g_vrWorldInternal) { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); return; }
@@ -5869,6 +5885,9 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             args.startInstance = startInstance;
             flatCensusDraw(self, 'X', perInstance, instances, args);
         }
+        const auto isolation=flatDrawIsolation().observe(self,{'X',perInstance,startIndex,instances,startInstance,baseVertex},
+            bindingShaderHash(BindSlot::Vs),bindingShaderHash(BindSlot::Ps));
+        bool isolated=false;
         FlatRuntimeDrawScope flatDraw(self, instances, 'X', perInstance, startIndex,
                                       baseVertex, startInstance);
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
@@ -5877,17 +5896,17 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             FlatParticleScope particle(self, 'X', perInstance, instances);
             ConcoursePaneScope pane(self, perInstance, startIndex, baseVertex, 'X', kConcoursePaneCalls);
             if (sun.issues() && !pane.withheld()) {
-                g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
-                                                  baseVertex, startInstance);
-                while (pane.nextMirrorPass())
+                isolated=flatDrawIsolation().issue(isolation,self,stationMaskSetBlend,stationMaskSetDepth,
+                    [&]{g_state->realDrawIndexedInstanced(self,perInstance,instances,startIndex,baseVertex,startInstance);});
+                while (!isolated && pane.nextMirrorPass())
                     g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                       baseVertex, startInstance);
             }
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
-        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); cockpitGlassOverlayEnd(self); }
-        if (!stationSkip) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); });
+        if (!isolated && cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); cockpitGlassOverlayEnd(self); }
+        if (!stationSkip && !isolated) flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); });
         return;
     }
     if (g_vrWorldInternal) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); return; }

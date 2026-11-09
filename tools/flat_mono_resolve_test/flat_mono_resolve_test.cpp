@@ -84,7 +84,7 @@ struct ShardUnit {const char* name;int group;};
 const ShardUnit kUnits[]={
     {"projectionScopeTests",1},{"projectionRuntimeTests",1},{"projectionSnapshotTests",1},
     {"resolver",2},
-    {"flatPixelCaptureGpuTests",2},{"flatDrawCaptureGpuTests",2},{"flatDrawPacketGpuTests",2},
+    {"flatPixelCaptureGpuTests",2},{"flatDrawCaptureGpuTests",2},{"flatDrawIsolationGpuTests",2},{"flatDrawPacketGpuTests",2},
     {"flatWeaponFootprintGpuTests",2},{"flatOverlayLayerGpuTests",2},{"flatLoopOutputGpuTests",2},
     {"flatResolveInputGpuTests",3},{"flatForegroundOwnershipGpuTests",2},
     {"hdrRouteGpuTests",2},
@@ -273,6 +273,7 @@ bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned slot,ID3D11Texture2D* colour,I
 #include "flat_projection_runtime_tests.h"
 #include "flat_pixel_capture_gpu_tests.h"
 #include "flat_draw_capture_gpu_tests.h"
+#include "flat_draw_isolation_gpu_tests.h"
 #include "flat_draw_packet_gpu_tests.h"
 #include "flat_weapon_footprint_gpu_tests.h"
 #include "flat_overlay_layer_gpu_tests.h"
@@ -344,6 +345,7 @@ int main(int argc,char** argv) {
     auto runSuites=[&]{
         if(shardRuns("flatPixelCaptureGpuTests"))failures+=timedSuite("flatPixelCaptureGpuTests",[&]{return flatPixelCaptureGpuTests(device.Get(),context.Get());});
         if(shardRuns("flatDrawCaptureGpuTests"))failures+=timedSuite("flatDrawCaptureGpuTests",[&]{return flatDrawCaptureGpuTests(device.Get(),context.Get());});
+        if(shardRuns("flatDrawIsolationGpuTests"))failures+=timedSuite("flatDrawIsolationGpuTests",[&]{return flatDrawIsolationGpuTests(device.Get(),context.Get());});
         if(shardRuns("flatDrawPacketGpuTests"))failures+=timedSuite("flatDrawPacketGpuTests",[&]{return flatDrawPacketGpuTests(device.Get(),context.Get());});
         if(shardRuns("flatWeaponFootprintGpuTests"))failures+=timedSuite("flatWeaponFootprintGpuTests",[&]{return flatWeaponFootprintGpuTests(device.Get(),context.Get());});
         if(shardRuns("flatOverlayLayerGpuTests"))failures+=timedSuite("flatOverlayLayerGpuTests",[&]{return flatOverlayLayerGpuTests(device.Get(),context.Get());});
