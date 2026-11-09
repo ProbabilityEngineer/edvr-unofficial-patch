@@ -436,6 +436,46 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
         }
     }
     }
+    {
+        edvr::FlatDrawCapture aimed;aimed.arm(900,true);
+        const fs::path aimedDir=aimed.directory();
+        context->ClearState();
+        context->RSSetState(rasterState.Get());
+        D3D11_VIEWPORT viewport{0,0,float(W),float(H),0,1};context->RSSetViewports(1,&viewport);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(vs.Get(),nullptr,0);context->PSSetShader(ps.Get(),nullptr,0);
+        auto noWriteDesc=depthStateDesc;noWriteDesc.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ZERO;
+        ComPtr<ID3D11DepthStencilState> noWrite;
+        ck(SUCCEEDED(device->CreateDepthStencilState(&noWriteDesc,&noWrite)),"crosshair depth state");
+        context->OMSetDepthStencilState(noWrite.Get(),0);
+        ID3D11RenderTargetView* target=rtv.Get();context->OMSetRenderTargets(1,&target,dsv.Get());
+        const float red[4]{1,0,0,1};
+        for(uint64_t frame=901;frame<=902;++frame) {
+            context->ClearRenderTargetView(rtv.Get(),red);
+            context->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);
+            aimed.begin(frame,depth.Get(),W,H);
+            // Unknown family, no depth writes and not marked motion-eligible:
+            // crosshair discovery must not depend on the earlier colour guess.
+            ck(aimed.before(context,1,'D',3,0,0,0,0x9911,0x9922,vs.Get(),ps.Get()),
+               "crosshair admits unknown non-depth-writing family");
+            aimed.execution(context);context->Draw(3,0);aimed.after(context);
+            aimed.qualify(frame,depth.Get(),color.Get(),W,H);
+            aimed.reference(context,frame,color.Get());
+            // Prove the reference retains this draw, not a later surface image.
+            context->ClearRenderTargetView(rtv.Get(),red);
+            aimed.present(context,frame);
+        }
+        context->Flush();
+        for(unsigned i=0;i<100&&!fs::exists(aimedDir/L"frame_902.json");++i){
+            Sleep(1);aimed.present(context,903+i);
+        }
+        ck(fs::exists(aimedDir/L"frame_901_reference.bin")&&
+           fs::exists(aimedDir/L"frame_902.json"),"crosshair reference and manifests retained");
+        if(!bad){std::ofstream file(fixtureRoot/L"flat_draw_crosshair_current_fixture.txt",std::ios::binary);
+            file<<fs::relative(aimedDir,fixtureRoot).generic_u8string()<<"\n";
+            ck(file.good(),"crosshair fixture pointer written");}
+        aimed.cancel("test-end");
+    }
     if(!bad){std::ofstream file(pointer,std::ios::binary);file<<fs::relative(dir,fixtureRoot).generic_u8string()<<"\n";
         ck(file.good(),"fixture pointer written");std::printf("flat draw fixture: %ls\n",dir.c_str());}
     return bad;
