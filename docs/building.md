@@ -22,6 +22,29 @@ and uploads `d3d11.dll` as a diagnostic artifact. It also uploads build logs.
 Running CI and installing the resulting DLL still require separate approval;
 the workflow neither installs anything nor creates a release.
 
+### Private crosshair capture diagnostic
+
+The crosshair diagnostic uses the existing **full draw-capture trigger**
+(Shift + the configured `dump_draws` key). Aim the game's **centred crosshair**
+at a surviving, less-transparent decoration and hold the view steady. No new
+overlay or config key is added. Eight contiguous 16×16 windows cover a centred
+64×32 render-pixel region in the next two qualified frames. Non-depth-writing,
+matching-depth draws get priority regardless of shader family; existing draw,
+memory and expiry limits remain, and quota skips are still reported.
+
+Each accepted frame also attempts a same-frame, pre-Present central output
+crop, at most 512×512 pixels. This currently supports RGBA8/BGRA8 SDR output;
+unsupported formats and missing/failed references are explicit, not success.
+To export RGB reference PNGs without altering capture files:
+`python tools/flat_draw_pixels.py CAPTURE_DIR --preview-dir NEW_OUTPUT_DIR`.
+The output directory must be new and outside the capture; `--dry-run` writes
+nothing. Metadata records render/output extents and the sampled region's
+position in the crop. Old eight-point captures remain readable.
+
+This is contributor discovery, not a rendering fix or automatic selection of
+a replay-ready packet. A changed sample alone does not establish decoration
+ownership; use the matching reference and draw chronology.
+
 How to build EDVR from source, check the build without the game or a headset,
 and what the optional DLSS mode and the release package need.
 

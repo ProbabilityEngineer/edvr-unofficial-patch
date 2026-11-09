@@ -4267,6 +4267,14 @@ void flatRuntimeWeaponFootprintBeforePresent(IDXGISwapChain* swap,UINT flags) {
     FlatComputeInternalScope guard;
     s.weaponFootprint.beforePresent(s.context.Get(),s.prefix.frame,s.prefix.sequence);
 }
+void flatRuntimeDrawCaptureBeforePresent(IDXGISwapChain* swap,UINT flags) {
+    if(!swap||(flags&DXGI_PRESENT_TEST))return;
+    auto& s=state();if(!s.drawCapture.active()||!owner())return;
+    FlatComputeInternalScope guard;
+    Ptr<ID3D11Texture2D> output;
+    swap->GetBuffer(0,IID_PPV_ARGS(&output));
+    s.drawCapture.reference(s.context.Get(),s.prefix.frame,output.Get());
+}
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
@@ -4608,7 +4616,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         witnessRearm();   // the camera-write witness walks stacks again, bounded (flat_witness_bound.h)
         syncEngine();
         flatMonoResolveArmPixels(frame);
-        s.drawCapture.arm(frame);
+        s.drawCapture.arm(frame,true);
         armDrawPackets(s,frame);
         s.drawPacketContext=s.context;s.drawPacketThread=GetCurrentThreadId();s.drawPacketFrame=frame+1;
         s.weaponFootprint.arm(frame);

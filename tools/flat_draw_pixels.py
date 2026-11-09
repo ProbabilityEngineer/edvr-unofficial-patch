@@ -93,6 +93,16 @@ def producer_center(normalized, extent):
     return min(int(f32(f32(normalized) * extent)), extent - 1)
 
 
+def reference_rows(ref, payload):
+    """Preview presented RGB; retain native alpha only in the raw capture."""
+    for y in range(ref["height"]):
+        row = bytearray(payload[y*ref["width"]*4:(y+1)*ref["width"]*4])
+        if ref["format"] in (87, 91):
+            row[0::4], row[2::4] = row[2::4], row[0::4]
+        row[3::4] = b"\xff" * ref["width"]
+        yield row
+
+
 def load_frame(path):
     match = FRAME.fullmatch(path.name)
     if not match:
@@ -128,6 +138,43 @@ def load_frame(path):
         raise CaptureError("invalid motion completeness fields")
     width = integer(manifest.get("render_width"), "render_width", WINDOW, 16384)
     height = integer(manifest.get("render_height"), "render_height", WINDOW, 16384)
+    layout = manifest.get("sample_layout", "legacy-eight-point-v1")
+    if layout not in ("legacy-eight-point-v1", "crosshair-64x32-v1"):
+        raise CaptureError("unknown sample layout")
+    reference = manifest.get("reference")
+    if reference is not None:
+        if not isinstance(reference, dict) or reference.get("status") not in (
+                "not-requested", "not-observed", "output-unavailable", "unsupported-output",
+                "budget-cap", "create-failed", "map-failed", "write-failed", "timeout", "gpu_error", "ok"):
+            raise CaptureError("invalid reference status")
+        if integer(reference.get("frame"), "reference.frame") != frame or reference.get("stage") != "pre-present-output":
+            raise CaptureError("reference is not from this pre-present frame")
+        if reference["status"] == "ok":
+            ow = integer(reference.get("output_width"), "reference.output_width", 1, 16384)
+            oh = integer(reference.get("output_height"), "reference.output_height", 1, 16384)
+            rw = integer(reference.get("width"), "reference.width", 1, min(512, ow))
+            rh = integer(reference.get("height"), "reference.height", 1, min(512, oh))
+            rx = integer(reference.get("x"), "reference.x", 0, ow-rw)
+            ry = integer(reference.get("y"), "reference.y", 0, oh-rh)
+            if (reference.get("format") not in (28, 29, 87, 91) or
+                    reference.get("bytes") != rw*rh*4 or
+                    (rw, rh, rx, ry) != (min(512, ow), min(512, oh), ow//2-rw//2, oh//2-rh//2) or
+                    reference.get("file") != f"frame_{frame}_reference.bin"):
+                raise CaptureError("reference layout/file mismatch")
+            if (path.parent / reference["file"]).stat().st_size != rw*rh*4:
+                raise CaptureError("reference payload size mismatch")
+            payload = read_blob(path.parent / reference["file"])
+            if len(payload) != rw*rh*4:
+                raise CaptureError("reference payload size mismatch")
+            reference = dict(reference)
+            reference["crosshair_in_crop"] = [ow/2-rx, oh/2-ry]
+            reference["sampling_roi_in_crop"] = [
+                (width//2-32)*ow/width-rx, (height//2-16)*oh/height-ry,
+                64*ow/width, 32*oh/height] if layout == "crosshair-64x32-v1" else None
+    if layout == "crosshair-64x32-v1" and (width < 64 or height < 32 or
+            reference is None or reference["status"] == "not-requested" or
+            (status == "complete" and reference["status"] != "ok")):
+        raise CaptureError("crosshair capture lacks an explicit reference outcome or valid extent")
     for key in ("prior_depth", "selected_depth", "selected_hdr"):
         hex_token(manifest.get(key), key)
     if status == "complete" and (not qualified or not identity_match or refusals or
@@ -157,6 +204,10 @@ def load_frame(path):
         integer(point.get("y"), f"point {index}.y", 0, height - 1)
         if point["x"] != producer_center(point["u"], width) or point["y"] != producer_center(point["v"], height):
             raise CaptureError(f"point {index} center disagrees with normalized coordinate")
+    if layout == "crosshair-64x32-v1" and (
+            len(points) != 8 or any((p["x"], p["y"]) !=
+                (width//2-24+16*(i%4), height//2-8+16*(i//4)) for i, p in enumerate(points))):
+        raise CaptureError("crosshair windows do not tile the centred 64x32 region")
     draws = manifest.get("draws")
     if not isinstance(draws, list) or len(draws) != recorded:
         raise CaptureError("draw list disagrees with draws_recorded")
@@ -373,9 +424,9 @@ def load_frame(path):
                 if not isinstance(state, dict) or type(state.get("observed")) is not bool:
                     raise CaptureError("pipeline phase must explicitly report observed state")
                 if state["observed"]:
-                    for name, count, row_width in (("viewports", "viewport_count", 6),
+                    for name, count_field, row_width in (("viewports", "viewport_count", 6),
                                                ("scissors", "scissor_count", 4)):
-                        n = integer(state.get(count), count, 0, 16)
+                        n = integer(state.get(count_field), count_field, 0, 16)
                         rows = state.get(name)
                         if not isinstance(rows, list) or len(rows) != n or any(
                                 not isinstance(row, list) or len(row) != row_width for row in rows):
@@ -597,11 +648,12 @@ def load_frame(path):
             "selection": selection,
             "changes": changes, "motion_windows": motion_windows, "unknown_pairs": unknown,
             "colour_decal_candidates": colour_decal_candidates,
+            "sample_layout": layout, "reference": reference,
             "readback_validation": "Complete means bytes are available, not that backend copy semantics are verified. Validate the GPU fixture on the capture backend before treating depth equality as evidence.",
             "interpretation": "Changes are native render-target bytes before and after a sampled draw. Omitted draws, final visible owner, and cross-frame draw identity are not inferred."}
 
 
-def run(capture_dir, output=None, dry_run=False):
+def run(capture_dir, output=None, dry_run=False, preview_dir=None):
     if not capture_dir.is_dir():
         raise CaptureError(f"capture directory does not exist: {capture_dir}")
     paths = sorted(capture_dir.glob("frame_*.json"))
@@ -613,6 +665,19 @@ def run(capture_dir, output=None, dry_run=False):
         raise CaptureError("duplicate frame ids")
     report = {"frames": frames, "consecutive": len(ids) == 2 and ids[1] == ids[0] + 1,
               "cross_frame_matching": "unproven; draw ordinals and resource pointers are not stable object identity"}
+    if preview_dir is not None:
+        if preview_dir.resolve().is_relative_to(capture_dir.resolve()):
+            raise CaptureError("previews must be outside the source capture")
+        if not dry_run:
+            from flat_pixels import write_png
+            preview_dir.mkdir(parents=True, exist_ok=False)
+            for frame in frames:
+                ref = frame["reference"]
+                if not ref or ref["status"] != "ok":
+                    continue
+                payload = read_blob(capture_dir / ref["file"])
+                write_png(preview_dir / f"frame_{frame['frame']}_reference.png",
+                          ref["width"], ref["height"], reference_rows(ref, payload))
     if output is not None and not dry_run:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -667,6 +732,22 @@ def verify_fixture(root):
         if actual != expected:
             raise CaptureError(f"fixture native changed-pixel counts differ: {actual}")
         changed_counts.append({key: pixels for key, (pixels, _) in expected_changes.items()})
+    aimed_directory = pointed_directory("flat_draw_crosshair_current_fixture.txt")
+    aimed_report = run(aimed_directory)
+    require_consecutive_fixture_frames(aimed_report, [901, 902], aimed_directory,
+                                       "crosshair fixture lacks two consecutive frames")
+    expected_reference = b"".join(bytes((0, 255, 0, 255) if 2*x < y else (255, 0, 0, 255))
+                                  for y in range(64) for x in range(64))
+    for frame in aimed_report["frames"]:
+        ref = frame["reference"]
+        expected = {"rt0/point0": [(192, 384)], "rt0/point4": [(256, 512)], "rt0/point5": [(64, 128)]}
+        actual = {key: [(row["changed_pixels"], row["changed_bytes"]) for row in rows]
+                  for key, rows in frame["changes"].items()}
+        if (frame["status"] != "complete" or frame["sample_layout"] != "crosshair-64x32-v1" or
+                frame["selection"]["priority"]["recorded"] != 1 or actual != expected or
+                ref["status"] != "ok" or ref["sampling_roi_in_crop"] != [0, 16, 64, 32] or
+                (aimed_directory / ref["file"]).read_bytes() != expected_reference):
+            raise CaptureError("crosshair fixture windows or same-frame reference differ from GPU expectation")
     motion_directory = pointed_directory("flat_draw_motion_current_fixture.txt")
     motion_report = run(motion_directory)
     motion_frames = motion_report["frames"]
@@ -777,6 +858,48 @@ def self_test():
         path = root / "frame_7.json"
         path.write_text(json.dumps(manifest), encoding="utf-8")
         report = run(root)
+        # Centred render-space tiling survives odd extents and output scaling.
+        aimed_dir = root / "aimed"
+        aimed_dir.mkdir()
+        aimed = dict(manifest, status="partial", draws=[], draws_seen=0, draws_recorded=0,
+                     pixels_bytes=0, cb_bytes=0, sample_layout="crosshair-64x32-v1")
+        for suffix in ("pixels", "cb"):
+            (aimed_dir / f"frame_7_{suffix}.bin").write_bytes(b"")
+        ref = {"status": "ok", "frame": 7, "stage": "pre-present-output",
+               "output_width": 3024, "output_height": 1964, "x": 1256, "y": 726,
+               "width": 512, "height": 512, "format": 87, "bytes": 512*512*4,
+               "file": "frame_7_reference.bin"}
+        aimed["reference"] = ref
+        (aimed_dir / ref["file"]).write_bytes(bytes((1, 2, 3, 0)) * (512*512))
+        aimed_path = aimed_dir / "frame_7.json"
+        for w, h in ((64, 32), (2268, 1473), (2570, 1669), (3024, 1964), (6048, 3928), (16384, 16383)):
+            aimed["render_width"], aimed["render_height"] = w, h
+            aimed["points"] = []
+            for i in range(8):
+                x, y = w//2-24+16*(i%4), h//2-8+16*(i//4)
+                aimed["points"].append(dict(x=x, y=y, u=float(f"{(x+.5)/w:.6g}"), v=float(f"{(y+.5)/h:.6g}")))
+            aimed_path.write_text(json.dumps(aimed), encoding="utf-8")
+            frame = run(aimed_dir)["frames"][0]
+            assert frame["reference"]["crosshair_in_crop"] == [256, 256]
+            assert frame["reference"]["sampling_roi_in_crop"][2:] == [64*3024/w, 32*1964/h]
+        previews = root / "aimed-previews"
+        before = {p.name: p.read_bytes() for p in aimed_dir.iterdir()}
+        run(aimed_dir, dry_run=True, preview_dir=previews)
+        assert not previews.exists() and before == {p.name: p.read_bytes() for p in aimed_dir.iterdir()}
+        run(aimed_dir, preview_dir=previews)
+        assert (previews / "frame_7_reference.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert list(reference_rows(dict(width=1, height=1, format=87), bytes((1, 2, 3, 0)))) == [bytes((3, 2, 1, 255))]
+        assert list(reference_rows(dict(width=1, height=1, format=28), bytes((1, 2, 3, 0)))) == [bytes((1, 2, 3, 255))]
+        ref["frame"] = 6
+        aimed_path.write_text(json.dumps(aimed), encoding="utf-8")
+        try:
+            run(aimed_dir)
+            raise AssertionError("wrong-frame reference accepted")
+        except CaptureError:
+            pass
+        ref["frame"], ref["status"], ref["bytes"] = 7, "unsupported-output", 0
+        aimed_path.write_text(json.dumps(aimed), encoding="utf-8")
+        assert run(aimed_dir)["frames"][0]["reference"]["status"] == "unsupported-output"
         change = report["frames"][0]["changes"]["rt0/point0"][0]
         assert change["changed_pixels"] == 1 and change["changed_bytes"] == 4
         assert change["max_byte_delta"] == 7
@@ -920,7 +1043,10 @@ def self_test():
         extended = json.loads(json.dumps(newer))
         extended_draw = extended["draws"][0]
         extended_draw["vs"], extended_draw["ps"] = "5B4D8E894EEDA8B4", "4375B72964F386CD"
-        extended_draw["pipeline"] = {"original": {"observed": False}, "executed": {"observed": False}}
+        extended_draw["pipeline"] = {
+            "original": {"observed": True, "viewport_count": 1, "viewports": [[0, 0, 32, 32, 0, 1]],
+                         "scissor_count": 0, "scissors": [], "blend": {}, "raster": {}},
+            "executed": {"observed": False}}
         extended_draw["motion"]["slot"].update(format=2, view_format=2)
         extended_pixels = bytearray(pixels)
         for copy in extended_draw["copies"]:
@@ -946,6 +1072,8 @@ def self_test():
                     "slot_changed_pixels", "dsv_changed_pixels", "pool_record_sha256"):
             assert extended_row[key] == row[key], key
         assert len(extended_frame["colour_decal_candidates"]) == 1
+        assert extended_frame["colour_decal_candidates"][0]["count"] == extended_draw["count"]
+        assert extended_frame["render_size"] == [32, 32]
         assert not extended_frame["colour_decal_candidates"][0]["pipeline"]["executed"]["observed"]
         newer["selection"] = {"strategy": "depth-matched-stratified-v1", "stride": 64,
                               "phase": 0, "quota_per_class": 256, "depth_matched": 1,
@@ -998,6 +1126,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture_dir", nargs="?", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--preview-dir", type=Path,
+                        help="new directory outside capture for same-frame SDR RGB reference PNGs")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-fixture", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -1013,7 +1143,7 @@ def main(argv=None):
                 parser.error("--verify-fixture does not take --output")
             print(json.dumps(verify_fixture(args.capture_dir), indent=2))
             return 0
-        print(json.dumps(run(args.capture_dir, args.output, args.dry_run), indent=2))
+        print(json.dumps(run(args.capture_dir, args.output, args.dry_run, args.preview_dir), indent=2))
         return 0
     except (CaptureError, OSError) as exc:
         print(f"flat_draw_pixels: {exc}", file=sys.stderr)

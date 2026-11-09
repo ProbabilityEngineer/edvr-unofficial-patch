@@ -77,6 +77,12 @@ class FlatDrawCapture {
     };
     struct Chunk { Ptr<ID3D11Texture2D> stage; unsigned format=0,bpp=0,used=0; bool mapped=false;
         uint64_t allocation=0; };
+    struct Reference {
+        Ptr<ID3D11Texture2D> stage;
+        unsigned outputWidth=0,outputHeight=0,x=0,y=0,width=0,height=0,format=0;
+        uint64_t allocation=0,bytes=0;
+        const char* status="not-requested";
+    };
     struct Frame {
         uint64_t number=0, startMs=0, bytesAllocated=0; unsigned width=0,height=0, drawsSeen=0, overflows=0, refusals=0,motionRefusals=0;
         unsigned depthMatched=0; FlatDrawAdmission admission;
@@ -88,6 +94,7 @@ class FlatDrawCapture {
         uint64_t pixelWritten=0,cbWritten=0,poolWritten=0;
         unsigned poolSnapshots=0,poolByFamily[2]{};
         unsigned readbackFrames=0; bool readbackError=false,motionReadbackError=false;
+        bool crosshair=false; Reference reference;
     };
     std::unique_ptr<Frame> current_;
     std::deque<std::unique_ptr<Frame>> pending_;
@@ -95,7 +102,7 @@ class FlatDrawCapture {
     uint64_t armMs_=0,armFrame_=0, allocated_=0; unsigned accepted_=0;
     unsigned unqualified_=0;
     std::map<std::pair<char,uint64_t>,bool> shaderBytes_;
-    bool armed_=false,failed_=false;
+    bool armed_=false,failed_=false,crosshair_=false;
     static unsigned bpp(DXGI_FORMAT f) {
         switch(f) {
         case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -165,6 +172,13 @@ class FlatDrawCapture {
         const bool ok=!n || std::fwrite(p,1,n,f)==n;return std::fclose(f)==0&&ok;
     }
     static unsigned center(float u,unsigned n) {return std::min(n-1u,static_cast<unsigned>(u*n));}
+    // Eight contiguous tiles cover 64x32 render pixels at the centred crosshair.
+    static unsigned pointX(const Frame& f,unsigned i) {
+        return f.crosshair?f.width/2-32+8+16*(i%4):center(uv_[i][0],f.width);
+    }
+    static unsigned pointY(const Frame& f,unsigned i) {
+        return f.crosshair?f.height/2-16+8+16*(i/4):center(uv_[i][1],f.height);
+    }
     static unsigned origin(unsigned c,unsigned n) {return std::min(n-kWindow,c<kWindow/2?0:c-kWindow/2);}
     bool reserve(Frame& f,uint64_t bytes,bool motion=false) {
         if(bytes>kByteCap || allocated_>kByteCap-bytes){if(motion)++f.motionRefusals;else ++f.overflows;return false;}
@@ -174,7 +188,7 @@ class FlatDrawCapture {
         const Rt& r=rt==6?d.motionSlot:rt==7?d.motionDepth:d.rt[rt];
         Copy c;c.rt=rt;c.point=pt;c.after=after;c.format=r.format;c.bpp=bpp(static_cast<DXGI_FORMAT>(r.format));
         if(!r.valid){c.status="unavailable";d.copies.push_back(c);if(rt>=6)++f.motionRefusals;else ++f.refusals;return false;}
-        c.x0=origin(center(uv_[pt][0],r.width),r.width);c.y0=origin(center(uv_[pt][1],r.height),r.height);
+        c.x0=origin(pointX(f,pt),r.width);c.y0=origin(pointY(f,pt),r.height);
         unsigned idx=0;
         for(;idx<f.chunks.size();++idx)if(f.chunks[idx].format==r.format && f.chunks[idx].used<kChunkSlots)break;
         if(idx==f.chunks.size()) {
@@ -277,6 +291,22 @@ class FlatDrawCapture {
     }
     bool readback(ID3D11DeviceContext* ctx,Frame& f) {
         const std::wstring stem=directory_+L"\\frame_"+std::to_wstring(f.number);
+        auto& ref=f.reference;
+        if(ref.stage&&!std::strcmp(ref.status,"queued")) {
+            D3D11_MAPPED_SUBRESOURCE map{};
+            const HRESULT hr=ctx->Map(ref.stage.Get(),0,D3D11_MAP_READ,D3D11_MAP_FLAG_DO_NOT_WAIT,&map);
+            if(hr==DXGI_ERROR_WAS_STILL_DRAWING)return false;
+            if(FAILED(hr)){ref.status="map-failed";f.readbackError=true;}
+            else {
+                std::vector<uint8_t> pixels(size_t(ref.width)*ref.height*4);
+                for(unsigned y=0;y<ref.height;++y)std::memcpy(pixels.data()+size_t(y)*ref.width*4,
+                    static_cast<const uint8_t*>(map.pData)+size_t(y)*map.RowPitch,ref.width*4);
+                ctx->Unmap(ref.stage.Get(),0);
+                if(write(stem+L"_reference.bin",pixels.data(),pixels.size())){ref.status="ok";ref.bytes=pixels.size();}
+                else {ref.status="write-failed";f.readbackError=true;}
+            }
+            ref.stage.Reset();allocated_-=ref.allocation;f.bytesAllocated-=ref.allocation;ref.allocation=0;
+        }
         if(!f.pixelFile&&_wfopen_s(&f.pixelFile,(stem+L"_pixels.bin").c_str(),L"wb")){f.readbackError=true;return true;}
         if(!f.cbFile&&_wfopen_s(&f.cbFile,(stem+L"_cb.bin").c_str(),L"wb")){f.readbackError=true;return true;}
         if(!f.poolFile&&_wfopen_s(&f.poolFile,(stem+L"_pool.bin").c_str(),L"wb")){
@@ -344,7 +374,7 @@ class FlatDrawCapture {
            <<",\"motion_quota_skipped\":"<<f.admission.motionQuotaSkipped
            <<",\"priority_eligible\":"<<f.admission.priorityEligible<<",\"priority_recorded\":"<<f.admission.priorityRecorded
            <<",\"priority_quota_skipped\":"<<f.admission.priorityQuotaSkipped
-           <<",\"priority_pair\":\"5B4D8E894EEDA8B4/4375B72964F386CD\""
+           <<",\"priority_pair\":\""<<(f.crosshair?"*/* (non-depth-writing)":"5B4D8E894EEDA8B4/4375B72964F386CD")<<"\""
            <<",\"pool_candidates\":["<<f.admission.poolCandidates[0]<<','<<f.admission.poolCandidates[1]
            <<"],\"pool_selected\":["<<f.admission.poolSelected[0]<<','<<f.admission.poolSelected[1]
            <<"],\"pool_skipped\":["<<f.admission.poolSkipped[0]<<','<<f.admission.poolSkipped[1]
@@ -355,8 +385,17 @@ class FlatDrawCapture {
           <<",\"pixels_file\":\"frame_"<<f.number<<"_pixels.bin\",\"pixels_bytes\":"<<f.pixelWritten
            <<",\"cb_file\":\"frame_"<<f.number<<"_cb.bin\",\"cb_bytes\":"<<f.cbWritten
            <<",\"pool_file\":\"frame_"<<f.number<<"_pool.bin\",\"pool_bytes\":"<<f.poolWritten<<",\"points\":[";
-        for(unsigned i=0;i<kPoints;++i){if(i)o<<',';o<<"{\"u\":"<<uv_[i][0]<<",\"v\":"<<uv_[i][1]<<",\"x\":"<<center(uv_[i][0],f.width)<<",\"y\":"<<center(uv_[i][1],f.height)<<"}";}
-        o<<"],\"draws\":[";
+        for(unsigned i=0;i<kPoints;++i){if(i)o<<',';
+            o<<"{\"u\":"<<(f.crosshair?(pointX(f,i)+0.5)/f.width:uv_[i][0])
+             <<",\"v\":"<<(f.crosshair?(pointY(f,i)+0.5)/f.height:uv_[i][1])
+             <<",\"x\":"<<pointX(f,i)<<",\"y\":"<<pointY(f,i)<<"}";}
+        const auto& ref=f.reference;
+        o<<"],\"sample_layout\":\""<<(f.crosshair?"crosshair-64x32-v1":"legacy-eight-point-v1")
+         <<"\",\"reference\":{\"status\":\""<<ref.status<<"\",\"frame\":"<<f.number
+         <<",\"stage\":\"pre-present-output\",\"output_width\":"<<ref.outputWidth<<",\"output_height\":"<<ref.outputHeight
+         <<",\"x\":"<<ref.x<<",\"y\":"<<ref.y<<",\"width\":"<<ref.width<<",\"height\":"<<ref.height
+         <<",\"format\":"<<ref.format<<",\"bytes\":"<<ref.bytes<<",\"file\":\"frame_"<<f.number<<"_reference.bin\"}"
+         <<",\"draws\":[";
         for(size_t i=0;i<f.draws.size();++i){const Draw& d=f.draws[i];if(i)o<<',';
             o<<"{\"pipeline\":{\"original\":";pipelineJson(o,d.originalPipeline);
             o<<",\"executed\":";pipelineJson(o,d.executedPipeline);
@@ -399,6 +438,7 @@ class FlatDrawCapture {
         }o<<"]}";return o.str();
     }
     void finish(Frame& f,bool timedOut) {
+        if(!std::strcmp(f.reference.status,"queued"))f.reference.status=timedOut?"timeout":"gpu_error";
         if(f.pixelFile){if(std::fclose(f.pixelFile)!=0)f.readbackError=true;f.pixelFile=nullptr;}
         if(f.cbFile){if(std::fclose(f.cbFile)!=0)f.readbackError=true;f.cbFile=nullptr;}
         if(f.poolFile){if(std::fclose(f.poolFile)!=0)f.motionReadbackError=true;f.poolFile=nullptr;}
@@ -408,6 +448,7 @@ class FlatDrawCapture {
             if(!std::strcmp(d.pool.status,"queued")){d.pool.status=unfinished;d.pool.length=0;}}
         bool all=f.qualified&&f.identity&&!f.draws.empty()&&!f.overflows&&!f.refusals&&!f.readbackError&&!timedOut&&
             f.drawsSeen==f.draws.size();
+        if(f.crosshair&&std::strcmp(f.reference.status,"ok"))all=false;
         bool motionComplete=f.qualified&&f.identity&&!f.motionRefusals&&!f.motionReadbackError&&!timedOut&&
             !f.admission.motionSkipped&&!f.admission.motionQuotaSkipped;unsigned motionDraws=0;
         for(auto& d:f.draws){for(auto& c:d.copies)if(c.rt<4&&std::strcmp(c.status,"ok"))all=false;
@@ -418,6 +459,7 @@ class FlatDrawCapture {
         const char* status=all?"complete":f.qualified?"partial":"failed";
         if(!std::strcmp(f.reason,"qualified"))f.reason=timedOut?"readback-timeout":all?"qualified":
             f.draws.empty()?"no-eligible-draws":
+            f.crosshair&&std::strcmp(f.reference.status,"ok")?"reference-unavailable":
             (f.refusals||f.motionRefusals||f.readbackError||f.motionReadbackError||f.overflows)?
                 "copy-or-cap-refused":"sampled-with-gaps";
         const std::wstring stem=directory_+L"\\frame_"+std::to_wstring(f.number);
@@ -430,12 +472,12 @@ class FlatDrawCapture {
         const bool files=write(temporary,body.data(),body.size())&&
             replaceFileAtomic(temporary,manifest);
         if(!files)DeleteFileW(temporary.c_str());
-        Log::get().note("flat draw pixels: frame=%llu status=%s reason=%s draws=%u/%u scene=%u/%u skip=%u quota-skip=%u motion-eligible=%u recorded=%u skip=%u quota-skip=%u copies=%llu cb-bytes=%llu motion=%u/%u refusals=%u pool-bytes=%llu files=%s directory=%ls",
+        Log::get().note("flat draw pixels: frame=%llu status=%s reason=%s draws=%u/%u scene=%u/%u skip=%u quota-skip=%u motion-eligible=%u recorded=%u skip=%u quota-skip=%u copies=%llu cb-bytes=%llu motion=%u/%u refusals=%u pool-bytes=%llu files=%s reference=%s directory=%ls",
             (unsigned long long)f.number,status,f.reason,(unsigned)f.draws.size(),f.drawsSeen,
             f.admission.sceneRecorded,f.admission.sceneEligible,f.admission.sceneSkipped,f.admission.sceneQuotaSkipped,
             f.admission.motionEligible,f.admission.motionRecorded,f.admission.motionSkipped,f.admission.motionQuotaSkipped,
             (unsigned long long)f.pixelWritten,(unsigned long long)f.cbWritten,motionComplete?1u:0u,motionDraws,
-            f.motionRefusals,(unsigned long long)f.poolWritten,files?"ok":"failed",directory_.c_str());
+            f.motionRefusals,(unsigned long long)f.poolWritten,files?"ok":"failed",f.reference.status,directory_.c_str());
         if(!files)failed_=true;allocated_-=f.bytesAllocated;
     }
 public:
@@ -445,8 +487,9 @@ public:
             Log::get().note("flat draw pixels: summary status=failed reason=%s qualified=%u unqualified=%u directory=%ls",reason,accepted_,unqualified_,directory_.c_str());
         if(current_){current_->reason=reason;finish(*current_,true);current_.reset();}
         while(!pending_.empty()){pending_.front()->reason=reason;finish(*pending_.front(),true);pending_.pop_front();}armed_=false;}
-    void arm(uint64_t frame) {
+    void arm(uint64_t frame,bool crosshair=false) {
         cancel("rearmed");directory_.clear();accepted_=0;unqualified_=0;failed_=false;shaderBytes_.clear();armed_=true;armFrame_=frame;armMs_=GetTickCount64();
+        crosshair_=crosshair;
         SYSTEMTIME t{};GetSystemTime(&t);wchar_t leaf[128]{};
         const auto root=Config::get().logDir()+L"\\flat_draw_pixels";
         const auto leafFor=[&](uint64_t captureId) {
@@ -454,14 +497,16 @@ public:
             return std::wstring(leaf);
         };
         if(!ensureDirectory(Config::get().logDir())||!ensureDirectory(root)||!createFreshCaptureDirectory(root,leafFor,directory_)){armed_=false;Log::get().note("flat draw pixels: arm refused directory");return;}
-        Log::get().note("flat draw pixels: armed frame=%llu next-two-qualified-frames points=8 window=16 cap=512-draws/frame scene=256 motion=256 stride=64 complementary-phases colour-priority=5B4D/4375 within-motion-quota pipeline=original+executed memory=256MiB expiry=900frames/30s directory=%ls",
-            (unsigned long long)frame,directory_.c_str());
+        Log::get().note("flat draw pixels: armed frame=%llu next-two-qualified-frames points=8 window=16 cap=512-draws/frame scene=256 motion=256 stride=64 complementary-phases priority=%s within-motion-quota pipeline=original+executed memory=256MiB expiry=900frames/30s directory=%ls",
+            (unsigned long long)frame,crosshair_?"all-non-depth-writing":"5B4D/4375",directory_.c_str());
+        if(crosshair_)Log::get().note("flat draw pixels: aim=centred-game-crosshair ROI=64x32-render-pixels priority=all-non-depth-writing-within-quota reference=up-to-512x512-SDR-output-crop; aim at surviving less-transparent decoration and hold still; no colour or shader-family assumption");
     }
     void begin(uint64_t frame,const void* priorDepth,unsigned width,unsigned height) {
         if(!armed_||accepted_>=kFrames||current_)return;
         if(frame-armFrame_>900 || GetTickCount64()-armMs_>30000){cancel("arm-expired-no-qualified-frame");return;}
-        if(!priorDepth||width<kWindow||height<kWindow){if(accepted_)cancel("second-frame-prior-source-unavailable");return;}
+        if(!priorDepth||width<(crosshair_?64:kWindow)||height<(crosshair_?32:kWindow)){if(accepted_)cancel("second-frame-prior-source-unavailable");return;}
         current_.reset(new Frame);current_->number=frame;current_->priorDepth=priorDepth;
+        current_->crosshair=crosshair_;if(crosshair_)current_->reference.status="not-observed";
         current_->width=width;current_->height=height;current_->startMs=GetTickCount64();current_->draws.reserve(kDrawCap);
     }
     bool before(ID3D11DeviceContext* ctx,unsigned instances,char kind,uint32_t count,uint32_t start,int32_t base,uint32_t startInstance,
@@ -489,9 +534,9 @@ public:
         if(depthState)depthState->GetDesc(&depthDesc);
         else {depthDesc.DepthEnable=TRUE;depthDesc.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;}
         const bool scene=depthDesc.DepthEnable&&depthDesc.DepthWriteMask==D3D11_DEPTH_WRITE_MASK_ALL;
-        // A source candidate may be a depth-write-off decal. Keep a separate
-        // quota so it cannot be displaced by the scene's numerous opaque draws.
-        const bool priority=flatDrawColourDecalCandidate(vs,ps);
+        // Non-depth-writing contributors share the existing motion quota;
+        // priority bypasses stride, not that quota or the matching-depth gate.
+        const bool priority=f.crosshair?!scene:flatDrawColourDecalCandidate(vs,ps);
         if(!scene&&!motionEligible&&!priority)return false;
         if(!f.admission.consider(motionEligible||priority,f.number,priority))return false;
         Draw d;d.q=f.drawsSeen;d.instances=instances;d.kind=kind;d.count=count;d.start=start;d.base=base;d.startInstance=startInstance;
@@ -592,6 +637,35 @@ public:
         f.qualified=true;f.selectedDepth=selectedDepth;f.selectedHdr=selectedHdr;
         f.identity=(selectedDepth==f.priorDepth&&w==f.width&&h==f.height);
         f.reason=f.identity?"qualified":"prior-depth-or-extent-mismatch";
+    }
+    // Called before real Present, never after a flip. This bounded colour crop
+    // is a same-frame visual reference, not a detector of crosshair geometry.
+    void reference(ID3D11DeviceContext* ctx,uint64_t frame,ID3D11Texture2D* output) {
+        if(!active()||!ctx||!current_->crosshair||current_->number!=frame||
+           !current_->qualified||!current_->identity)return;
+        Frame& f=*current_;auto& ref=f.reference;
+        if(std::strcmp(ref.status,"not-observed"))return;
+        if(!output){ref.status="output-unavailable";return;}
+        D3D11_TEXTURE2D_DESC td{};output->GetDesc(&td);
+        ref.outputWidth=td.Width;ref.outputHeight=td.Height;ref.format=td.Format;
+        if(td.SampleDesc.Count!=1||td.ArraySize!=1||td.MipLevels!=1||
+           (td.Format!=DXGI_FORMAT_R8G8B8A8_UNORM&&td.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB&&
+            td.Format!=DXGI_FORMAT_B8G8R8A8_UNORM&&td.Format!=DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+            ref.status="unsupported-output";return;
+        }
+        ref.width=std::min(512u,td.Width);ref.height=std::min(512u,td.Height);
+        ref.x=td.Width/2-ref.width/2;ref.y=td.Height/2-ref.height/2;
+        ref.allocation=uint64_t(ref.width)*ref.height*8; // staging plus packed readback
+        if(!reserve(f,ref.allocation)){ref.allocation=0;ref.status="budget-cap";return;}
+        td.Width=ref.width;td.Height=ref.height;td.Usage=D3D11_USAGE_STAGING;
+        td.BindFlags=td.MiscFlags=0;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+        Ptr<ID3D11Device> dev;ctx->GetDevice(&dev);
+        if(FAILED(dev->CreateTexture2D(&td,nullptr,&ref.stage))) {
+            allocated_-=ref.allocation;f.bytesAllocated-=ref.allocation;ref.allocation=0;
+            ref.status="create-failed";return;
+        }
+        const D3D11_BOX box{ref.x,ref.y,0,ref.x+ref.width,ref.y+ref.height,1};
+        ctx->CopySubresourceRegion(ref.stage.Get(),0,0,0,0,output,0,&box);ref.status="queued";
     }
     // `live` false: the completed frame reset, or ran at phase (0,0). Its constants are ones no live
     // frame has (the camera rows carry no phase), so it is not a sample: the two frames right after an

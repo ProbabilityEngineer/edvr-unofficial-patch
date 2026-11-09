@@ -127,6 +127,8 @@ void flatRuntimeReplayQueryEnd(ID3D11DeviceContext*, ID3D11Asynchronous*);
 // F10-only retained DSV clear chronology; called before the real clear.
 void flatRuntimeWeaponFootprintClear(ID3D11DepthStencilView*, UINT clearFlags, UINT8 stencil);
 void flatRuntimeWeaponFootprintBeforePresent(IDXGISwapChain*, UINT flags);
+// Same-frame output reference for crosshair-aimed draw discovery.
+void flatRuntimeDrawCaptureBeforePresent(IDXGISwapChain*, UINT flags);
 // A hooked call of the kind flat_substitution.h names has come, or the frame is ending: put the game's state back where
 // engine motion's substitution is still bound (a lazy run of substituted producer draws), or forget it (the context
 // lost its state). Every hook of that kind calls this before its real call; a load and a compare when nothing of EDVR's
