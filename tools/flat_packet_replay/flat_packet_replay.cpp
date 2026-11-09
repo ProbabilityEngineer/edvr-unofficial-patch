@@ -1,4 +1,4 @@
-// Offline diagnostics only. Reads original capture inputs; never loads the proxy DLL.
+// Offline diagnostics only. Reads captured pipeline inputs; never loads the proxy DLL.
 #include <windows.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -209,14 +209,24 @@ void write(const std::filesystem::path& p,const Bytes& b) {
     f.write(reinterpret_cast<const char*>(b.data()),b.size());
     if(!f)throw std::runtime_error("output write");
 }
-int run(Recipe& x,const std::filesystem::path& out) {
+int run(Recipe& x,const std::filesystem::path& out,bool comparison=false,bool hardware=false) {
     auto dll=LoadLibraryExW(L"d3d11.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
     if(!dll)throw std::runtime_error("system d3d11");
     auto create=reinterpret_cast<decltype(&D3D11CreateDevice)>(GetProcAddress(dll,"D3D11CreateDevice"));
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     D3D_FEATURE_LEVEL fl;
-    check(create(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&dev,&fl,&ctx),"WARP device");
+    const D3D_FEATURE_LEVEL levels[]={D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0};
+    check(create(nullptr,hardware?D3D_DRIVER_TYPE_HARDWARE:D3D_DRIVER_TYPE_WARP,nullptr,0,
+                 comparison?levels:nullptr,comparison?2:0,D3D11_SDK_VERSION,&dev,&fl,&ctx),"requested replay device");
+    std::cout<<"driver_request="<<(hardware?"hardware":"WARP")<<" feature_level="<<fl<<"\n";
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC adapterDesc{};
+    check(dev.As(&dxgi),"DXGI device");
+    check(dxgi->GetAdapter(&adapter),"replay adapter");
+    check(adapter->GetDesc(&adapterDesc),"replay adapter description");
+    std::wcout<<L"adapter="<<adapterDesc.Description<<L"\n";
     ComPtr<ID3D11DeviceContext1> ctx1;
     check(ctx.As(&ctx1),"context1");
     for(auto& kv:x.resources) {
@@ -254,7 +264,7 @@ int run(Recipe& x,const std::filesystem::path& out) {
         std::cout<<"created "<<r.name<<"\n";
     }
     auto& f=x.fields;
-    for(UINT i=1;i<8;++i)if(f.count("OM.RTV"+std::to_string(i)+".resource"))throw std::runtime_error("multiple original render targets unsupported");
+    for(UINT i=1;i<8;++i)if(!comparison&&f.count("OM.RTV"+std::to_string(i)+".resource"))throw std::runtime_error("multiple original render targets unsupported");
     auto res=[&](const std::string& key)->Resource& {
         return x.resources.at(UINT(std::stoul(f.at(key))));
     };
@@ -269,7 +279,13 @@ int run(Recipe& x,const std::filesystem::path& out) {
     for(auto forbidden: {
         "discard","oDepth","oMask","SV_Depth","SV_Coverage"
     }
-    )if(disasm.find(forbidden)!=std::string::npos)throw std::runtime_error("PS invalidates solid passing-fragment proof");
+    )if(!comparison&&disasm.find(forbidden)!=std::string::npos)throw std::runtime_error("PS invalidates solid passing-fragment proof");
+    if(comparison) {
+        for(auto stage:{"VS","PS"})if(pod<UINT>(f.at(std::string(stage)+".classCount")))
+            throw std::runtime_error("dynamic shader linkage unsupported");
+        for(const auto& field:f)if(field.first.find("OM.UAV")==0&&field.first.find(".resource")!=std::string::npos)
+            throw std::runtime_error("OM UAV replay unsupported");
+    }
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
     check(dev->CreateVertexShader(x.vs.data(),x.vs.size(),nullptr,&vs),"VS create");
@@ -336,7 +352,7 @@ int run(Recipe& x,const std::filesystem::path& out) {
     auto color=as<ID3D11Texture2D>(res("OM.RTV0.resource")),depth=as<ID3D11Texture2D>(res("OM.DSV.resource"));
     D3D11_TEXTURE2D_DESC originalColorDesc{};
     color->GetDesc(&originalColorDesc);
-    if(originalColorDesc.Format!=DXGI_FORMAT_R11G11B10_FLOAT)throw std::runtime_error("diagnostic requires HDR R11G11B10_FLOAT target");
+    if(!comparison&&originalColorDesc.Format!=DXGI_FORMAT_R11G11B10_FLOAT)throw std::runtime_error("diagnostic requires HDR R11G11B10_FLOAT target");
     auto rtvDesc=pod<D3D11_RENDER_TARGET_VIEW_DESC>(f.at("OM.RTV0.view"));
     auto dsvDesc=pod<D3D11_DEPTH_STENCIL_VIEW_DESC>(f.at("OM.DSV.view"));
     ComPtr<ID3D11RenderTargetView> rtv;
@@ -344,7 +360,7 @@ int run(Recipe& x,const std::filesystem::path& out) {
     check(dev->CreateRenderTargetView(color.Get(),&rtvDesc,&rtv),"RTV create");
     check(dev->CreateDepthStencilView(depth.Get(),&dsvDesc,&dsv),"DSV create");
     auto blendDesc=pod<D3D11_BLEND_DESC>(f.at("OM.blend"));
-    if(blendDesc.AlphaToCoverageEnable)throw std::runtime_error("A2C invalidates solid footprint");
+    if(!comparison&&blendDesc.AlphaToCoverageEnable)throw std::runtime_error("A2C invalidates solid footprint");
     ComPtr<ID3D11BlendState> blend;
     check(dev->CreateBlendState(&blendDesc,&blend),"blend create");
     auto ds=pod<D3D11_DEPTH_STENCIL_DESC>(f.at("OM.depthStencil"));
@@ -365,6 +381,84 @@ int run(Recipe& x,const std::filesystem::path& out) {
     auto ref=pod<UINT>(f.at("OM.stencilRef"));
     ctx->OMSetBlendState(blend.Get(),factors.data(),sample);
     ctx->OMSetDepthStencilState(dsState.Get(),ref);
+    if(comparison) {
+        // Preserve the captured targets (including private MRT6), masks and
+        // shaders. No replacement solid shader or altered depth test is used.
+        if(f.count("OM.blend1")) {
+            auto desc=pod<D3D11_BLEND_DESC1>(f.at("OM.blend1"));
+            for(auto& target:desc.RenderTarget)if(target.LogicOpEnable)
+                throw std::runtime_error("logic-op replay unsupported");
+        }
+        std::array<ComPtr<ID3D11RenderTargetView>,8> views;
+        ID3D11RenderTargetView* raw[8]{};
+        UINT slots=0;
+        std::vector<std::pair<std::string,Resource*>> outputs;
+        for(UINT i=0;i<8;++i) {
+            auto name="OM.RTV"+std::to_string(i);
+            if(!f.count(name+".resource"))continue;
+            auto& resource=res(name+".resource");
+            auto desc=pod<D3D11_RENDER_TARGET_VIEW_DESC>(f.at(name+".view"));
+            check(dev->CreateRenderTargetView(resource.gpu.Get(),&desc,&views[i]),"comparison RTV");
+            raw[i]=views[i].Get();slots=i+1;
+            outputs.emplace_back(name,&resource);
+        }
+        outputs.emplace_back("OM.DSV",&res("OM.DSV.resource"));
+        std::filesystem::create_directories(out);
+        for(auto& output:outputs) {
+            auto texture=as<ID3D11Texture2D>(*output.second);
+            auto initial=readback(dev.Get(),ctx.Get(),texture.Get(),output.second->parts.at(0).row);
+            if(initial!=output.second->parts[0].load())
+                throw std::runtime_error("initial upload/readback mismatch: "+output.first);
+            write(out/(output.first+".before.bin"),initial);
+        }
+        D3D11_QUERY_DESC queryDesc{D3D11_QUERY_PIPELINE_STATISTICS,0};
+        ComPtr<ID3D11Query> query;
+        check(dev->CreateQuery(&queryDesc,&query),"pipeline statistics");
+        ctx->OMSetRenderTargets(slots,raw,dsv.Get());
+        ctx->Begin(query.Get());
+        ctx->DrawIndexedInstanced(x.count,x.instances,x.start,x.base,x.startInstance);
+        ctx->End(query.Get());
+        ctx->OMSetRenderTargets(0,nullptr,nullptr);
+        D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
+        ctx->Flush();
+        const auto started=GetTickCount64();
+        HRESULT ready;
+        while((ready=ctx->GetData(query.Get(),&stats,sizeof(stats),0))==S_FALSE) {
+            if(GetTickCount64()-started>30000)throw std::runtime_error("query timeout");
+            Sleep(1);
+        }
+        check(ready,"pipeline statistics read");
+        std::ofstream report(out/"comparison.json");
+        // Some backends acknowledge pipeline-statistics queries with dummy
+        // zeroes. For a nonempty draw those are not evidence of no execution.
+        report<<"{\"driver_request\":\""<<(hardware?"hardware":"WARP")<<"\",\"feature_level\":"<<fl
+              <<",\"pipeline_statistics_observed\":"<<(stats.IAVertices||stats.VSInvocations?"true":"false")
+              <<",\"ia_vertices\":"<<stats.IAVertices<<",\"vs_invocations\":"<<stats.VSInvocations
+              <<",\"clip_primitives\":"<<stats.CPrimitives<<",\"ps_invocations\":"<<stats.PSInvocations
+              <<",\"outputs\":[";
+        bool first=true;
+        for(auto& output:outputs) {
+            auto texture=as<ID3D11Texture2D>(*output.second);
+            auto actual=readback(dev.Get(),ctx.Get(),texture.Get(),output.second->parts.at(0).row);
+            auto before=output.second->parts[0].load();
+            Resource* captured=nullptr;
+            for(auto& kv:x.resources)if(kv.second.name==output.first+".after")captured=&kv.second;
+            if(!captured)throw std::runtime_error("captured after snapshot absent");
+            auto expected=captured->parts.at(0).load();
+            if(before.size()!=actual.size()||expected.size()!=actual.size())throw std::runtime_error("comparison layout");
+            uint64_t changed=0,mismatch=0;
+            for(size_t i=0;i<actual.size();++i){changed+=actual[i]!=before[i];mismatch+=actual[i]!=expected[i];}
+            write(out/(output.first+".after.bin"),actual);
+            if(!first)report<<",";
+            first=false;
+            report<<"{\"name\":\""<<output.first<<"\",\"changed_bytes\":"<<changed
+                  <<",\"captured_after_mismatch_bytes\":"<<mismatch<<"}";
+        }
+        report<<"]}\n";
+        if(!report)throw std::runtime_error("comparison report write");
+        std::cout<<"comparison complete; consult captured-after parity before attribution\n";
+        return 0;
+    }
     ctx->OMSetRenderTargets(1,rtv.GetAddressOf(),dsv.Get());
     auto beforeColor=res("OM.RTV0.resource").parts[0].load();
     auto beforeDepth=res("OM.DSV.resource").parts[0].load();
@@ -450,14 +544,14 @@ int run(Recipe& x,const std::filesystem::path& out) {
     std::cout<<"mask "<<stats.marked<<"/"<<pixels.size()<<" color mismatches "<<parityChanged<<" DSV exact "<<(actualDepth==expectedDepth)<<"\n";
     return 0;
 }
-void gpuSelfTest() {
+void gpuSelfTest(bool hardware=false) {
     auto dll=LoadLibraryExW(L"d3d11.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
     auto create=reinterpret_cast<decltype(&D3D11CreateDevice)>(GetProcAddress(dll,"D3D11CreateDevice"));
     if(!create)throw std::runtime_error("system D3D11 factory");
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     D3D_FEATURE_LEVEL feature;
-    check(create(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&dev,&feature,&ctx),"self-test WARP");
+    check(create(nullptr,hardware?D3D_DRIVER_TYPE_HARDWARE:D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&dev,&feature,&ctx),"self-test requested device");
     const char* vsText="float4 main(uint id:SV_VertexID):SV_Position {float2 p[3]={float2(-1,-1),float2(-1,3),float2(3,-1)};return float4(p[id],.5,1);}";
     const char* psText="float4 main():SV_Target0{return 1;}";
     ComPtr<ID3DBlob> vsCode,psCode,error;
@@ -531,14 +625,16 @@ void gpuSelfTest() {
         ctx->OMSetRenderTargets(0,nullptr,nullptr);
         auto result=readback(dev.Get(),ctx.Get(),mask.Get(),8);
         auto measured=maskStats(result,8,8);
-        if(measured.marked!=(scenario==0?64:0))throw std::runtime_error("WARP depth/stencil mask mismatch");
-        if(readback(dev.Get(),ctx.Get(),gameDepth.Get(),32)!=original)throw std::runtime_error("WARP replay mutated game DSV");
+        if(measured.marked!=(scenario==0?64:0))throw std::runtime_error("depth/stencil mask mismatch");
+        if(readback(dev.Get(),ctx.Get(),gameDepth.Get(),32)!=original)throw std::runtime_error("replay mutated source DSV");
     }
 }
 int main(int argc,char** argv) {
     try {
-        if(argc==2&&std::string(argv[1])=="--self-test") {
-            gpuSelfTest();
+        if((argc==2||argc==3)&&std::string(argv[1])=="--self-test") {
+            const bool hardware=argc==3&&std::string(argv[2])=="--hardware";
+            if(argc==3&&!hardware)throw std::runtime_error("unknown self-test option");
+            gpuSelfTest(hardware);
             Bytes b(12);
             b[1]=b[10]=255;
             auto s=maskStats(b,4,3);
@@ -550,16 +646,25 @@ int main(int argc,char** argv) {
             catch(const std::runtime_error& e) {
                 if(std::string(e.what())=="accepted short POD")throw;
             }
-            std::cout<<"flat packet replay C++ self-test: PASS\n";
+            std::cout<<"flat packet replay C++ self-test: PASS driver_request="<<(hardware?"hardware":"WARP")<<"\n";
             return 0;
         }
-        if(argc!=3 && !(argc==4 && std::string(argv[3])=="--dry-run"))throw std::runtime_error("usage: runner recipe output-directory [--dry-run]");
+        if(argc<3)throw std::runtime_error("usage: runner recipe output-directory [--dry-run] [--comparison] [--hardware]");
+        bool dry=false,comparison=false,hardware=false;
+        for(int i=3;i<argc;++i) {
+            std::string option=argv[i];
+            if(option=="--dry-run")dry=true;
+            else if(option=="--comparison")comparison=true;
+            else if(option=="--hardware")hardware=true;
+            else throw std::runtime_error("unknown replay option");
+        }
+        if(hardware&&!comparison)throw std::runtime_error("hardware request requires comparison mode");
         auto recipe=load(std::filesystem::u8path(argv[1]));
-        if(argc==4) {
+        if(dry) {
             std::cout<<"replay recipe readable; dry-run writes nothing\n";
             return 0;
         }
-        return run(recipe,std::filesystem::u8path(argv[2]));
+        return run(recipe,std::filesystem::u8path(argv[2]),comparison,hardware);
     }
     catch(const std::exception& e) {
         std::cerr<<"replay: "<<e.what()<<"\n";
