@@ -20,14 +20,14 @@ def publish(root, command, dataset="-", first=0, last=0, dry_run=False):
     root = Path(root)
     if not root.is_dir():
         raise ValueError("--log-dir must be an existing EDVR log directory")
-    if command not in ("discover", "test", "pairs", "cancel"):
+    if command not in ("discover", "test", "pairs", "unpatch", "cancel"):
         raise ValueError("unknown command")
-    if command in ("test", "pairs"):
+    if command in ("test", "pairs", "unpatch"):
         token(dataset)
         if not 1 <= first <= last <= 8192:
             raise ValueError("group/pair range must be within 1..8192")
     elif (dataset, first, last) != ("-", 0, 0):
-        raise ValueError("only test/pairs accept a dataset and range")
+        raise ValueError("only test/pairs/unpatch accept a dataset and range")
     request = uuid.uuid4().hex
     payload = f"EDVR_ISOLATE_V1 {int(time.time())} {request} {command} {dataset} {first} {last}\n"
     if not dry_run:
@@ -65,8 +65,10 @@ def report(root, request, preview=None, dry_run=False):
         for x in pairs:
             if any(not re.fullmatch(r"[0-9a-f]{1,16}", x[k]) for k in ("vs", "ps")):
                 raise ValueError("invalid pair shader hash")
-            if not 0 <= x["masked"] <= x["selected"] <= x["seen"]:
+            if not 0 <= x["masked"] <= x["selected"] <= x["seen"] or x.get("withheld", 0) < 0:
                 raise ValueError("invalid issued-call accounting")
+        if data.get("withheld_patches", 0) != sum(x.get("withheld", 0) for x in pairs):
+            raise ValueError("withheld count mismatch")
         if any(not 1 <= g["pair"] <= len(pairs) for g in groups):
             raise ValueError("group references an unknown pair")
     for g in groups:
@@ -95,7 +97,8 @@ def report(root, request, preview=None, dry_run=False):
         if im["bytes"] != w * h * 4 or payload.stat().st_size != im["bytes"]:
             raise ValueError("invalid image byte count")
         pictures.append((im, payload.read_bytes()))
-    if data["test_complete"] and (not data["masked_issues"] or len(pictures) != 3 or data["reason"] != "test-ended"):
+    acted = data.get("withheld_patches", 0) if data.get("command") == "unpatch" else data["masked_issues"]
+    if data["test_complete"] and (not acted or len(pictures) != 3 or data["reason"] != "test-ended"):
         raise ValueError("false completion claim")
     if preview is not None:
         preview = Path(preview).resolve()
@@ -165,6 +168,7 @@ def self_test():
         collision.unlink()
         publish(root, "test", request, 1, 8192, dry_run=True)
         publish(root, "pairs", request, 1, 8192, dry_run=True)
+        publish(root, "unpatch", request, 1, 1, dry_run=True)
         try:
             publish(root, "pairs", dry_run=True)
             raise AssertionError("pairs accepted without dataset")
@@ -183,9 +187,9 @@ def self_test():
             except ValueError:
                 pass
         assert not list(root.iterdir())
-        for command in ("discover", "test", "pairs", "cancel"):
+        for command in ("discover", "test", "pairs", "unpatch", "cancel"):
             arguments = [command, "--log-dir", tmp, "--dry-run"]
-            if command in ("test", "pairs"):
+            if command in ("test", "pairs", "unpatch"):
                 arguments += ["--dataset", request, "--first", "1", "--last", "2"]
             with contextlib.redirect_stdout(io.StringIO()):
                 main(arguments)
@@ -224,12 +228,25 @@ def self_test():
             raise AssertionError("accepted pair accounting mismatch")
         except ValueError:
             pass
+        # An unpatch trial masks nothing; it completes on withheld substitutions.
+        manifest.update(command="unpatch", masked_issues=0, withheld_patches=4)
+        manifest["pairs"][0].update(masked=0, withheld=4)
+        manifest["groups"][0].update(masked=0)
+        path.write_text(json.dumps(manifest))
+        report(root, request)
+        manifest["withheld_patches"] = 3
+        path.write_text(json.dumps(manifest))
+        try:
+            report(root, request)
+            raise AssertionError("accepted withheld count mismatch")
+        except ValueError:
+            pass
     print("flat_draw_isolation self-test: passed")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("discover", "test", "pairs", "cancel", "report"))
+    parser.add_argument("command", nargs="?", choices=("discover", "test", "pairs", "unpatch", "cancel", "report"))
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--dataset", default="-")
     parser.add_argument("--first", type=int, default=0)

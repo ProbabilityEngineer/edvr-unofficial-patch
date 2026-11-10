@@ -75,6 +75,7 @@ steady. Replace `LOG_DIR` below with the existing game's `edvr_logs` directory:
 python tools/flat_draw_isolation.py discover --log-dir LOG_DIR
 python tools/flat_draw_isolation.py pairs --log-dir LOG_DIR --dataset DATASET_ID --first 1 --last PAIR_NUMBER
 python tools/flat_draw_isolation.py test --log-dir LOG_DIR --dataset DATASET_ID --first 1 --last GROUP_NUMBER
+python tools/flat_draw_isolation.py unpatch --log-dir LOG_DIR --dataset DATASET_ID --first PAIR --last PAIR
 python tools/flat_draw_isolation.py report --log-dir LOG_DIR --id TEST_ID --preview-dir NEW_OUTPUT_DIR
 python tools/flat_draw_isolation.py cancel --log-dir LOG_DIR
 ```
@@ -89,6 +90,12 @@ pair is isolated, use `test` with that pair's groups to narrow further. Use
 arguments and counts. Fine group signatures do not match across frames for
 draws whose other bindings or arguments change; check each group's `seen` count
 and `unknown_signatures` before reading a `test` result as negative.
+
+`unpatch` selects pairs like `pairs` but masks nothing: for the trial it
+withholds EDVR's engine-motion shader substitution (the MRT6 motion export)
+from the selected pairs, so the game's own shader draws while temporal AA keeps
+running. `withheld_patches` counts substitutions withheld; zero means engine
+motion never offered to patch those pairs during the trial.
 IDs remain tied to that frozen discovery, not subsequent draw order; rediscover
 after a view/scene change. A dataset expires after five minutes and is invalidated
 by the cancel command, resize, device/context or profile change. Requests expire after

@@ -58,7 +58,9 @@ struct FlatIsolationRequest {
         if(r.command=="discover"||r.command=="cancel")return r.dataset=="-"&&!r.first&&!r.last;
         // "test" selects fine signature groups; "pairs" selects VS/PS shader pairs,
         // which stay stable across frames when per-frame instance offsets do not.
-        return (r.command=="test"||r.command=="pairs")&&token(r.dataset)&&r.first&&r.first<=r.last&&r.last<=8192;
+        // "unpatch" selects pairs too, but writes are NOT masked: only EDVR's
+        // engine-motion shader substitution is withheld for them.
+        return (r.command=="test"||r.command=="pairs"||r.command=="unpatch")&&token(r.dataset)&&r.first&&r.first<=r.last&&r.last<=8192;
     }
 };
 
@@ -73,7 +75,7 @@ public:
     static constexpr unsigned kKeyCap=8192,kFrameCap=240;
     static constexpr uint64_t kMaskMs=2000,kHardMs=5000,kDatasetMs=300000,kByteCap=8ull*1024*1024;
     struct Group {FlatIsolationKey key;unsigned pair=0,discovered=0,seen=0,selected=0,masked=0,refused=0;};
-    struct Pair {uint64_t vs=0,ps=0;unsigned discovered=0,seen=0,selected=0,masked=0,refused=0;};
+    struct Pair {uint64_t vs=0,ps=0;unsigned discovered=0,seen=0,selected=0,masked=0,refused=0,withheld=0;};
     // pair!=0 means selected. group is 0 when a pair test meets an unknown fine signature.
     struct Ticket {unsigned group=0,pair=0;uint64_t generation=0;};
 private:
@@ -97,7 +99,8 @@ private:
     std::map<FlatIsolationKey,unsigned> index_;
     std::vector<Pair> pairs_;
     std::map<std::array<uint64_t,2>,unsigned> pairIndex_;
-    bool byPair() const {return command_=="pairs";}
+    bool byPair() const {return command_=="pairs"||command_=="unpatch";}
+    bool unpatching() const {return command_=="unpatch";}
     std::map<std::array<uint64_t,3>,unsigned> excluded_;
     std::array<FlatOutputReference,3> images_;
     std::array<uint64_t,3> imageFrames_{};
@@ -168,24 +171,24 @@ private:
         },[&](uint64_t n){bytes_-=n;});
     }
     void finish() {
-        unsigned masked=0,selected=0;
-        for(const auto& p:pairs_){masked+=p.masked;selected+=p.selected;}
+        unsigned masked=0,selected=0,withheld=0;
+        for(const auto& p:pairs_){masked+=p.masked;selected+=p.selected;withheld+=p.withheld;}
         for(auto& im:images_)if(!std::strcmp(im.status,"queued"))im.status="timeout";
         const bool pictures=std::all_of(images_.begin(),images_.end(),[](const FlatOutputReference& i){
             return !std::strcmp(i.status,"ok");});
         std::ostringstream out;
         out<<"{\"schema\":\"edvr-flat-draw-isolation-v1\",\"request\":\""<<request_
            <<"\",\"dataset\":\""<<dataset_<<"\",\"command\":\""<<command_<<"\",\"reason\":\""<<reason_
-           <<"\",\"test_complete\":"<<((command_=="test"||command_=="pairs")&&reason_=="test-ended"&&masked&&pictures?"true":"false")
+           <<"\",\"test_complete\":"<<((((command_=="test"||command_=="pairs")&&masked)||(command_=="unpatch"&&withheld))&&reason_=="test-ended"&&pictures?"true":"false")
            <<",\"visual_effect\":\"unassessed\",\"duration_ms\":"<<clock_()-start_
-           <<",\"first\":"<<first_<<",\"last\":"<<last_<<",\"selected_calls\":"<<selected<<",\"masked_issues\":"<<masked
+           <<",\"first\":"<<first_<<",\"last\":"<<last_<<",\"selected_calls\":"<<selected<<",\"masked_issues\":"<<masked<<",\"withheld_patches\":"<<withheld
            <<",\"unsupported_calls\":"<<unsupported_<<",\"unsafe_calls\":"<<unsafe_<<",\"unknown_signatures\":"<<unknown_
            <<",\"unknown_pairs\":"<<unknownPairs_
            <<",\"signature_semantics\":\"shader/arguments/bindings group, not unique object identity\",\"pairs\":[";
         for(size_t i=0;i<pairs_.size();++i){
             if(i)out<<',';const auto& p=pairs_[i];
             out<<"{\"id\":"<<i+1<<",\"vs\":\""<<std::hex<<p.vs<<"\",\"ps\":\""<<p.ps<<std::dec<<"\",\"discovered\":"<<p.discovered
-               <<",\"seen\":"<<p.seen<<",\"selected\":"<<p.selected<<",\"masked\":"<<p.masked<<",\"refused\":"<<p.refused<<"}";
+               <<",\"seen\":"<<p.seen<<",\"selected\":"<<p.selected<<",\"masked\":"<<p.masked<<",\"refused\":"<<p.refused<<",\"withheld\":"<<p.withheld<<"}";
         }
         out<<"],\"groups\":[";
         for(size_t i=0;i<groups_.size();++i){
@@ -234,7 +237,7 @@ private:
         if(conflict||(mode_!=Mode::Idle&&mode_!=Mode::Ready)){
             Log::get().note("flat draw isolation: refused busy/capture-active request=%s",r.id.c_str());return;
         }
-        if(r.command!="discover"&&(dataset_!=r.dataset||now>datasetUntil_||r.last>(r.command=="pairs"?pairs_.size():groups_.size()))){
+        if(r.command!="discover"&&(dataset_!=r.dataset||now>datasetUntil_||r.last>(r.command=="test"?groups_.size():pairs_.size()))){
             Log::get().note("flat draw isolation: refused stale dataset or group range request=%s",r.id.c_str());return;
         }
         if(!newDirectory(r.id)){Log::get().note("flat draw isolation: refused output directory");return;}
@@ -246,11 +249,11 @@ private:
             groups_.clear();index_.clear();pairs_.clear();pairIndex_.clear();dataset_.clear();mode_=Mode::Discover;discoveredThisPresent_=true;
         } else {
             for(auto& g:groups_)g.seen=g.selected=g.masked=g.refused=0;
-            for(auto& p:pairs_)p.seen=p.selected=p.masked=p.refused=0;
+            for(auto& p:pairs_)p.seen=p.selected=p.masked=p.refused=p.withheld=0;
             mode_=Mode::Baseline;
         }
-        Log::get().note("flat draw isolation: armed request=%s command=%s groups=%u..%u selection=%s automatic-restore=2s/240frames hard-limit=5s Escape=cancels; no rendering config changed",
-            request_.c_str(),command_.c_str(),first_,last_,byPair()?"shader-pairs":"signature-groups");
+        Log::get().note("flat draw isolation: armed request=%s command=%s groups=%u..%u selection=%s%s automatic-restore=2s/240frames hard-limit=5s Escape=cancels; no rendering config changed",
+            request_.c_str(),command_.c_str(),first_,last_,byPair()?"shader-pairs":"signature-groups",unpatching()?" (engine-motion patch withheld, writes untouched)":"");
     }
 public:
     bool observing() const {return mode_==Mode::Discover||mode_==Mode::Mask;}
@@ -320,7 +323,19 @@ public:
         const unsigned selector=byPair()?pit->second:(g?it->second:0);
         if(!selector||selector<first_||selector>last_)return {};
         ++p.selected;if(g)++g->selected;
+        if(unpatching())return {}; // the draw's writes are untouched; withholdsPatch() did the work
         return {g?it->second:0,pit->second,generation_};
+    }
+    // Engine motion asks this before substituting its patched shader for a keyed
+    // pair. True only during an "unpatch" trial for a selected pair, on the
+    // experiment's own thread/context. Counts the substitutions withheld.
+    bool withholdsPatch(ID3D11DeviceContext* ctx,uint64_t vs,uint64_t ps) {
+        if(mode_!=Mode::Mask||!unpatching()||ctx!=context_||GetCurrentThreadId()!=thread_)return false;
+        tick(clock_());
+        if(mode_!=Mode::Mask)return false;
+        const auto pit=pairIndex_.find(std::array<uint64_t,2>{vs,ps});
+        if(pit==pairIndex_.end()||pit->second<first_||pit->second>last_)return false;
+        ++pairs_[pit->second-1].withheld;return true;
     }
     template<class Issue>
     bool issue(Ticket ticket,ID3D11DeviceContext* ctx,stationmask::SetBlendFn blend,stationmask::SetDepthFn depth,Issue actual) {

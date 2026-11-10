@@ -36,6 +36,7 @@
 #include "exposure_fix.h"   // lookupShaderHash: the PS shadow probe reads the registry
 #include "flat_compute_readback.h"
 #include "flat_query_cut.h"   // the flat bracket's kept answers, and the sampled check of each
+#include "flat_draw_isolation.h"   // TEMPORARY diagnostic: the "unpatch" trial withholds a selected pair's substitution
 #include "kinematic_eval_hook.h"
 #include "kinematic_eval_probe.h"
 #include "object_record_writer_hook.h"   // objectRecordWriterHookMatches: the lookup's prologue may be the record-writer hook's
@@ -1864,6 +1865,11 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // vertex patch where the family needs one. Nothing -- slot target, clear,
     // snapshot, MRT6 -- is prepared for a draw that cannot export ownership;
     // a declined draw puts the game's state back, as before.
+    // TEMPORARY diagnostic (flat_draw_isolation.h "unpatch"): a selected pair keeps the game's own shader for the trial.
+    if (runtimeFlatProfile() && keyedPs(f, psHash, true) && flatDrawIsolation().withholdsPatch(ctx, vsHash, psHash)) {
+        restore(ctx);
+        return;
+    }
     if (!keyedPs(f, psHash, runtimeFlatProfile())) {
         if (selfMarkPs) {
             // Compatibility path for a marker-bearing shader: latch target
