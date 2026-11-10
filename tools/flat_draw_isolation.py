@@ -20,14 +20,14 @@ def publish(root, command, dataset="-", first=0, last=0, dry_run=False):
     root = Path(root)
     if not root.is_dir():
         raise ValueError("--log-dir must be an existing EDVR log directory")
-    if command not in ("discover", "test", "cancel"):
+    if command not in ("discover", "test", "pairs", "cancel"):
         raise ValueError("unknown command")
-    if command == "test":
+    if command in ("test", "pairs"):
         token(dataset)
         if not 1 <= first <= last <= 8192:
-            raise ValueError("group range must be within 1..8192")
+            raise ValueError("group/pair range must be within 1..8192")
     elif (dataset, first, last) != ("-", 0, 0):
-        raise ValueError("only test accepts a dataset and range")
+        raise ValueError("only test/pairs accept a dataset and range")
     request = uuid.uuid4().hex
     payload = f"EDVR_ISOLATE_V1 {int(time.time())} {request} {command} {dataset} {first} {last}\n"
     if not dry_run:
@@ -58,13 +58,28 @@ def report(root, request, preview=None, dry_run=False):
     groups = data["groups"]
     if len(groups) > 8192 or [g["id"] for g in groups] != list(range(1, len(groups) + 1)):
         raise ValueError("invalid group IDs")
+    pairs = data.get("pairs")
+    if pairs is not None:
+        if len(pairs) > len(groups) or [x["id"] for x in pairs] != list(range(1, len(pairs) + 1)):
+            raise ValueError("invalid pair IDs")
+        for x in pairs:
+            if any(not re.fullmatch(r"[0-9a-f]{1,16}", x[k]) for k in ("vs", "ps")):
+                raise ValueError("invalid pair shader hash")
+            if not 0 <= x["masked"] <= x["selected"] <= x["seen"]:
+                raise ValueError("invalid issued-call accounting")
+        if any(not 1 <= g["pair"] <= len(pairs) for g in groups):
+            raise ValueError("group references an unknown pair")
     for g in groups:
         if len(g["key"]) != 18 or any(not re.fullmatch(r"[0-9a-f]{1,16}", x) for x in g["key"]):
             raise ValueError("invalid signature")
         if not 0 <= g["masked"] <= g["selected"] <= g["seen"]:
             raise ValueError("invalid issued-call accounting")
-    if data["masked_issues"] != sum(g["masked"] for g in groups):
+    # Pairs own the accounting when present: a pair test can mask a draw whose
+    # fine signature was never discovered.
+    if data["masked_issues"] != sum(x["masked"] for x in (pairs if pairs is not None else groups)):
         raise ValueError("masked count mismatch")
+    if pairs is not None and sum(g["masked"] for g in groups) > data["masked_issues"]:
+        raise ValueError("group masked count exceeds total")
     pictures = []
     if len(data["images"]) != 3:
         raise ValueError("expected normal/suppressed/restored references")
@@ -107,7 +122,7 @@ def describe_group(group):
         "vs": f"{w[0]:016X}", "ps": f"{w[1]:016X}", "kind": chr(w[2] & 255),
         "count": (w[2] >> 8) & 0xffffffff, "topology": w[2] >> 40,
         "start": w[3] & 0xffffffff, "base": base if base < 0x80000000 else base - 0x100000000,
-        "instances": w[4] & 0xffffffff, "start_instance": w[4] >> 32,
+        "instances": w[4] & 0xffffffff,
         "binding_lifetime_ids": {"vb0": w[5], "ib": w[6], "rtv0": w[7], "dsv": w[8],
                                  "layout": w[11], "ps_srvs_0_3": w[12:16], "vb1": w[16]},
     }
@@ -120,9 +135,9 @@ def self_test():
     key = ["0"] * 18
     key[2] = f"{ord('X') | (432 << 8) | (4 << 40):x}"
     key[3] = f"{(0xffffffff << 32) | 4:x}"
-    key[4] = f"{(5 << 32) | 3:x}"
+    key[4] = "3"
     decoded = describe_group({"key": key, "id": 1})
-    assert (decoded["kind"], decoded["count"], decoded["base"], decoded["instances"], decoded["start_instance"]) == ("X", 432, -1, 3, 5)
+    assert (decoded["kind"], decoded["count"], decoded["base"], decoded["instances"]) == ("X", 432, -1, 3)
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         before = list(root.iterdir())
@@ -149,6 +164,12 @@ def self_test():
         assert collision.exists() and collision.read_text() == "another publisher"
         collision.unlink()
         publish(root, "test", request, 1, 8192, dry_run=True)
+        publish(root, "pairs", request, 1, 8192, dry_run=True)
+        try:
+            publish(root, "pairs", dry_run=True)
+            raise AssertionError("pairs accepted without dataset")
+        except ValueError:
+            pass
         for bad in ("../escape", "a" * 33, "A" * 32):
             try:
                 token(bad)
@@ -162,9 +183,9 @@ def self_test():
             except ValueError:
                 pass
         assert not list(root.iterdir())
-        for command in ("discover", "test", "cancel"):
+        for command in ("discover", "test", "pairs", "cancel"):
             arguments = [command, "--log-dir", tmp, "--dry-run"]
-            if command == "test":
+            if command in ("test", "pairs"):
                 arguments += ["--dataset", request, "--first", "1", "--last", "2"]
             with contextlib.redirect_stdout(io.StringIO()):
                 main(arguments)
@@ -190,12 +211,25 @@ def self_test():
             raise AssertionError("accepted false completion")
         except ValueError:
             pass
+        # A pair test may mask draws whose fine signature is unknown.
+        manifest.update(test_complete=False, command="pairs", masked_issues=5,
+                        pairs=[{"id": 1, "vs": "a", "ps": "b", "discovered": 1, "seen": 5, "selected": 5, "masked": 5, "refused": 0}],
+                        groups=[{"id": 1, "pair": 1, "discovered": 1, "seen": 2, "selected": 2, "masked": 2, "refused": 0, "key": ["0"] * 18}])
+        path.write_text(json.dumps(manifest))
+        report(root, request)
+        manifest["masked_issues"] = 2
+        path.write_text(json.dumps(manifest))
+        try:
+            report(root, request)
+            raise AssertionError("accepted pair accounting mismatch")
+        except ValueError:
+            pass
     print("flat_draw_isolation self-test: passed")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("discover", "test", "cancel", "report"))
+    parser.add_argument("command", nargs="?", choices=("discover", "test", "pairs", "cancel", "report"))
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--dataset", default="-")
     parser.add_argument("--first", type=int, default=0)
@@ -203,6 +237,8 @@ def main(argv=None):
     parser.add_argument("--id")
     parser.add_argument("--preview-dir", type=Path)
     parser.add_argument("--groups", nargs=2, type=int, metavar=("FIRST", "LAST"))
+    parser.add_argument("--pairs", nargs=2, type=int, metavar=("FIRST", "LAST"),
+                        help="list shader pairs (in first-draw order) with their counts")
     parser.add_argument("--wait", type=float, default=6, help="report wait, 0..10 seconds")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -212,8 +248,10 @@ def main(argv=None):
         return
     if not args.command or not args.log_dir or not 0 <= args.wait <= 10:
         parser.error("command, --log-dir and --wait within 0..10 required")
-    if args.groups and not 1 <= args.groups[0] <= args.groups[1] <= 8192:
-        parser.error("--groups must be within 1..8192")
+    for option in ("groups", "pairs"):
+        span = getattr(args, option)
+        if span and not 1 <= span[0] <= span[1] <= 8192:
+            parser.error(f"--{option} must be within 1..8192")
     if args.command == "report":
         if not args.id:
             parser.error("report requires --id")
@@ -234,14 +272,19 @@ def main(argv=None):
                 if time.monotonic() >= end:
                     raise ValueError("no completed manifest; inspect game log for acceptance/refusal, do not assume it ran")
                 time.sleep(.1)
-    summary = {k: v for k, v in data.items() if k not in ("groups", "images")}
+    summary = {k: v for k, v in data.items() if k not in ("groups", "pairs", "images")}
     summary["group_count"] = len(data["groups"])
+    summary["pair_count"] = len(data.get("pairs", []))
     summary["images"] = [{"label": i["label"], "status": i["status"], "frame": i["frame"]} for i in data["images"]]
     print(json.dumps(summary, indent=2))
     if args.groups:
         first, last = args.groups
         for g in data["groups"][max(0, first - 1):last]:
             print(json.dumps(describe_group(g)))
+    if args.pairs:
+        first, last = args.pairs
+        for x in data.get("pairs", [])[first - 1:last]:
+            print(json.dumps(x))
 
 
 if __name__ == "__main__":

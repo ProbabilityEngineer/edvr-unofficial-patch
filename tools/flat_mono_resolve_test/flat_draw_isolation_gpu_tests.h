@@ -34,6 +34,8 @@ inline int flatDrawIsolationGpuTests(ID3D11Device* dev,ID3D11DeviceContext* ctx)
     ck(!edvr::FlatIsolationRequest::parse(prefix+"discover - 0 0 trailing",1000,parsed),"trailing input refused");
     ck(!edvr::FlatIsolationRequest::parse(prefix+"test "+token+" -4294967295 1",1000,parsed),"negative unsigned wrap refused");
     ck(!edvr::FlatIsolationRequest::parse("EDVR_ISOLATE_V1 18446744073709552616 "+token+" discover - 0 0",1000,parsed),"overflow epoch refused");
+    ck(edvr::FlatIsolationRequest::parse(prefix+"pairs "+token+" 1 2",1000,parsed)&&parsed.command=="pairs","pair test parsed");
+    ck(!edvr::FlatIsolationRequest::parse(prefix+"pairs - 1 2",1000,parsed),"pair test without dataset refused");
 
     const auto saved=edvr::Config::get().logDir();
     const fs::path root=fs::path(saved)/(L"isolation_"+std::to_wstring(GetCurrentProcessId())+L"_"+std::to_wstring(GetTickCount64()));
@@ -73,7 +75,8 @@ inline int flatDrawIsolationGpuTests(ID3D11Device* dev,ID3D11DeviceContext* ctx)
     const char* source=
         "float4 vs(float3 p:POSITION):SV_Position{return float4(p,1);}"
         "struct O{float4 a:SV_Target0;float4 b:SV_Target1;float2 c:SV_Target6;};"
-        "O ps(){O o;o.a=float4(0,1,0,1);o.b=float4(0,0,1,1);o.c=float2(3,4);return o;}";
+        "O ps(){O o;o.a=float4(0,1,0,1);o.b=float4(0,0,1,1);o.c=float2(3,4);return o;}"
+        "float4 vp(uint i:SV_VertexID):SV_Position{float2 u=float2((i<<1)&2,i&2);return float4(u*2-1,.5,1);}";
     ComPtr<ID3DBlob> vbCode,pbCode,errors;ComPtr<ID3D11VertexShader> vs;ComPtr<ID3D11PixelShader> ps;
     D3DCompile(source,std::strlen(source),nullptr,nullptr,nullptr,"vs","vs_5_0",0,0,&vbCode,&errors);
     D3DCompile(source,std::strlen(source),nullptr,nullptr,nullptr,"ps","ps_5_0",0,0,&pbCode,&errors);
@@ -198,6 +201,42 @@ inline int flatDrawIsolationGpuTests(ID3D11Device* dev,ID3D11DeviceContext* ctx)
     for(unsigned i=0;i<edvr::FlatDrawIsolation::kFrameCap;++i){draw();present();}
     ck(!draw()&&controller.mode()==edvr::FlatDrawIsolation::Mode::Recover,"frame limit restores without wall-clock advance");
     isolationFixtureTime+=600;present();drain();
+    // Vertex-pulled draws (no input layout or VB0, e.g. deferred decals) are
+    // eligible. StartInstanceLocation does not split a group, and a pair test
+    // masks a same-pair draw whose fine signature was never discovered.
+    ComPtr<ID3DBlob> vpCode;ComPtr<ID3D11VertexShader> pulled;
+    D3DCompile(source,std::strlen(source),nullptr,nullptr,nullptr,"vp","vs_5_0",0,0,&vpCode,&errors);
+    if(vpCode)dev->CreateVertexShader(vpCode->GetBufferPointer(),vpCode->GetBufferSize(),nullptr,&pulled);
+    if(ck(pulled!=nullptr,"vertex-pulled fixture shader")){
+        struct Pulled {edvr::FlatDrawIsolation::Ticket ticket;bool masked;};
+        auto pulledDraw=[&](unsigned count,unsigned startInstance){
+            ID3D11Buffer* none=nullptr;const UINT zero=0;
+            ctx->IASetInputLayout(nullptr);ctx->IASetVertexBuffers(0,1,&none,&zero,&zero);ctx->VSSetShader(pulled.Get(),nullptr,0);
+            const auto t=controller.observe(ctx,{'N',count,0,1,startInstance,0},0x9abc,0x5678);
+            const bool m=controller.issue(t,ctx,isolationFixtureBlend,isolationFixtureDepth,[&]{ctx->DrawInstanced(count,1,0,startInstance);});
+            ctx->IASetInputLayout(layout.Get());ctx->IASetVertexBuffers(0,1,&buffer,&stride,&offset);ctx->VSSetShader(vs.Get(),nullptr,0);
+            return Pulled{t,m};
+        };
+        clear();bind();pulledDraw(3,0);
+        ck(read(output.Get(),4)==green,"vertex-pulled positive control writes colour");
+        const auto pd=request("discover");present();bind();pulledDraw(3,0);draw();present();drain();
+        ck(controller.mode()==edvr::FlatDrawIsolation::Mode::Ready,"vertex-pulled discovery completed");
+        request("test",pd,1,1);present();clear();bind();
+        auto r=pulledDraw(3,7);red=read(output.Get(),4);
+        ck(r.masked&&r.ticket.group==1&&r.ticket.pair==1&&!red.empty()&&red[0]==255&&red[1]==0,
+           "vertex-pulled draw masked; instance offset keeps its group");
+        isolationFixtureTime+=edvr::FlatDrawIsolation::kMaskMs;ck(!draw(),"group test ends");
+        isolationFixtureTime+=600;present();drain();
+        request("pairs",pd,1,1);present();
+        ck(controller.mode()==edvr::FlatDrawIsolation::Mode::Mask,"pair test armed");
+        clear();bind();r=pulledDraw(6,0);red=read(output.Get(),4);
+        ck(r.masked&&!r.ticket.group&&r.ticket.pair==1&&!red.empty()&&red[0]==255&&red[1]==0,
+           "pair test masks an undiscovered signature of the selected pair");
+        ck(!draw(),"pair test leaves other pairs unmasked");
+        isolationFixtureTime+=edvr::FlatDrawIsolation::kMaskMs;draw();isolationFixtureTime+=600;present();drain();
+        request("pairs",pd,3,3);present();
+        ck(controller.mode()==edvr::FlatDrawIsolation::Mode::Ready,"pair range beyond discovery refused");
+    }
     controller.cancel("fixture-cleanup");
     std::printf("Draw isolation GPU tests: %d checks, %d failures; artifacts=%ls\n",checks,bad,root.c_str());
     return bad;

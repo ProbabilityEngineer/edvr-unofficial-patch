@@ -73,15 +73,22 @@ steady. Replace `LOG_DIR` below with the existing game's `edvr_logs` directory:
 
 ```text
 python tools/flat_draw_isolation.py discover --log-dir LOG_DIR
+python tools/flat_draw_isolation.py pairs --log-dir LOG_DIR --dataset DATASET_ID --first 1 --last PAIR_NUMBER
 python tools/flat_draw_isolation.py test --log-dir LOG_DIR --dataset DATASET_ID --first 1 --last GROUP_NUMBER
 python tools/flat_draw_isolation.py report --log-dir LOG_DIR --id TEST_ID --preview-dir NEW_OUTPUT_DIR
 python tools/flat_draw_isolation.py cancel --log-dir LOG_DIR
 ```
 
 Discovery observes one full frame without suppressing anything, then reports
-its dataset ID and group count. Split the inclusive group range and test **both
-halves**, narrowing groups that change the exact decoration. Use
-`report --groups FIRST LAST` to inspect shader pairs, arguments and counts.
+its dataset ID, shader-pair count and group count. Start with `pairs`: it
+selects VS/PS shader pairs (numbered in first-draw order) and masks every draw
+of a selected pair, whether or not its fine signature was seen during
+discovery. Split the inclusive pair range and test **both halves**; once one
+pair is isolated, use `test` with that pair's groups to narrow further. Use
+`report --pairs FIRST LAST` or `report --groups FIRST LAST` to inspect pairs,
+arguments and counts. Fine group signatures do not match across frames for
+draws whose other bindings or arguments change; check each group's `seen` count
+and `unknown_signatures` before reading a `test` result as negative.
 IDs remain tied to that frozen discovery, not subsequent draw order; rediscover
 after a view/scene change. A dataset expires after five minutes and is invalidated
 by the cancel command, resize, device/context or profile change. Requests expire after
@@ -105,19 +112,21 @@ timeout and missing images are not a complete test. The reference budget is
 concurrently: active pixel/packet/discovery capture causes isolation refusal
 or cancellation.
 
-The initial domain is direct D/I/N/X geometry with known VS/PS hashes, an input
-layout, VB0, colour target and DSV (plus an index buffer for indexed draws).
-There is no guessed shader-family, depth-write or scene-size admission rule.
-This excludes depth-only passes, indirect/DrawAuto, depthless geometry and
-typical fullscreen `SV_VertexID` passes; it does **not** guarantee exclusion of
-every lighting or UI pass. Active/uncertain count-bearing queries, predication,
+The domain is direct D/I/N/X draws with known VS/PS hashes and at least one
+colour or depth target (plus an index buffer for indexed draws). Vertex-pulled
+draws without an input layout or VB0, such as deferred decals and fullscreen
+passes, are included. There is no guessed shader-family, depth-write or
+scene-size admission rule. Depth-only passes (no pixel shader) and
+indirect/DrawAuto are excluded. Lighting, post-processing and UI passes can be
+selected; masking one shows a broad dependency, not decoration ownership. Active/uncertain count-bearing queries, predication,
 stream output and pixel UAV bindings are refused. Excluded shader pairs and
 reasons are reported, with an explicit overflow count beyond 128 pair/reason
 entries. Unknown signatures in later frames are counted, never silently added
 to the selected range.
 
-Signatures combine shader hashes, draw arguments/topology and lifetime-tagged
-binding identities. They are **not unique object IDs**: resource contents can
+Signatures combine shader hashes, draw arguments/topology (excluding
+`StartInstanceLocation`, which the game reassigns every frame) and
+lifetime-tagged binding identities. They are **not unique object IDs**: resource contents can
 change, repeated signatures remain groups, and multiple instances may share a
 draw. No individual-instance narrowing or marker shader is implemented here.
 Only the game's selected issue and the named reissues are suppressed; unrelated
