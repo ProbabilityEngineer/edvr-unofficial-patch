@@ -209,6 +209,7 @@ struct Bound {
     // F2: which target-7 mode the derived blend was made for (0 none, 1 off, 2 written), and whether t108..t110 hold the skin views.
     int skinMode = 0;
     bool skinSrvs = false;
+    bool noSlot = false;   // TEMPORARY diagnostic: the derived blend was made with MRT6's writes off
 };
 Bound g_bound;
 std::atomic<bool> g_anyBound{false};   // EDVR state may still be bound (owner thread restores)
@@ -259,6 +260,7 @@ struct BlendEntry {
     const char* refused = nullptr;
     bool flatProvenance=false;
     int skinMode = 0;   // F2: target 7 left as is / written off / written (engine_velocity_state.h)
+    bool noSlot = false;   // TEMPORARY diagnostic (flat_draw_isolation.h "noslot"): MRT6 write mask 0
 };
 std::vector<BlendEntry> g_blends;
 constexpr size_t kBlendCap = 64;
@@ -982,9 +984,9 @@ bool snapshotOverlayBase(ID3D11DeviceContext* ctx, Eye& e) {
 }
 
 // The derived blend state for the game's current one (null = the default).
-ID3D11BlendState* derivedBlendFor(ID3D11DeviceContext* ctx, ID3D11BlendState* game, const char** refused,bool flatProvenance=false,int skinMode=0) {
+ID3D11BlendState* derivedBlendFor(ID3D11DeviceContext* ctx, ID3D11BlendState* game, const char** refused,bool flatProvenance=false,int skinMode=0,bool noSlot=false) {
     for (const auto& b : g_blends)
-        if (b.game.Get() == game && b.flatProvenance==flatProvenance && b.skinMode == skinMode) { *refused = b.refused; return b.derived.Get(); }
+        if (b.game.Get() == game && b.flatProvenance==flatProvenance && b.skinMode == skinMode && b.noSlot == noSlot) { *refused = b.refused; return b.derived.Get(); }
     if (g_blends.size() >= kBlendCap) g_blends.clear();   // g_bound holds its own references
     Ptr<ID3D11Device> dev;
     ctx->GetDevice(&dev);
@@ -992,7 +994,15 @@ ID3D11BlendState* derivedBlendFor(ID3D11DeviceContext* ctx, ID3D11BlendState* ga
     entry.game = game;
     entry.flatProvenance=flatProvenance;
     entry.skinMode = skinMode;
+    entry.noSlot = noSlot;
     entry.derived = engineVelocityCreateDerivedBlend(dev.Get(), game, &entry.refused, skinMode);
+    if(noSlot && entry.derived) {
+        D3D11_BLEND_DESC d{};entry.derived->GetDesc(&d);
+        d.RenderTarget[kEngineVelocityTarget].RenderTargetWriteMask=0;
+        Ptr<ID3D11BlendState> slotless;
+        if(FAILED(dev->CreateBlendState(&d,&slotless))){entry.derived.Reset();entry.refused="noslot-blend-create";}
+        else entry.derived=std::move(slotless);
+    }
     if(flatProvenance && entry.derived) {
         D3D11_BLEND_DESC d{};entry.derived->GetDesc(&d);
         d.RenderTarget[kEngineVelocityTarget].RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
@@ -1870,6 +1880,8 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
         restore(ctx);
         return;
     }
+    // TEMPORARY diagnostic ("noslot"): everything substituted as usual, but MRT6's writes masked off for the trial.
+    const bool noSlot = runtimeFlatProfile() && keyedPs(f, psHash, true) && flatDrawIsolation().withholdsSlot(ctx, vsHash, psHash);
     if (!keyedPs(f, psHash, runtimeFlatProfile())) {
         if (selfMarkPs) {
             // Compatibility path for a marker-bearing shader: latch target
@@ -2033,7 +2045,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // A rigid family's substituted draw turns target 7's writes off: it would otherwise leave undefined values there, and pay the bandwidth of writing them.
     const int skinMode = e.skinBound ? ((exportsE || zeroes) ? 2 : 1) : 0;
     const bool derivedBound = g_bound.derivedBlend && bindingGeneration(BindSlot::Blend) == g_bound.blendGen;
-    if (!derivedBound || g_bound.skinMode != skinMode) {
+    if (!derivedBound || g_bound.skinMode != skinMode || g_bound.noSlot != noSlot) {
         Ptr<ID3D11BlendState> game;
         float factor[4] = {};
         UINT mask = 0;
@@ -2074,7 +2086,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
             }
         }
         const char* refused = nullptr;
-        ID3D11BlendState* derived = derivedBlendFor(ctx, game.Get(), &refused, false, skinMode);
+        ID3D11BlendState* derived = derivedBlendFor(ctx, game.Get(), &refused, false, skinMode, noSlot);
         if (!derived) {
             ++g_draw.blendRefused;
             g_draw.blendRefusedWhy = refused;
@@ -2088,6 +2100,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
         std::memcpy(g_bound.blendFactor, factor, sizeof(factor));
         g_bound.sampleMask = mask;
         g_bound.skinMode = skinMode;
+        g_bound.noSlot = noSlot;
         g_bound.blendGen = bindingGeneration(BindSlot::Blend);   // (unchanged when only the target-7 mode was derived again)
         ++g_draw.blendApplied;
     }

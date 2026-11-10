@@ -20,14 +20,14 @@ def publish(root, command, dataset="-", first=0, last=0, dry_run=False):
     root = Path(root)
     if not root.is_dir():
         raise ValueError("--log-dir must be an existing EDVR log directory")
-    if command not in ("discover", "test", "pairs", "unpatch", "cancel"):
+    if command not in ("discover", "test", "pairs", "unpatch", "noslot", "cancel"):
         raise ValueError("unknown command")
-    if command in ("test", "pairs", "unpatch"):
+    if command in ("test", "pairs", "unpatch", "noslot"):
         token(dataset)
         if not 1 <= first <= last <= 8192:
             raise ValueError("group/pair range must be within 1..8192")
     elif (dataset, first, last) != ("-", 0, 0):
-        raise ValueError("only test/pairs/unpatch accept a dataset and range")
+        raise ValueError("only test/pairs/unpatch/noslot accept a dataset and range")
     request = uuid.uuid4().hex
     payload = f"EDVR_ISOLATE_V1 {int(time.time())} {request} {command} {dataset} {first} {last}\n"
     if not dry_run:
@@ -97,7 +97,7 @@ def report(root, request, preview=None, dry_run=False):
         if im["bytes"] != w * h * 4 or payload.stat().st_size != im["bytes"]:
             raise ValueError("invalid image byte count")
         pictures.append((im, payload.read_bytes()))
-    acted = data.get("withheld_patches", 0) if data.get("command") == "unpatch" else data["masked_issues"]
+    acted = data.get("withheld_patches", 0) if data.get("command") in ("unpatch", "noslot") else data["masked_issues"]
     if data["test_complete"] and (not acted or len(pictures) != 3 or data["reason"] != "test-ended"):
         raise ValueError("false completion claim")
     if preview is not None:
@@ -169,6 +169,7 @@ def self_test():
         publish(root, "test", request, 1, 8192, dry_run=True)
         publish(root, "pairs", request, 1, 8192, dry_run=True)
         publish(root, "unpatch", request, 1, 1, dry_run=True)
+        publish(root, "noslot", request, 1, 1, dry_run=True)
         try:
             publish(root, "pairs", dry_run=True)
             raise AssertionError("pairs accepted without dataset")
@@ -187,9 +188,9 @@ def self_test():
             except ValueError:
                 pass
         assert not list(root.iterdir())
-        for command in ("discover", "test", "pairs", "unpatch", "cancel"):
+        for command in ("discover", "test", "pairs", "unpatch", "noslot", "cancel"):
             arguments = [command, "--log-dir", tmp, "--dry-run"]
-            if command in ("test", "pairs", "unpatch"):
+            if command in ("test", "pairs", "unpatch", "noslot"):
                 arguments += ["--dataset", request, "--first", "1", "--last", "2"]
             with contextlib.redirect_stdout(io.StringIO()):
                 main(arguments)
@@ -246,7 +247,7 @@ def self_test():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("discover", "test", "pairs", "unpatch", "cancel", "report"))
+    parser.add_argument("command", nargs="?", choices=("discover", "test", "pairs", "unpatch", "noslot", "cancel", "report"))
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--dataset", default="-")
     parser.add_argument("--first", type=int, default=0)

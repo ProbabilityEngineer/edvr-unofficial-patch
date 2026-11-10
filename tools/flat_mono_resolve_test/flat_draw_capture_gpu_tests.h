@@ -97,6 +97,8 @@ inline int flatDrawCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* con
         ck(priority.priorityEligible==300&&priority.priorityRecorded+priority.priorityQuotaSkipped==300&&
            priority.motionRecorded==edvr::FlatDrawAdmission::kQuota&&priority.priorityQuotaSkipped>0,
            "priority capture remains bounded and reports omitted candidates");
+        ck(edvr::flatDrawColourDecalCandidate(0xDE545DC8EE4FBB87ull,0x91F8937EDA723663ull)&&
+           !edvr::flatDrawColourDecalCandidate(0xDE545DC8EE4FBB87ull,0x4375B72964F386CDull),"isolated decoration pair is a capture candidate");
         ck(edvr::flatDrawColourDecalCandidate(0x5B4D8E894EEDA8B4ull,0x4375B72964F386CDull)&&
            !edvr::flatDrawColourDecalCandidate(0xBBE58E40FE88EC80ull,0x4375B72964F386CDull),
            "capture priority requires the exact colour/mask pair");

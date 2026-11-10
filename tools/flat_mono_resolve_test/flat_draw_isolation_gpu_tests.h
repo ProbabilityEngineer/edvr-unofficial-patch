@@ -36,6 +36,7 @@ inline int flatDrawIsolationGpuTests(ID3D11Device* dev,ID3D11DeviceContext* ctx)
     ck(!edvr::FlatIsolationRequest::parse("EDVR_ISOLATE_V1 18446744073709552616 "+token+" discover - 0 0",1000,parsed),"overflow epoch refused");
     ck(edvr::FlatIsolationRequest::parse(prefix+"pairs "+token+" 1 2",1000,parsed)&&parsed.command=="pairs","pair test parsed");
     ck(edvr::FlatIsolationRequest::parse(prefix+"unpatch "+token+" 1 1",1000,parsed)&&parsed.command=="unpatch","unpatch trial parsed");
+    ck(edvr::FlatIsolationRequest::parse(prefix+"noslot "+token+" 1 1",1000,parsed)&&parsed.command=="noslot","noslot trial parsed");
     ck(!edvr::FlatIsolationRequest::parse(prefix+"pairs - 1 2",1000,parsed),"pair test without dataset refused");
 
     const auto saved=edvr::Config::get().logDir();
@@ -251,6 +252,15 @@ inline int flatDrawIsolationGpuTests(ID3D11Device* dev,ID3D11DeviceContext* ctx)
         ck(!controller.withholdsPatch(ctx,0x9abc,0x5678),"withholding ends with the trial");
         isolationFixtureTime+=600;present();drain();
         ck(controller.mode()==edvr::FlatDrawIsolation::Mode::Ready,"unpatch trial restored");
+        // "noslot" answers only withholdsSlot, never withholdsPatch, and also leaves writes alone.
+        request("noslot",pd,1,1);present();
+        ck(controller.mode()==edvr::FlatDrawIsolation::Mode::Mask,"noslot trial armed");
+        ck(controller.withholdsSlot(ctx,0x9abc,0x5678)&&!controller.withholdsPatch(ctx,0x9abc,0x5678),"noslot masks the slot write only");
+        ck(!controller.withholdsSlot(ctx,0x1234,0x5678),"noslot leaves other pairs");
+        clear();bind();r=pulledDraw(3,0);
+        ck(!r.masked&&read(output.Get(),4)==green,"noslot leaves the draw's writes untouched");
+        isolationFixtureTime+=edvr::FlatDrawIsolation::kMaskMs;ck(!controller.withholdsSlot(ctx,0x9abc,0x5678),"noslot ends with the trial");
+        isolationFixtureTime+=600;present();drain();
     }
     controller.cancel("fixture-cleanup");
     std::printf("Draw isolation GPU tests: %d checks, %d failures; artifacts=%ls\n",checks,bad,root.c_str());

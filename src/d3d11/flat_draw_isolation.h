@@ -60,7 +60,8 @@ struct FlatIsolationRequest {
         // which stay stable across frames when per-frame instance offsets do not.
         // "unpatch" selects pairs too, but writes are NOT masked: only EDVR's
         // engine-motion shader substitution is withheld for them.
-        return (r.command=="test"||r.command=="pairs"||r.command=="unpatch")&&token(r.dataset)&&r.first&&r.first<=r.last&&r.last<=8192;
+        // "noslot" keeps the substitution but masks its MRT6 write for them.
+        return (r.command=="test"||r.command=="pairs"||r.command=="unpatch"||r.command=="noslot")&&token(r.dataset)&&r.first&&r.first<=r.last&&r.last<=8192;
     }
 };
 
@@ -99,8 +100,9 @@ private:
     std::map<FlatIsolationKey,unsigned> index_;
     std::vector<Pair> pairs_;
     std::map<std::array<uint64_t,2>,unsigned> pairIndex_;
-    bool byPair() const {return command_=="pairs"||command_=="unpatch";}
-    bool unpatching() const {return command_=="unpatch";}
+    bool byPair() const {return command_=="pairs"||unpatching();}
+    // Both engine-motion trials leave the draw's writes to the game's targets alone.
+    bool unpatching() const {return command_=="unpatch"||command_=="noslot";}
     std::map<std::array<uint64_t,3>,unsigned> excluded_;
     std::array<FlatOutputReference,3> images_;
     std::array<uint64_t,3> imageFrames_{};
@@ -179,7 +181,7 @@ private:
         std::ostringstream out;
         out<<"{\"schema\":\"edvr-flat-draw-isolation-v1\",\"request\":\""<<request_
            <<"\",\"dataset\":\""<<dataset_<<"\",\"command\":\""<<command_<<"\",\"reason\":\""<<reason_
-           <<"\",\"test_complete\":"<<((((command_=="test"||command_=="pairs")&&masked)||(command_=="unpatch"&&withheld))&&reason_=="test-ended"&&pictures?"true":"false")
+           <<"\",\"test_complete\":"<<((((command_=="test"||command_=="pairs")&&masked)||(unpatching()&&withheld))&&reason_=="test-ended"&&pictures?"true":"false")
            <<",\"visual_effect\":\"unassessed\",\"duration_ms\":"<<clock_()-start_
            <<",\"first\":"<<first_<<",\"last\":"<<last_<<",\"selected_calls\":"<<selected<<",\"masked_issues\":"<<masked<<",\"withheld_patches\":"<<withheld
            <<",\"unsupported_calls\":"<<unsupported_<<",\"unsafe_calls\":"<<unsafe_<<",\"unknown_signatures\":"<<unknown_
@@ -253,7 +255,7 @@ private:
             mode_=Mode::Baseline;
         }
         Log::get().note("flat draw isolation: armed request=%s command=%s groups=%u..%u selection=%s%s automatic-restore=2s/240frames hard-limit=5s Escape=cancels; no rendering config changed",
-            request_.c_str(),command_.c_str(),first_,last_,byPair()?"shader-pairs":"signature-groups",unpatching()?" (engine-motion patch withheld, writes untouched)":"");
+            request_.c_str(),command_.c_str(),first_,last_,byPair()?"shader-pairs":"signature-groups",command_=="unpatch"?" (engine-motion patch withheld, writes untouched)":command_=="noslot"?" (engine-motion MRT6 write masked, substitution kept)":"");
     }
 public:
     bool observing() const {return mode_==Mode::Discover||mode_==Mode::Mask;}
@@ -329,14 +331,20 @@ public:
     // Engine motion asks this before substituting its patched shader for a keyed
     // pair. True only during an "unpatch" trial for a selected pair, on the
     // experiment's own thread/context. Counts the substitutions withheld.
-    bool withholdsPatch(ID3D11DeviceContext* ctx,uint64_t vs,uint64_t ps) {
-        if(mode_!=Mode::Mask||!unpatching()||ctx!=context_||GetCurrentThreadId()!=thread_)return false;
+    bool withholdsPatch(ID3D11DeviceContext* ctx,uint64_t vs,uint64_t ps) {return withholds(ctx,vs,ps,"unpatch");}
+    // "noslot": the substitution stays, its MRT6 write is masked off.
+    bool withholdsSlot(ID3D11DeviceContext* ctx,uint64_t vs,uint64_t ps) {return withholds(ctx,vs,ps,"noslot");}
+private:
+    // Thread and context first: command_ is only read on the experiment's own thread.
+    bool withholds(ID3D11DeviceContext* ctx,uint64_t vs,uint64_t ps,const char* command) {
+        if(mode_!=Mode::Mask||ctx!=context_||GetCurrentThreadId()!=thread_||command_!=command)return false;
         tick(clock_());
         if(mode_!=Mode::Mask)return false;
         const auto pit=pairIndex_.find(std::array<uint64_t,2>{vs,ps});
         if(pit==pairIndex_.end()||pit->second<first_||pit->second>last_)return false;
         ++pairs_[pit->second-1].withheld;return true;
     }
+public:
     template<class Issue>
     bool issue(Ticket ticket,ID3D11DeviceContext* ctx,stationmask::SetBlendFn blend,stationmask::SetDepthFn depth,Issue actual) {
         if(!ticket.pair||ctx!=context_||GetCurrentThreadId()!=thread_){actual();return false;}

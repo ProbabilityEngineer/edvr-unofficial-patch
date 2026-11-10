@@ -76,6 +76,7 @@ python tools/flat_draw_isolation.py discover --log-dir LOG_DIR
 python tools/flat_draw_isolation.py pairs --log-dir LOG_DIR --dataset DATASET_ID --first 1 --last PAIR_NUMBER
 python tools/flat_draw_isolation.py test --log-dir LOG_DIR --dataset DATASET_ID --first 1 --last GROUP_NUMBER
 python tools/flat_draw_isolation.py unpatch --log-dir LOG_DIR --dataset DATASET_ID --first PAIR --last PAIR
+python tools/flat_draw_isolation.py noslot --log-dir LOG_DIR --dataset DATASET_ID --first PAIR --last PAIR
 python tools/flat_draw_isolation.py report --log-dir LOG_DIR --id TEST_ID --preview-dir NEW_OUTPUT_DIR
 python tools/flat_draw_isolation.py cancel --log-dir LOG_DIR
 ```
@@ -95,7 +96,10 @@ and `unknown_signatures` before reading a `test` result as negative.
 withholds EDVR's engine-motion shader substitution (the MRT6 motion export)
 from the selected pairs, so the game's own shader draws while temporal AA keeps
 running. `withheld_patches` counts substitutions withheld; zero means engine
-motion never offered to patch those pairs during the trial.
+motion never offered to patch those pairs during the trial. `noslot` keeps the
+substitution (patched shader, derived blend, MRT6 bound) but masks the MRT6
+write for the selected pairs, separating the motion data from the G-buffer
+draw itself.
 IDs remain tied to that frozen discovery, not subsequent draw order; rediscover
 after a view/scene change. A dataset expires after five minutes and is invalidated
 by the cancel command, resize, device/context or profile change. Requests expire after

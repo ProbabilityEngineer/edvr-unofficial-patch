@@ -5,8 +5,11 @@
 namespace edvr {
 // Investigation candidate, not a declaration that every draw is window glass.
 // Used only by explicitly armed captures; never by rendering admission.
+// 2026-11-10: DE545DC8/91F8937E was isolated in flight as the station window
+// decoration's draw (dots and frame bars); its packets are wanted for replay.
 inline bool flatDrawColourDecalCandidate(uint64_t vs,uint64_t ps) {
-    return vs==0x5B4D8E894EEDA8B4ull && ps==0x4375B72964F386CDull;
+    return (vs==0x5B4D8E894EEDA8B4ull && ps==0x4375B72964F386CDull) ||
+           (vs==0xDE545DC8EE4FBB87ull && ps==0x91F8937EDA723663ull);
 }
 struct FlatDrawAdmission {
     static constexpr unsigned kQuota=256, kStride=64, kInitial=8;
