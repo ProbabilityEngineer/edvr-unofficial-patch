@@ -36,6 +36,7 @@ bool g_configRead = false;
 uint32_t g_configGeneration = 0;
 bool g_on = false;
 int g_dirtPercent = kDirtPercentDefault;   // visual.cockpit_glass_dirt, read with the look at the frame boundary
+float g_lightsLevel = 0.0f;                // visual.cockpit_glass_lights, read with the look (lightsLevelOf)
 std::string g_unrecognisedSaid;   // the last unrecognised value the log has named, so a typo is said once and not every config change
 
 // Everything made on one device is kept as raw pointers on purpose, never released at exit (a static destructor that releases a D3D object during shutdown is the kind of
@@ -45,8 +46,10 @@ ID3D11PixelShader* g_ps = nullptr;                    // the intact replacement
 ID3D11PixelShader* g_overlayPs[2] = {nullptr, nullptr};   // ice, condensation
 ID3D11BlendState* g_overlayBlend = nullptr;           // colour ONE + ONE, RGB written, alpha untouched
 ID3D11ShaderResourceView* g_streakSrv = nullptr;
-ID3D11Buffer* g_levelCb = nullptr;                    // the dirt level, one register (16 bytes) at b13
-float g_levelUploaded = -1.0f;                        // the level g_levelCb holds; a different one is uploaded at the next bind
+ID3D11Buffer* g_levelCb = nullptr;                    // the block at b13, two registers (32 bytes): the dirt level, then the layer-to-game pixel map (cockpit_glass_core.h LevelBlock)
+LevelBlock g_levelUploaded = {-1.0f, 0.0f, {0, 0}, {1, 1, 0, 0}};  // what g_levelCb holds; a different block is uploaded at the next bind or layer bracket
+LevelBlock g_levelWanted = {0.0f, 0.0f, {0, 0}, {1, 1, 0, 0}};     // the dirt level and local lights now, and the map the layer set for the canopy draw it brackets (identity otherwise)
+bool g_mapSet = false;                               // the layer's map is in force (set by cockpitGlassSetLayerMap, cleared by cockpitGlassClearLayerMap or any scene bind)
 bool g_levelRefused = false;
 Replacement g_state = Replacement::NotTried;
 bool g_overlayRefused[2] = {false, false};
@@ -68,6 +71,8 @@ ULONGLONG g_windowStart = 0;
 uint32_t g_binds = 0;      // canopy binds handed the replacement, this window
 uint32_t g_seen = 0;       // canopy binds the game made, this window
 uint32_t g_overlays = 0;   // ice or condensation draws drawn over with the legacy dirt, this window
+uint32_t g_t12Rebinds = 0, g_b13Rebinds = 0;   // canopy draws that found another binding in the swap's slot and put the swap's back, this window (cockpitGlassBeforeDraw)
+bool g_t12WriterSaid = false;                  // the first such t12 is described once a session
 
 // What was at t12 and b13 before the intact replacement's bind put the streaks and the dirt level there; given back at the next pixel-shader bind of another shader, or at the
 // frame boundary.
@@ -197,7 +202,8 @@ void dropDeviceObjects() {
     g_streakRefused = false;
     g_streakLogged = false;
     g_levelRefused = false;
-    g_levelUploaded = -1.0f;
+    g_levelUploaded = LevelBlock{-1.0f, 0.0f, {0, 0}, {1, 1, 0, 0}};
+    g_mapSet = false;
 }
 
 // The device the objects were made on is this context's, or they are made again.
@@ -231,29 +237,37 @@ ID3D11PixelShader* replacementFor(ID3D11DeviceContext* ctx) {
     return g_ps;
 }
 
+// Brings the block up to date with g_levelWanted: an upload only on a change (the dirt level moved, or the layer set or cleared its map).
+void uploadLevel(ID3D11DeviceContext* ctx) {
+    if (!g_levelCb || !levelBlockDiffers(g_levelWanted, g_levelUploaded)) return;
+    const LevelBlock v = g_levelWanted;
+    guarded("cockpitGlass.level.update", [&] { vScreenUpdateSubresourceRaw(ctx, g_levelCb, 0, nullptr, &v, 0, 0); });
+    g_levelUploaded = v;
+}
+
 // The dirt level's block for this device, made the first time it is wanted and brought up to date with visual.cockpit_glass_dirt when the player has moved it (an upload
-// only on a change). Null when the device refused it; the shaders then read an unbound b13, which is no dirt, never the game's own glass.
+// only on a change). Null when the device refused it; the shaders then read an unbound b13, which is no dirt, never the game's own glass. This is the block for a SCENE bind (the swap,
+// the overlay): the pixel map is the identity, whatever a layer bracket left, since a scene draw's SV_Position is the game's own.
 ID3D11Buffer* levelBuffer(ID3D11DeviceContext* ctx) {
-    const float level = dirtLevelOf(g_dirtPercent);
+    g_levelWanted.dirt = dirtLevelOf(g_dirtPercent);
+    g_levelWanted.lights = g_lightsLevel;
+    identityLevelMap(g_levelWanted);
+    g_mapSet = false;
     if (g_levelCb) {
-        if (level != g_levelUploaded) {
-            const float v[4] = {level, 0, 0, 0};
-            guarded("cockpitGlass.level.update", [&] { vScreenUpdateSubresourceRaw(ctx, g_levelCb, 0, nullptr, v, 0, 0); });
-            g_levelUploaded = level;
-        }
+        uploadLevel(ctx);
         return g_levelCb;
     }
     if (g_levelRefused) return nullptr;
     ID3D11Device* dev = nullptr;
+    const LevelBlock v = g_levelWanted;
     guarded("cockpitGlass.level.create", [&] {
         ctx->GetDevice(&dev);
         if (!dev) return;
-        const float v[4] = {level, 0, 0, 0};
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = sizeof v;
         bd.Usage = D3D11_USAGE_DEFAULT;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        const D3D11_SUBRESOURCE_DATA init{v, 0, 0};
+        const D3D11_SUBRESOURCE_DATA init{&v, 0, 0};
         dev->CreateBuffer(&bd, &init, &g_levelCb);
     });
     if (dev) guarded("cockpitGlass.level.device.release", [&] { dev->Release(); });
@@ -262,7 +276,7 @@ ID3D11Buffer* levelBuffer(ID3D11DeviceContext* ctx) {
         Log::get().note("cockpit glass: the dirt level block was refused by the device; the legacy glass draws without dirt");
         return nullptr;
     }
-    g_levelUploaded = level;
+    g_levelUploaded = v;
     return g_levelCb;
 }
 
@@ -348,12 +362,16 @@ void resetWindow(ULONGLONG now) {
     g_binds = 0;
     g_seen = 0;
     g_overlays = 0;
+    g_t12Rebinds = 0;
+    g_b13Rebinds = 0;
 }
 
 void logWindow(ULONGLONG now) {
     char line[240];
     formatWindow(line, sizeof line, (now - g_windowStart) / 1000.0, g_binds, g_seen, g_overlays, replacementName(g_state));
     Log::get().note("%s", line);
+    if (g_t12Rebinds || g_b13Rebinds)
+        Log::get().note("cockpit glass: canopy draws that found another binding and put the swap's back, this window: t12 %u, b13 %u", g_t12Rebinds, g_b13Rebinds);
 }
 
 }  // namespace
@@ -372,6 +390,60 @@ ID3D11PixelShader* cockpitGlassPsFor(ID3D11DeviceContext* ctx, ID3D11PixelShader
 }
 
 uint64_t cockpitGlassReplacedHash(ID3D11PixelShader* actual) { return actual && actual == g_ps ? kReplacedPsHash : 0; }
+
+bool cockpitGlassSwapActive() { return g_t12Bound; }
+
+bool cockpitGlassSetLayerMap(ID3D11DeviceContext* ctx, float scaleX, float scaleY, float biasX, float biasY) {
+    if (!g_levelCb || !g_t12Bound) return false;   // no swap in, or no block: the draw has nothing of ours to map
+    g_levelWanted.map[0] = scaleX;
+    g_levelWanted.map[1] = scaleY;
+    g_levelWanted.map[2] = biasX;
+    g_levelWanted.map[3] = biasY;
+    g_mapSet = true;
+    uploadLevel(ctx);
+    return true;
+}
+
+void cockpitGlassClearLayerMap(ID3D11DeviceContext* ctx) {
+    if (!g_mapSet) return;   // every draw but a taken canopy's: this and out
+    g_mapSet = false;
+    identityLevelMap(g_levelWanted);
+    uploadLevel(ctx);
+}
+
+void cockpitGlassBeforeDraw(ID3D11DeviceContext* ctx) {
+    if (!g_t12Bound) return;   // every draw but the canopy's: this and out
+    guarded("cockpitGlass.inputs.check", [&] {
+        ID3D11ShaderResourceView* srv = nullptr;
+        ID3D11Buffer* cb = nullptr;
+        ctx->PSGetShaderResources(kStreakSlot, 1, &srv);
+        ctx->PSGetConstantBuffers(kLevelSlot, 1, &cb);
+        if (srv != g_streakSrv) {
+            ++g_t12Rebinds;
+            if (!g_t12WriterSaid) {
+                g_t12WriterSaid = true;
+                D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+                if (srv) srv->GetDesc(&d);
+                Log::get().note("cockpit glass: at a canopy draw t12 was %s (view dimension %d, format %d), written after the swap's bind; the streaks are bound again at every such draw and that view is what t12 gets back",
+                                srv ? "another view" : "empty", static_cast<int>(d.ViewDimension), static_cast<int>(d.Format));
+            }
+            // The binding that is there now is what the next pixel shader's hand-back must restore: the one saved at the swap's bind is stale. The reference moves to g_t12Prev.
+            if (g_t12Prev) g_t12Prev->Release();
+            g_t12Prev = srv;
+            srv = nullptr;
+            vScreenPSSetShaderResourcesRaw(ctx, kStreakSlot, 1, &g_streakSrv);
+        }
+        if (cb != g_levelCb) {
+            ++g_b13Rebinds;
+            if (g_b13Prev) g_b13Prev->Release();
+            g_b13Prev = cb;
+            cb = nullptr;
+            vScreenPSSetConstantBuffersRaw(ctx, kLevelSlot, 1, &g_levelCb);
+        }
+        if (srv) srv->Release();
+        if (cb) cb->Release();
+    });
+}
 
 bool cockpitGlassOverlayBegin(ID3D11DeviceContext* ctx) {
     const Overlay which = overlayFor(bindingShaderHash(BindSlot::Ps));   // the game's own pixel shader: the shadow records it, never the replacement
@@ -435,6 +507,14 @@ void cockpitGlassFrameBoundary(ID3D11DeviceContext* ctx) {
             g_dirtPercent = dirtPercent;
             if (on && g_on)
                 Log::get().note("cockpit glass: dirt level %d%% (visual.cockpit_glass_dirt), from the next canopy bind", dirtPercent);
+        }
+        // Which local lights reach the dirt, said when it moves, whatever the look, with the value as read.
+        const std::string lights = cfg.getString("visual.cockpit_glass_lights", "off");
+        const float lightsLevel = lightsLevelOf(lights.c_str());
+        if (lightsLevel != g_lightsLevel) {
+            g_lightsLevel = lightsLevel;
+            Log::get().note("cockpit glass: local lights on the dirt: %s (visual.cockpit_glass_lights = %s), from the next canopy bind",
+                            lightsLevel > 0.5f ? "the station's spot lights" : "none", lights.c_str());
         }
         if (on != g_on) {
             const ULONGLONG now = GetTickCount64();

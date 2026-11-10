@@ -1,9 +1,9 @@
-# EDVR — private-fork working rules
+# ED Unofficial Patch — private-fork working rules
 
 This is the repository's agent instruction file. `CLAUDE.md` imports it;
 do not duplicate instructions there.
 
-EDVR provides Elite Dangerous: Odyssey graphics fixes through a `d3d11.dll`
+ED Unofficial Patch (formerly EDVR) provides Elite Dangerous: Odyssey graphics fixes through a `d3d11.dll`
 proxy and its own OpenXR runtime through `Openvr/win64/openvr_api.dll`.
 Test flights are expensive: distinguish local checks from actual game results.
 
@@ -23,7 +23,8 @@ performing destructive operations. When using Entire commands, consult
 
 This checkout is the owner's private derivative. AI-assisted implementation
 is permitted for that work, not as authorization for upstream contributions.
-Never push refs to `characterecho-sean/edvr-unofficial-patch`, open upstream
+Never push refs to `characterecho-sean/ed-unofficial-patch` or its former name
+`characterecho-sean/edvr-unofficial-patch`, open upstream
 PRs or issues, post comments there, or otherwise publish this work upstream.
 This applies to every branch and worktree, including direct URLs, remote
 aliases and APIs. Permission to push to the owner's fork is not permission
@@ -93,7 +94,7 @@ If a required project gate exceeds the approved scope, explain once and ask.
   Compile-only outputs are not validated release artifacts.
 - On private branches that provide the graphics-only tooling, an explicitly
   unvalidated graphics test DLL uses `--compile-only --graphics-only`, or
-  manual CI input `graphics_only=true`. Stock RC7 does not provide those
+  manual CI input `graphics_only=true`. The stock upstream baseline does not provide those
   additions: check the current branch's scripts and `docs/building.md` rather
   than assuming these flags exist. Remote CI still requires approval, and
   compile-only output never bypasses receipt-guarded promotion.

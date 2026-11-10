@@ -30,7 +30,12 @@ constexpr Family kFamilies[] = {
     // The captured pair is draw-qualified on WARP; VR remains unqualified.
     // 054658: 03B17 draws the station's moving rig; its survivors and discard
     // branch are qualified against the original on WARP.
-    {0xDE545DC8EE4FBB87ull, "vs_DE545DC8EE4FBB87", {0xE46E3E4832B2FDB0ull, 0xCB429E043DBB2506ull, 0x03B17F89B31C4788ull, 0}, false, 0x91F8937EDA723663ull},
+    // 2026-11-08 (a flat report of DLSS dropping on a planet once the SRV left the view; Sean's Frontier 11:03 trace):
+    // 60D69AB6 is a stock G-buffer material of this family (four targets, normal-mapped PBR), the only stock draw of the
+    // refused frames, with the HDR world camera's exact bytes and its depth. Unkeyed, a view holding it and no keyed draw
+    // was refused no-supported-motion-source-pair. Both profiles. Hash recomputed from the dumped bytecode (log.cpp
+    // fnv1a64); passes the corpus harness whole on WARP. E364F563 (the reporter's) stays a candidate in the harness.
+    {0xDE545DC8EE4FBB87ull, "vs_DE545DC8EE4FBB87", {0xE46E3E4832B2FDB0ull, 0xCB429E043DBB2506ull, 0x03B17F89B31C4788ull, 0x60D69AB6C65C549Aull, 0}, false, 0x91F8937EDA723663ull},
     {0xAACFDCF2FB9AD809ull, "vs_AACFDCF2FB9AD809", {0xCF534B32F491561Aull, 0, 0, 0}},
     // 2026-09-29, the Krait's main-menu F10 capture: 235567BE is the stock pixel
     // shader of the hull PLATING (5 draws, ~70k vertices). Unkeyed, its draws wrote
@@ -76,6 +81,10 @@ constexpr Family kFamilies[] = {
     // docs/vr-holo-me-head-flick-2026-11-05.md). No slot and no E, so these pixels took the head path while the face beside them had E: their motion
     // error follows the head's own motion (r 0.985), up to 1.75 input px a frame, and the helmet's thin lines shimmer. The same class as the hair above.
     {0x01DA82F8D0EA0C99ull, "vs_01DA82F8D0EA0C99", {0x2C3ADCD2FCD47298ull, 0, 0, 0}, false, 0, true, true},
+    // 2026-11-05, an NPC's eyes (Frontier 14:37, eye run 143722980001, a bartender; docs/vr-npc-eye-motion-2026-11-05.md). No slot and no E, so these
+    // pixels took the world path while the face round them had E: 2.8 to 7.7 native px a frame apart while the head moved. Drawn by a depth prepass
+    // (vs F516/ps B40B, depth only) and then this forward pass, the shape of the hair above. Its 432- and 168-index meshes are not identified.
+    {0x33A5025C48FC8259ull, "vs_33A5025C48FC8259", {0x7AA0441EE0E88667ull, 0, 0, 0}, false, 0, true, true},
 };
 constexpr int kFamilyCount = static_cast<int>(sizeof(kFamilies) / sizeof(kFamilies[0]));
 // F2: the five measured skinned pairs (the NPC's shading pairs, 2026-10-08 F10/F11): the pixel shader exports the vertex shader's E to
@@ -89,6 +98,7 @@ constexpr SkinPair kSkinPairs[] = {
     {0x8B589D25B2A0ADDCull, 0x7268762D11A610F2ull},
     {0xA6A39338C06E03A1ull, 0x1AE6AB9A94C0456Eull},
     {0x01DA82F8D0EA0C99ull, 0x2C3ADCD2FCD47298ull},
+    {0x33A5025C48FC8259ull, 0x7AA0441EE0E88667ull},
 };
 constexpr bool skinPair(uint64_t vs, uint64_t ps) noexcept {
     for (const SkinPair& p : kSkinPairs)

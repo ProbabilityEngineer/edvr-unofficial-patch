@@ -22,6 +22,7 @@
 #include "ui_scene_composites.h"  // the census of the interface composites left in the scene, and its line
 #include "ui_maps_math.h"   // the on-foot maps gate: the key, the step, the door's predicate, the lines
 #include "ui_holo_remap.h"
+#include "cockpit_glass.h"          // the legacy canopy's pixel map at b13 (cockpitGlassSetLayerMap)
 #include "ui_layer_draw_timing.h"
 #include "ui_layer_shaders.h"
 #include "ui_layer_coverage.h"
@@ -42,6 +43,7 @@
 #include "depth_probe.h"   // depthProbeDrawsAtSize: the world-screen gate's own count
 #include "device_hook.h"   // deviceHookHmdQuality, for the configure line
 #include "gpu_timing.h"
+#include "gpu_query_count.h"  // GpuQueryOwnerScope: the route timers' Ends count as ui_route
 #include "gpu_census.h"    // issue #38: the per-feature GPU cost census
 #include "graphics_runtime.h"
 #include "journal_watch.h" // the on-foot gate's reading: Status.json's Flags2 bit 0, GuiFocus
@@ -483,10 +485,22 @@ struct Eye {
     // What the layer's draws of the frame wSeq are: the weapons fire's (wFires) and the scope's gunsight marks (wMarks, A3), which share the layer and its composite. The drop test,
     // the missing-consumer streaks and the weapons line's counts are kept apart by kind, so a mark never stands the weapons fire down or counts as weapons fire.
     uint32_t wFires = 0, wMarks = 0;
+    uint32_t wGlass = 0;             // the legacy canopy's draws of the frame wSeq (kLegacyGlass): their own count, so the glass never counts as weapons fire, but a layer holding only glass is content that can be lost
     uint64_t wFireSeq = 0;           // the last frame whose first weapons-fire draw was counted as a content frame (the weapons line's eye-frames)
     uint32_t wMarkMissStreak = 0;    // consecutive frames whose marks no re-issue published
     bool wPubMatched = false;        // the re-issue that stamped wPubSeq composited by the tonemap difference (false: the plain add)
     uint64_t wMarkNotedSeq = 0;      // the last frame whose mark the door counted (scopeZoomNoteMarkComposite), once an eye-frame
+
+    // The half-resolution canopy's glass target G: R16G16B16A16_FLOAT at the draw target's size, cleared at the eye-frame's first half
+    // route canopy draw, added bilinearly into W once at the tonemap re-issue, before W is composited. gDs is its own depth-stencil at the same size, seeded from the game's, so no other
+    // family's seed of another size (hdrDs, ds) is touched or reused by it.
+    Ptr<ID3D11Texture2D> gTex;
+    Ptr<ID3D11RenderTargetView> gRtv;
+    Ptr<ID3D11ShaderResourceView> gSrv;
+    uint32_t gW = 0, gH = 0;
+    uint64_t gSeq = 0;               // the frame whose glass draws it holds
+    uint32_t gDraws = 0;
+    LayerDs gDs;
 
     // The shield ripple's displacement layer D (R32G32_FLOAT, the HDR layers' size): the game's own uv_jit + d where the shield-strike refraction drew this
     // frame, cleared far outside [0, 1] elsewhere. Made at the first 820E draw, released after kShieldRippleIdleFrames frames without one. dJx/dJy: the jitter its
@@ -596,6 +610,9 @@ struct Draw {
     uint32_t markPath = 0;      // the scope mark: what the layer did with the draw's depth and stencil tests (UiMarkDepth, scope_zoom_s1.h kMarkPath*)
     ID3D11ShaderResourceView* rippleSrv0 = nullptr;  // the game's t0, held while the ramp is bound (put back at restore)
     bool rippleSwapped = false;                      // the ramp is bound in its place
+    bool glassMapSet = false;                        // the legacy canopy's pixel map is in force at b13 (cockpitGlassSetLayerMap); restore() clears it
+    bool glassHalf = false;                          // the legacy canopy's draw takes the half-resolution route: into the eye's glass target G at the draw target's size
+    bool glassCensus = false;                        // the canopy draw's own census span (GpuCensusSection::AlteredLegacyGlass) was asked at the issue; uiLayerEnd closes it
     bool reissue = false;  // the VR world route's re-issue of the 2D screen (the game's own draw lands in its eye): not a take
     int eye = -1;
     UiLayerFamily family = UiLayerFamily::kNone;
@@ -660,6 +677,7 @@ static_assert(ui_holo_remap::kVs == kHoloTargetSphere, "hologram classifier iden
 // THE RELIEF (ui_holo_remap.h): the scene block's cb1[120].z by buffer (uiLayerNoteSceneWrite), the first application said
 // once per program, and each fallback source said the first time it is used.
 ui_holo_remap::SceneRelief g_sceneRelief;
+bool g_glassMapRefusedNoted = false;   // the legacy canopy's pixel map refusal, said once
 bool g_holoReliefNoted[kRemapPrograms]{}, g_holoReliefSourceNoted[ui_holo_remap::SceneRelief::kSources]{};
 
 // The pixel stage's b1 at a hologram draw (the scene block its programs read cb1[120].z from), identity only, and
@@ -792,6 +810,11 @@ struct Window {
     uint64_t weaponsTaken = 0, weaponsLost = 0, weaponsContentFrames = 0;
     uint64_t weaponsPair[kWeaponPairCount] = {};
     uint64_t weaponsEyeMatched = 0, weaponsEyeFallback = 0;
+    // The legacy canopy (kLegacyGlass) in the weapons layer: draws taken, layers holding glass no re-issue published, and the eye-frames that carried glass, by composite kind.
+    uint64_t glassTaken = 0, glassLost = 0, glassEyeMatched = 0, glassEyePlain = 0;
+    // The half-resolution route: the decisions that kept the full route (by reason), the draws taken by each route, and the
+    // adds into W that ran or failed at the door.
+    uint64_t glassHalfRatio = 0, glassHalfNotReady = 0, glassHalfDraws = 0, glassFullDraws = 0, glassAdds = 0, glassAddFailed = 0;
     // The shield ripple: eye-frames the door applied it, and its declines (0 reserved, 1 frame format, 2 pieces, 3 a picture the game made itself).
     uint64_t rippleApplied = 0, rippleDoorDeclined[4] = {};
     uint64_t hdrDeclined[static_cast<size_t>(CrispToneDecline::kCount)] = {};
@@ -982,11 +1005,21 @@ void routeApplyCoverage(int eye, uint64_t seq) {
     }
 }
 
+// One eye-frame in 16 is timed, each of them whole: the choice is a function of the frame's sequence alone, so every stage of a
+// sampled eye-frame (and both eyes of it) is timed and every stage of any other is not, which keeps the per-eye-frame sums
+// coherent (they are the only thing the timers feed: logTotals' price line, whose medians now come from a 16th of the samples).
+// An eye-frame that is not sampled is not "untimed" and not "lost": nothing of it begins, so no ledger entry, sum or counter is
+// touched. The HDR draw diagnostics (g_hdrDrawTimingOn, compiled off) time every frame as they always did: that census prices
+// the moved draw per frame. A frame one in 16 matches the draw clock (perf_monitor.cpp) and ui_depth's stellar timer.
+constexpr uint64_t kRouteSampleMask = 15;
+inline bool routeSampled(uint64_t seq) { return g_hdrDrawTimingOn || (seq & kRouteSampleMask) == 0; }
+
 void routeMovedMissing(int eye, uint64_t seq) {
     // A disabled draw is absent from both moved-only and combined coverage,
     // including an on/off toggle within one source sequence. Machinery stays
     // valid. Steady diagnostics-off frames need no scan of the pending ring.
     constexpr UiRouteStage stage = UiRouteStage::kHdrMovedDraw;
+    if (!routeSampled(seq)) return;  // an eye-frame the route timers skip has no sums to spoil
     uiRouteLost(g_stageSum[static_cast<size_t>(stage)][eye], seq);
     g_routeTotals[eye].lost(stage, seq);
     if (g_routeCoverage.missing(stage, eye, seq) &&
@@ -1000,10 +1033,13 @@ void routeMovedMissing(int eye, uint64_t seq) {
 // before any of that: logTotals is the only reader and flat never calls it,
 // and each timestamp query costs the driver work (on DXMT it splits the
 // Metal pass: a reporter's flat scene went from under 60 fps to 60 without
-// them). routePoll still drains what a VR frame left in flight.
+// them). -1 too, with no accounting, for an eye-frame that is not one of the
+// sampled 16th (routeSampled). routePoll still drains what a VR frame left in flight.
 int routeBegin(ID3D11DeviceContext* ctx, UiRouteStage stage, int eye, uint64_t seq) {
     if (!ctx || eye < 0 || eye > 1 || !seq) return -1;
     if (runtimeFlatProfile()) return -1;
+    if (!routeSampled(seq)) return -1;
+    const GpuQueryOwnerScope queryOwner(GpuQueryOwner::UiRoute);  // the timer's Ends count as ui_route, not "other"
     const size_t si = static_cast<size_t>(stage);
     RouteSlot& s = g_route[g_routeHead % kRouteRing];
     bool ok = false;
@@ -1040,6 +1076,7 @@ void routeEnd(ID3D11DeviceContext* ctx, int idx) {
     if (idx < 0 || idx >= static_cast<int>(kRouteRing) || !ctx) return;
     // Closes the moved HDR draw's census item opened by routeBegin (the same slot, the same stage).
     if (g_route[idx].stage == UiRouteStage::kHdrMovedDraw) gpuCensusEnd(ctx, GpuCensusSection::AlteredHdrHud);
+    const GpuQueryOwnerScope queryOwner(GpuQueryOwner::UiRoute);
     g_route[idx].timer.end(ctx);  // a failed end reads back as not measured
 }
 
@@ -1102,8 +1139,8 @@ void appendPrice(std::string& s, size_t stat) {
         s += "-";
         return;
     }
-    const double p95 = uiLayerPercentile(r.v, r.n, 0.95);  // sorts; the median reads the same order
-    const double med = uiLayerSortedPercentile(r.v, r.n, 0.5);
+    const double p95 = uiLayerPercentileSelect(r.v, r.n, 0.95);  // selection, not a sort: same numbers, O(n)
+    const double med = uiLayerPercentileSelect(r.v, r.n, 0.5);
     char buf[64];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.3f/%.3f (%u)", med, p95, r.n);
     s += buf;
@@ -1112,9 +1149,9 @@ void appendPrice(std::string& s, size_t stat) {
 uint64_t g_winStartMs = 0;
 uint64_t g_sessionRedirected = 0;
 // Phase-0 timing (src/common/periodic_work.h) of the 30 s totals and price
-// lines, built on Elite's thread at the frame boundary: appendPrice sorts up
+// lines, built on Elite's thread at the frame boundary: appendPrice selects the median and p95 of up
 // to kRouteSamples floats for each of the price stats. Context: the samples
-// held then (what the sorts had to order). One run per window that logs, so
+// held then (what the selection had to scan). One run per window that logs, so
 // nothing is written while fix.ui_quality is off and nothing was redirected.
 PeriodicWork g_workTotals{"ui_layer_totals", "samples"};
 
@@ -1444,7 +1481,7 @@ bool ensureWeaponsLayerFor(ID3D11DeviceContext* ctx, int eye, const char* madeFo
     e.wW = e.wH = 0;
     e.wSeq = 0;
     e.wDraws = 0;
-    e.wFires = e.wMarks = 0;
+    e.wFires = e.wMarks = e.wGlass = 0;
     Ptr<ID3D11Device> dev;
     ctx->GetDevice(&dev);
     if (!dev || !makeTarget(dev.Get(), s.w, s.h, DXGI_FORMAT_R16G16B16A16_FLOAT, &e.wTex, &e.wRtv, &e.wSrv)) {
@@ -1458,6 +1495,36 @@ bool ensureWeaponsLayerFor(ID3D11DeviceContext* ctx, int eye, const char* madeFo
     Log::get().note("sharp weapons: %s eye's weapons layer %s at %ux%u (R16G16B16A16_FLOAT, %.1f MB) for %s -- the weapons fire and the scope's gunsight mark are drawn into it and "
                     "composited after the upscale.",
                     eye == 0 ? "left" : "right", resized ? "re-created" : "created", s.w, s.h, uiLayerMB(uiLayerBytes(s.w, s.h, 8)), madeFor);
+    return true;
+}
+
+// The half-resolution canopy (docs\cockpit-glass-legacy-port.md, "Station lights").
+bool g_glassHalfNotReadyNoted = false;  // G or the add pass could not be made: said once, the draw keeps the full route
+bool g_glassAddFailedNoted = false;     // the add pass failed at the door: said once
+bool g_glassHalfNoted = false;          // the first half-resolution draw: said once
+
+void releaseLayerDs(LayerDs& l);
+
+// The glass target G for an eye: R16G16B16A16_FLOAT at the DRAW TARGET's size, made at the decision of a half-route canopy draw (so a failure leaves the draw on the full route, never
+// take-then-drop). Replaced, and its depth-stencil released, when the target's size moves.
+bool ensureGlassHalfFor(ID3D11DeviceContext* ctx, int eye, uint32_t tw, uint32_t th) {
+    Eye& e = g_eye[eye];
+    if (!tw || !th) return false;
+    if (e.gTex && e.gW == tw && e.gH == th && e.gRtv && e.gSrv) return true;
+    e.gW = e.gH = 0;
+    e.gSeq = 0;
+    e.gDraws = 0;
+    releaseLayerDs(e.gDs);
+    Ptr<ID3D11Device> dev;
+    ctx->GetDevice(&dev);
+    if (!dev || !makeTarget(dev.Get(), tw, th, DXGI_FORMAT_R16G16B16A16_FLOAT, &e.gTex, &e.gRtv, &e.gSrv)) {
+        e.gTex.Reset();
+        e.gRtv.Reset();
+        e.gSrv.Reset();
+        return false;
+    }
+    e.gW = tw;
+    e.gH = th;
     return true;
 }
 
@@ -1733,7 +1800,7 @@ bool releaseLayers() {
     bool any = false;
     for (Eye& e : g_eye) {
         any = any || e.tex || e.mTex || e.maskTex || e.mapDepthTex || e.ds.tex || e.dsCopy || e.dsDirect[0].depth || e.dsDirect[1].depth || e.out || e.copy || e.frameSrv || e.frameUav ||
-              e.hdrTex || e.hdrDs.tex || e.wTex || e.smaa.ready();
+              e.hdrTex || e.hdrDs.tex || e.wTex || e.gTex || e.gDs.tex || e.smaa.ready();
         e.smaa.releaseTargets();
         e.coverage.reset();
         e.tex.Reset();
@@ -1778,7 +1845,14 @@ bool releaseLayers() {
         e.wW = e.wH = 0;
         e.wSeq = 0;
         e.wDraws = 0;
-        e.wFires = e.wMarks = 0;
+        e.wFires = e.wMarks = e.wGlass = 0;
+        e.gTex.Reset();
+        e.gRtv.Reset();
+        e.gSrv.Reset();
+        e.gW = e.gH = 0;
+        e.gSeq = 0;
+        e.gDraws = 0;
+        releaseLayerDs(e.gDs);
         e.wFireSeq = e.wMarkNotedSeq = 0;
         e.wTarget = nullptr;
         e.wToneSeq = 0;
@@ -2406,6 +2480,11 @@ void restore(ID3D11DeviceContext* ctx) {
         }
     }
     g_draw.mapRunBound = false;
+    // The legacy canopy's map at b13 goes back to the identity the scene binds read (a no-op for every other draw).
+    if (g_draw.glassMapSet) {
+        g_draw.glassMapSet = false;
+        cockpitGlassClearLayerMap(ctx);
+    }
     vScreenRSSetViewportsRaw(ctx, g_draw.vpCount, g_draw.vp);
     if (g_draw.scissorSet) ctx->RSSetScissorRects(g_draw.scCount, g_draw.sc);
     ctx->OMSetBlendState(g_draw.blend, g_draw.factor, g_draw.sampleMask);
@@ -2586,6 +2665,9 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     const bool wl = g_draw.weapons && which == 0;
     // The shield ripple: the 820E draw (g_draw.ripple, with g_draw.hdr) goes into the eye's displacement layer D, tested against the same seeded depth.
     const bool rp = g_draw.ripple && which == 0;
+    // The half-resolution canopy: the draw goes into the eye's glass target G at the DRAW TARGET's size, tested against G's own seeded depth-stencil. It is still a
+    // weapons-layer draw (wl): W is cleared, its counts are kept, and the composite finds the glass added into W at the tonemap re-issue (glassHalfAdd).
+    const bool gh = wl && g_draw.glassHalf && g_draw.family == UiLayerFamily::kLegacyGlass;
     // The Galaxy Map's own issues (which 2: into the panel mask, which 3: the arrow's probe into the layer with nothing written) take their own blend and test no depth.
     const bool mapIssue = which >= 2;
     // The Galaxy Map's sprite depth (galaxy_map_ui.h, THE SPRITES' DEPTH): a map sprite's colour issue into the HDR layer binds the eye's D16 depth and tests it (which 0), and which 4 is the
@@ -2594,11 +2676,14 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     const bool mapDepthIssue = which == 4;
     const bool mapDepthColour = which == 0 && g_draw.hdr && !g_draw.weapons && !g_draw.ripple && mapDepthTests(g_draw.family) && mapui::vrOpen();
     ID3D11RenderTargetView* target =
-        which == 2 ? e.maskRtv.Get() : which == 3 ? e.rtv.Get() : which == 4 ? e.hdrRtv.Get() : which ? e.mRtv.Get() : (rp ? e.dRtv.Get() : (wl ? e.wRtv.Get() : (g_draw.hdr ? e.hdrRtv.Get() : e.rtv.Get())));
+        which == 2 ? e.maskRtv.Get() : which == 3 ? e.rtv.Get() : which == 4 ? e.hdrRtv.Get() : which ? e.mRtv.Get() : (rp ? e.dRtv.Get() : (gh ? e.gRtv.Get() : (wl ? e.wRtv.Get() : (g_draw.hdr ? e.hdrRtv.Get() : e.rtv.Get()))));
     if (!target) return false;
-    LayerDs& lds = g_draw.hdr ? e.hdrDs : e.ds;
-    const uint32_t layerW = rp ? e.dW : (wl ? e.wW : (g_draw.hdr ? e.hdrW : e.w));
-    const uint32_t layerH = rp ? e.dH : (wl ? e.wH : (g_draw.hdr ? e.hdrH : e.h));
+    // G's depth-stencil is its own (e.gDs, at the target's size): the full route's seed of hdrDs and the 8-bit layer's of ds are other sizes, and a seed of one size is never reused by, or clobbered
+    // by, a draw of another.
+    LayerDs& lds = gh ? e.gDs : (g_draw.hdr ? e.hdrDs : e.ds);
+    const uint32_t layerW = rp ? e.dW : (gh ? g_draw.targetW : (wl ? e.wW : (g_draw.hdr ? e.hdrW : e.w)));
+    const uint32_t layerH = rp ? e.dH : (gh ? g_draw.targetH : (wl ? e.wH : (g_draw.hdr ? e.hdrH : e.h)));
+    if (gh && (!e.gTex || e.gW != layerW || e.gH != layerH)) return false;   // G was made for this target at the decision; a move since leaves the draw in the scene, untouched
     // The blend at the moment of issue: a verdict's own Begin runs between
     // the decision and here, and the shape must still be the decided one.
     ID3D11BlendState* bs = nullptr;
@@ -2668,22 +2753,23 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     if (wl && e.wSeq != g_draw.seq) {
         // The frame's content lost, by kind (weaponsLayerLoss): the weapons fire's is counted and stood down as it always was; the scope's gunsight mark (A3) has its own count and
         // streak, so a frame that held a mark alone never counts as weapons fire or stands the weapons fire down.
-        const WeaponsLayerLoss lost = weaponsLayerLoss(e.wSeq, e.wFires, e.wMarks, e.wPubSeq);
-        if (lost.fire) {
-            ++g_win.weaponsLost;
+        const WeaponsLayerLoss lost = weaponsLayerLoss(e.wSeq, e.wFires, e.wMarks, e.wPubSeq, e.wGlass);
+        if (lost.fire || lost.glass) {
+            if (lost.fire) ++g_win.weaponsLost;
+            if (lost.glass) ++g_win.glassLost;   // the legacy canopy's dirt: the layer held it and no tonemap re-issue carried it
             noteWeaponsLost(g_draw.eye, e, g_draw.seq);
             // The missing-consumer deadline, as the HUD layer's: content no tonemap re-issue published for a streak of frames says
             // the consumer is not coming; the weapons fire goes back to the scene (their own stand-down: the HUD is unaffected).
             if (++e.wMissStreak >= kCrispHdrMissFrames) {
                 char why[200];
                 _snprintf_s(why, _TRUNCATE,
-                            "the weapons layer's content reached no tonemap for %u consecutive frames (the weapons fire was taken but never "
+                            "the weapons layer's content reached no tonemap for %u consecutive frames (the weapons layer's light was taken but never "
                             "came back)", kCrispHdrMissFrames);
                 weaponsStandDown(why);
             }
         }
         if (lost.mark) {
-            if (!lost.fire) noteWeaponsLost(g_draw.eye, e, g_draw.seq, true);
+            if (!lost.fire && !lost.glass) noteWeaponsLost(g_draw.eye, e, g_draw.seq, true);
             if (++e.wMarkMissStreak >= kCrispHdrMissFrames) {
                 char why[200];
                 _snprintf_s(why, _TRUNCATE,
@@ -2697,9 +2783,18 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
         routeEnd(ctx, timer);
         e.wSeq = g_draw.seq;
         e.wDraws = 0;
-        e.wFires = e.wMarks = 0;
+        e.wFires = e.wMarks = e.wGlass = 0;
         e.wOtherTargets = 0;
         e.wTarget = g_draw.targetRes;
+        ++g_win.clears;
+    }
+    // The glass target G: cleared once an eye-frame, at the frame's first half-route canopy draw (W is cleared above, by whichever weapons-layer draw came first, so it is ready to take the add).
+    if (gh && e.gSeq != g_draw.seq) {
+        const int timer = routeBegin(ctx, UiRouteStage::kHdrClear, g_draw.eye, g_draw.seq);
+        vScreenClearRenderTargetViewRaw(ctx, e.gRtv.Get(), kUiLayerClear);
+        routeEnd(ctx, timer);
+        e.gSeq = g_draw.seq;
+        e.gDraws = 0;
         ++g_win.clears;
     }
     // The weapons line's eye-frames with weapons draws: the first weapons-fire draw of an eye-frame, whether or not a mark began the frame's layer.
@@ -2871,7 +2966,10 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
                 lds.seedJx == g_draw.jx && lds.seedJy == g_draw.jy);
             const bool copyDepth = depth && !keepDepth;
             UiSeedPlan seedPlan;
-            if (g_seedCensus.enabled) {
+            // G's seed is outside the seed census's per-layer tracks (they are the 8-bit layer's and the HDR layer's, keyed by size and eye): the census is a diagnostic and would read a layer of
+            // a third size as the HDR layer changing size.
+            const bool censusSeed = g_seedCensus.enabled && !gh;
+            if (censusSeed) {
                 D3D11_DEPTH_STENCIL_VIEW_DESC vd{};
                 g_draw.dsv->GetDesc(&vd);
                 DXGI_FORMAT tf, df, sf;
@@ -2882,10 +2980,10 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             }
             const bool seeded = seedLayerDepth(ctx, e, lds, g_draw.eye, layerW, layerH, g_draw.dsv, mask, copyDepth,
                                 g_draw.hdr ? UiRouteStage::kHdrSeed : UiRouteStage::kSeed,
-                                g_draw.hdr ? "a cockpit HUD draw" : "a UI draw", seedPlan, keepDepth);
-            if (g_seedCensus.enabled) g_seedCensus.seed(g_draw.eye, g_draw.hdr, g_draw.seq,
+                                gh ? "the half-resolution legacy canopy" : g_draw.hdr ? "a cockpit HUD draw" : "a UI draw", seedPlan, keepDepth);
+            if (censusSeed) g_seedCensus.seed(g_draw.eye, g_draw.hdr, g_draw.seq,
                 gameDs, layerW, layerH, seedPlan, seeded);
-            if (g_seedCensus.enabled && seeded) noteSeedCounts(g_draw.seq, static_cast<int>(g_draw.eye), g_draw.hdr, seedPlan);
+            if (censusSeed && seeded) noteSeedCounts(g_draw.seq, static_cast<int>(g_draw.eye), g_draw.hdr, seedPlan);
             if (!seeded) {
                 ++g_win.seedFailures;
                 releaseSaved();
@@ -2900,6 +2998,25 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     // A map sprite's issue binds the eye's sprite depth in the layer's depth place. The game's own state on these is depth off and a stencil write; that write is not made while the
     // map is open in VR (uiLayerWriteBackBegin declines it), and the layer's seeded stencil, which no map draw tests, is not written for them.
     if (mapDsv) layerDsv = mapDsv;
+    // The legacy canopy's shader runs at the layer's pixels, and its light-cluster lookup is by the game's: b13 carries the map back (cockpit_glass_core.h LevelBlock). Made before anything of
+    // the game's state is changed, so a refusal here is the same as the holo remap's: the draw stays in the scene. The model is ui_holo_remap::params (game = layer * (x, y) + (bx, by)).
+    if (g_draw.family == UiLayerFamily::kLegacyGlass) {
+        ui_holo_remap::Params glassMap{};
+        const auto& gv = g_draw.vp[0];
+        const bool mapped = g_draw.vpCount == 1 && std::isfinite(gv.Width) && std::isfinite(gv.Height) && gv.Width > 0 && gv.Height > 0 &&
+                            ui_holo_remap::params(g_draw.targetW, g_draw.targetH, layerW, layerH, g_draw.jx, g_draw.jy, glassMap) &&
+                            cockpitGlassSetLayerMap(ctx, glassMap.x, glassMap.y, glassMap.bx, glassMap.by);
+        if (!mapped) {
+            ++g_win.refusedAtIssue;
+            if (!g_glassMapRefusedNoted) {
+                g_glassMapRefusedNoted = true;
+                Log::get().note("legacy glass: refused at the issue -- the viewport, the layer's size or the swap's block did not give a pixel map; the canopy stays in the scene (said once).");
+            }
+            releaseSaved();
+            return false;
+        }
+        g_draw.glassMapSet = true;
+    }
     // The map (the game's eye target onto the layer) and the jitter cancel.
     const UiLayerMap m = uiLayerMapFromRegion(0.0f, 0.0f, static_cast<float>(g_draw.targetW),
                                               static_cast<float>(g_draw.targetH), layerW, layerH);
@@ -2988,6 +3105,12 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
         !mapDepthIssue, g_draw.hdr, which, g_hdrDrawTimingOn, g_draw.eye, g_draw.seq,
         [&](UiRouteStage stage, int eye, uint64_t seq) { return routeBegin(ctx, stage, eye, seq); },
         [&](int eye, uint64_t seq) { routeMovedMissing(eye, seq); });
+    // The canopy's own census span (AlteredLegacyGlass): the game's draw of it only, from here to uiLayerEnd, in either profile and whichever route (the VR "UI draws" scope times the same draw
+    // on its own turn). Counted on every draw, timed on the section's turn.
+    if (which == 0 && g_draw.family == UiLayerFamily::kLegacyGlass && !g_draw.glassCensus) {
+        g_draw.glassCensus = true;
+        gpuCensusBegin(ctx, GpuCensusSection::AlteredLegacyGlass);
+    }
     if (g_draw.hdr && which == 0) {
         ++g_win.hdrDrawTimingEligible;
         if (timing == UiDrawRouteStart::Disabled) ++g_win.hdrDrawTimingDisabled;
@@ -3009,6 +3132,21 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             if (e.wTarget != g_draw.targetRes) ++e.wOtherTargets;
             if (g_draw.family == UiLayerFamily::kScopeMark) {
                 ++e.wMarks;   // the scope's gunsight mark shares the layer (A3) and is counted by the press line, not by the weapons line
+            } else if (g_draw.family == UiLayerFamily::kLegacyGlass) {
+                ++e.wGlass;
+                ++g_win.glassTaken;
+                if (gh) {
+                    ++e.gDraws;
+                    ++g_win.glassHalfDraws;
+                    if (!g_glassHalfNoted) {
+                        g_glassHalfNoted = true;
+                        Log::get().note("legacy glass: half resolution: the first canopy draw went into the %s eye's glass target G, %ux%u (R16G16B16A16_FLOAT, %.1f MB), the draw "
+                                        "target's size, with its own %ux%u depth-stencil; the weapons layer is %ux%u and takes G added bilinearly once an eye-frame, before the composite (said once).",
+                                        g_draw.eye == 0 ? "left" : "right", e.gW, e.gH, uiLayerMB(uiLayerBytes(e.gW, e.gH, 8)), e.gDs.w, e.gDs.h, e.wW, e.wH);
+                    }
+                } else {
+                    ++g_win.glassFullDraws;
+                }
             } else {
                 ++e.wFires;
                 ++g_win.weaponsTaken;
@@ -3971,6 +4109,8 @@ void logMemory() {
         if (e.hdrDs.tex)
             appendResource(one, "HDR HUD depth-stencil", e.hdrDs.w, e.hdrDs.h, e.hdrDs.viewFmt,
                            &total);
+        if (e.gTex) appendResource(one, "glass target G (half-resolution canopy)", e.gW, e.gH, DXGI_FORMAT_R16G16B16A16_FLOAT, &total);
+        if (e.gDs.tex) appendResource(one, "glass depth-stencil", e.gDs.w, e.gDs.h, e.gDs.viewFmt, &total);
         if (e.dsCopy) {
             appendResource(one, "its copy of the game's depth-stencil", e.dsCopyW, e.dsCopyH,
                            e.dsCopyFmt, &total);
@@ -4044,6 +4184,35 @@ void logSharpWeapons() {
         reasons.empty() ? "" : ")", static_cast<unsigned long long>(g_win.weaponsEyeMatched),
         static_cast<unsigned long long>(g_win.weaponsEyeFallback),
         static_cast<unsigned long long>(g_win.weaponsContentFrames), static_cast<unsigned long long>(g_win.weaponsLost), pairs.c_str());
+}
+
+// The legacy canopy's own 30 s line (kLegacyGlass), printed every window with zeros: the shared decision's counts for the family (taken into the weapons layer, left in the scene by
+// reason), the eye-frames that carried it by composite kind, and the layers whose glass no tonemap re-issue published. "not asked" says the family never reached the decision (the
+// look is odyssey, the layer is not live, or the canopy was not drawn), which reads differently from a window that asked and was refused.
+void logLegacyGlass() {
+    const size_t fi = static_cast<size_t>(UiLayerFamily::kLegacyGlass);
+    const uint64_t taken = g_win.decided[fi][static_cast<size_t>(UiLayerDecision::kRedirect)];
+    uint64_t leftTotal = 0;
+    std::string reasons;
+    for (size_t d = 1; d < static_cast<size_t>(UiLayerDecision::kCount); ++d) {
+        const uint64_t n = g_win.decided[fi][d];
+        if (!n) continue;
+        leftTotal += n;
+        appendf(reasons, "%s%s %llu", reasons.empty() ? "" : ", ", uiLayerDecisionKey(static_cast<UiLayerDecision>(d)), static_cast<unsigned long long>(n));
+    }
+    if (!taken && !leftTotal) {
+        Log::get().note("legacy glass: not asked in this window (the canopy pair did not reach the layer's decision: visual.cockpit_glass is odyssey, the weapons layer is not live, or the canopy was not drawn).");
+        return;
+    }
+    // The resolution route: what each draw took and why. Draws that went to G with no add reads differently from a window that worked.
+    std::string route;
+    appendf(route, "; draws by route: half %llu, full %llu (kept full by the layer/target ratio %llu, by G or the add pass not ready %llu); adds into W ran %llu, failed %llu",
+            static_cast<unsigned long long>(g_win.glassHalfDraws), static_cast<unsigned long long>(g_win.glassFullDraws), static_cast<unsigned long long>(g_win.glassHalfRatio),
+            static_cast<unsigned long long>(g_win.glassHalfNotReady), static_cast<unsigned long long>(g_win.glassAdds), static_cast<unsigned long long>(g_win.glassAddFailed));
+    if (g_win.glassHalfDraws && !g_win.glassAdds) route += " -- DRAWS WENT TO G AND NO ADD INTO W RAN";
+    Log::get().note("legacy glass: %llu draws in the weapons layer, %llu left in the scene%s%s%s; eye-frames carrying it: %llu matched, %llu plain; %llu layers' glass never reached a tonemap%s.",
+                    static_cast<unsigned long long>(taken), static_cast<unsigned long long>(leftTotal), reasons.empty() ? "" : " (", reasons.c_str(), reasons.empty() ? "" : ")",
+                    static_cast<unsigned long long>(g_win.glassEyeMatched), static_cast<unsigned long long>(g_win.glassEyePlain), static_cast<unsigned long long>(g_win.glassLost), route.c_str());
 }
 
 // The bound depth view's resolve memo (resolveBoundDsv): how often seedWritersCheck's question was answered from it and how often it
@@ -4344,6 +4513,7 @@ bool crispTakeReady(ID3D11DeviceContext* ctx, int eye);
 // The weapons fire's counterpart: the weapons layer, the 8-bit layer and the blend states the re-issue needs (defined beside it). forMark: the caller is the scope's gunsight mark,
 // whose failure stands the mark down alone (markStandDown) and never the weapons half.
 bool weaponsTakeReady(ID3D11DeviceContext* ctx, int eye, bool forMark = false);
+bool glassAddReady(ID3D11DeviceContext* ctx);
 // The shield ripple's counterparts (defined beside it): D and the shared pieces for a take, and the first-draw checks.
 bool rippleTakeReady(ID3D11DeviceContext* ctx, int eye, uint32_t targetW, uint32_t targetH);
 bool rippleR1Allows(ID3D11DeviceContext* ctx);
@@ -4697,6 +4867,8 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     g_draw.reissue = false;
     g_draw.holoPsHash = 0; g_draw.holoOriginal = nullptr; g_draw.holoPatched = nullptr;
     g_draw.holoRestoreOk = true;
+    g_draw.glassMapSet = false;
+    g_draw.glassHalf = false;
     g_draw.ds = UiDsEffect{};
     g_draw.stencilRead = 0;
     g_draw.shape = UiBlendShape::kRefused;
@@ -4800,6 +4972,7 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     // stencil tests took (known only to a draw that got as far as that decision).
     UiBlendRt gameBlend;
     bool markBlendKnown = false, markBlendRewritten = false, markPathKnown = false;
+    bool glassHalfRoute = false;   // the legacy canopy's draw takes the half-resolution route (decided with the layer's readiness, below)
     UiMarkDepth markDepth = UiMarkDepth::kUntested;
     char dsWhy[160] = "";
     if (d == UiLayerDecision::kRedirect) {
@@ -4893,6 +5066,23 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
                     : ensureLayerFor(ctx, f.eye) &&
                           (f.blend != UiBlendShape::kMultiply || ensureMult(ctx, g_eye[f.eye], f.eye));
             d = uiLayerDecide(f);
+            // The legacy canopy's route: half when the weapons layer is at least 1.5 times the draw's target on both axes. Everything the half route needs (G, the add pass's shaders and states) is made
+            // HERE, before the draw is taken: a failure keeps the full route, said once, so no draw is taken and then dropped.
+            if (d == UiLayerDecision::kRedirect && family == UiLayerFamily::kLegacyGlass) {
+                const Eye& ge = g_eye[f.eye];
+                if (!uiLegacyGlassHalfRes(ge.wW, ge.wH, g_tc.info.a, g_tc.info.b)) {
+                    ++g_win.glassHalfRatio;   // the layer is not 1.5 times the target on both axes (flat at 1:1): the full route
+                } else if (!ensureGlassHalfFor(ctx, f.eye, g_tc.info.a, g_tc.info.b) || !glassAddReady(ctx)) {
+                    ++g_win.glassHalfNotReady;
+                    if (!g_glassHalfNotReadyNoted) {
+                        g_glassHalfNotReadyNoted = true;
+                        Log::get().note("legacy glass: the half-resolution route was wanted, but the glass target G (%ux%u) or the add pass's shaders, blend states or deferred context could not be made; the canopy keeps the full "
+                                        "route (said once).", g_tc.info.a, g_tc.info.b);
+                    }
+                } else {
+                    glassHalfRoute = true;
+                }
+            }
         }
         // The SV_Position remap's draws (ui_holo_remap.h needsRemap): the hologram sphere VS into the HDR HUD
         // layer, and the frosted base wherever it is taken. A program that cannot be prepared is refused to
@@ -4990,6 +5180,7 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     g_draw.hdr = f.crispHdr;
     g_draw.weapons = uiLayerFamilyUsesWeaponsLayer(family);
     g_draw.ripple = family == UiLayerFamily::kShieldRipple;
+    g_draw.glassHalf = glassHalfRoute;
     g_draw.vsHash = bindingShaderHash(BindSlot::Vs);
     g_draw.seq = seq;
     g_draw.targetRes = g_tc.info.resource;
@@ -5003,7 +5194,8 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     // is the target (targetMatchesEye above).
     // The jitter cancel, from the family's table (weapons_fire.h; default cancel, as for the space dust): a pair whose matrices do not
     // carry the eye's jitter is drawn with none.
-    const bool cancel = !g_draw.weapons || weaponsFireJitterCancel(g_draw.vsHash);
+    // The legacy canopy cancels too: its pair is not in the table, whose default is the cancel, and the canopy's matrices carry the eye's jitter (flat_projection_recipes.h gives it the scene camera rows); said here so a table change cannot reach it.
+    const bool cancel = !g_draw.weapons || family == UiLayerFamily::kLegacyGlass || weaponsFireJitterCancel(g_draw.vsHash);
     g_draw.jx = cancel ? jx : 0.0f;
     g_draw.jy = cancel ? jy : 0.0f;
     return true;
@@ -5034,6 +5226,10 @@ bool uiLayerBegin(ID3D11DeviceContext* ctx) { return beginGuarded(ctx, 0); }
 void uiLayerEnd(ID3D11DeviceContext* ctx) {
     if (!g_draw.active) return;
     g_draw.drawRoute.end([&](int slot) { routeEnd(ctx, slot); });
+    if (g_draw.glassCensus) {
+        g_draw.glassCensus = false;
+        gpuCensusEnd(ctx, GpuCensusSection::AlteredLegacyGlass);
+    }
     if (!guarded("uiLayer.end", [&] { restore(ctx); })) {
         standDown("a fault while putting the game's state back after a draw");
     }
@@ -5621,6 +5817,12 @@ bool weaponsTakeReady(ID3D11DeviceContext* ctx, int eye, bool forMark) {
     if (!ensureLayerFor(ctx, eye)) return fail("the eye's 8-bit layer (the tonemap re-issue's target) could not be created");
     if (!ensureSharpStates(ctx)) return fail("the tonemap re-issue's blend states could not be created");
     return true;
+}
+
+// What the half-resolution canopy's add needs at the door, made at the decision: the source pass's shaders, the blend states and the deferred context. False leaves the draw on the full route.
+bool glassAddReady(ID3D11DeviceContext* ctx) {
+    compileSharpSourceOnce(ctx);
+    return g_srcVs && g_srcPs && ensureSharpStates(ctx) && crispCoverageContextReady(ctx);
 }
 
 bool rippleBuildShared(ID3D11DeviceContext* ctx, uint32_t tw, uint32_t th) {
@@ -6652,6 +6854,23 @@ bool uiLayerCrispToneBegin(ID3D11DeviceContext* ctx) {
             else if (!ensureSharpScratch(ctx, e.wW, e.wH)) plainWhy = "the source pass's scratch could not be made";
             matchedReady = !plainWhy;
         }
+        // The half-resolution canopy: G (the draw target's size) is added bilinearly into W once an eye-frame, here, BEFORE the source pass below adds F_up to the sum, so the matched
+        // composite sees W = L_weapons + L_glass + F_up. The pass is recorded on the coverage pass's deferred context and executed with the immediate context's state restored, as the source pass
+        // is (sharpGlassAddPass). A failure leaves W without the glass this frame: counted, and said once.
+        if (wpnC && e.gSeq == p.seq && e.gDraws) {
+            const bool added = e.gSrv && glassAddReady(ctx) &&
+                               sharpGlassAddPass(ctx, g_crispDeferred.Get(), g_srcVs, g_srcPs, g_sharpStates, e.gSrv.Get(), e.wRtv.Get(), e.wW, e.wH, vScreenExecuteCommandListRaw);
+            if (added) {
+                ++g_win.glassAdds;
+            } else {
+                ++g_win.glassAddFailed;
+                if (!g_glassAddFailedNoted) {
+                    g_glassAddFailedNoted = true;
+                    Log::get().note("legacy glass: the add of the %s eye's glass target G into the weapons layer failed at the tonemap re-issue; that eye-frame's canopy is missing from the composite. "
+                                    "Counted in the 30 s line (said once).", p.eye == 0 ? "left" : "right");
+                }
+            }
+        }
         TonePlan plan = sharpTonePlan(hudC, wpnC, matchedReady);
         if (plan.clearEye) vScreenClearRenderTargetViewRaw(ctx, e.rtv.Get(), kUiLayerClear);
         bool fellBack = wpnC && !plan.sourcePass;
@@ -6843,7 +7062,7 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx) {
         // weapons fire's by a frame that held weapons fire, the scope mark's (A3) by a frame that held a mark. wPubMatched is how the door counts a mark's composite.
         e.wPubSeq = seq;
         e.wPubMatched = plan.sourcePass;
-        if (e.wFires) e.wMissStreak = 0;
+        if (e.wFires || e.wGlass) e.wMissStreak = 0;
         if (e.wMarks) e.wMarkMissStreak = 0;
     }
     g_lastRedirectSeq = seq;
@@ -6867,6 +7086,17 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx) {
             fallbackNoted = true;
             Log::get().note("sharp weapons: a matched composite fell back to the plain add this frame (the source pass's shaders, the scratch "
                             "or the deferred context were not available, or the pass failed); counted in the 30 s line.");
+        }
+    }
+    if (hadWeapons && e.wGlass) {
+        // The legacy canopy's dirt and glare in the layer: the first eye-frame it was carried is said once, and each is counted by composite kind in the glass line.
+        static bool glassEngagedNoted = false;
+        if (plan.sourcePass) ++g_win.glassEyeMatched;
+        else ++g_win.glassEyePlain;
+        if (!glassEngagedNoted) {
+            glassEngagedNoted = true;
+            Log::get().note("legacy glass: the canopy's dirt and glare in the %s eye's weapons layer were composited %s -- %ux%u; said once.",
+                            eye == 0 ? "left" : "right", plan.sourcePass ? "by tonemap difference, T(F_up + L) - T(F_up) through the game's own tonemap draw" : "by the plain add", e.w, e.h);
         }
     }
     if (hadWeapons && e.wMarks) {
@@ -7161,10 +7391,11 @@ bool resolveBoundDsv(void* view, ResourceInfo* info) {
 void seedWritersCheck(ID3D11DeviceContext* ctx, uint32_t count, uint32_t instances, uint32_t verdict, char drawKind) {
     for (uint32_t eye = 0; eye < 2; ++eye) {
         Eye& e = g_eye[eye];
-        for (LayerDs* l : {&e.ds, &e.hdrDs}) {
+        for (LayerDs* l : {&e.ds, &e.hdrDs, &e.gDs}) {
             const bool hdr = l == &e.hdrDs;
+            const bool glass = l == &e.gDs;   // the half-resolution canopy's own seed: kept fresh like the others, outside the seed census's tracks
             const bool freshCandidate = l->seq == g_lastRedirectSeq && l->source;
-            const bool diagnosticCandidate = g_seedCensus.enabled &&
+            const bool diagnosticCandidate = !glass && g_seedCensus.enabled &&
                 g_seedCensus.tracks[eye][hdr ? 1 : 0].known;
             if (!freshCandidate && !diagnosticCandidate) continue;
             void* dsvView = bindingGet(BindSlot::Dsv0);
@@ -7172,7 +7403,7 @@ void seedWritersCheck(ID3D11DeviceContext* ctx, uint32_t count, uint32_t instanc
             if (!dsvView || !resolveBoundDsv(dsvView, &info))
                 continue;
             const bool matchingFresh = freshCandidate && info.resource == l->source;
-            const bool matchingDiagnostic = g_seedCensus.matches(eye, hdr, info.resource);
+            const bool matchingDiagnostic = !glass && g_seedCensus.matches(eye, hdr, info.resource);
             if (!matchingFresh && !matchingDiagnostic) continue;
             ID3D11DepthStencilView* dsv = static_cast<ID3D11DepthStencilView*>(dsvView);
             UINT ref = 0;
@@ -7361,16 +7592,16 @@ void uiLayerNoteDepthClear(void* dsv, uint32_t flags, float depth, uint8_t stenc
     if (!dsv) return;
     bool any = false;
     for (const Eye& e : g_eye)
-        any = any || (e.ds.seq && e.ds.source) || (e.hdrDs.seq && e.hdrDs.source);
+        any = any || (e.ds.seq && e.ds.source) || (e.hdrDs.seq && e.hdrDs.source) || (e.gDs.seq && e.gDs.source);
     if (!any && !g_seedCensus.enabled) return;
     ResourceInfo info;
     if (!bindingResolve(dsv, &info) || !info.resource) return;
     for (uint32_t eye = 0; eye < 2; ++eye) {
         Eye& e = g_eye[eye];
-        for (LayerDs* l : {&e.ds, &e.hdrDs}) {
+        for (LayerDs* l : {&e.ds, &e.hdrDs, &e.gDs}) {
             const bool hdr = l == &e.hdrDs;
             const bool invalidated = l->seq && l->source == info.resource;
-            if (g_seedCensus.matches(eye, hdr, info.resource)) {
+            if (l != &e.gDs && g_seedCensus.matches(eye, hdr, info.resource)) {
                 D3D11_DEPTH_STENCIL_VIEW_DESC vd{};
                 static_cast<ID3D11DepthStencilView*>(dsv)->GetDesc(&vd);
                 DXGI_FORMAT tf, df, sf;
@@ -7717,7 +7948,7 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         if (g_weaponsBackOffUntilMs && now >= g_weaponsBackOffUntilMs) {
             g_weaponsBackOffUntilMs = 0;
             g_weaponsStoodDown = false;
-            for (Eye& e : g_eye) { e.wMissStreak = 0; e.wDraws = 0; e.wFires = e.wMarks = 0; }
+            for (Eye& e : g_eye) { e.wMissStreak = 0; e.wDraws = 0; e.wFires = e.wMarks = e.wGlass = 0; }
             refreshLive();
             Log::get().note("sharp weapons: re-armed after its back-off (back-off %u this session); the weapons fire is taken "
                             "again from the next frame.", g_weaponsBackOffNo);
@@ -7809,6 +8040,7 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         logTotals(static_cast<double>(now - g_winStartMs) / 1000.0);
     }
     logSharpWeapons();
+    logLegacyGlass();
     logShieldRipple();
     g_win = Window{};
     g_seedCensus.nextWindow();

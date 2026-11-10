@@ -310,6 +310,39 @@ void testHotkeyEdge() {
         h.setBinding("231D012D:Joy_3");
         check(h.pressed(), "setting the same binding again does not swallow a press");
     }
+    // Key up: pressed() reads the key and nothing else (no modifiers, no focus query),
+    // and leaves the same state that pressedWith(false, held, focused) leaves for
+    // every held/focused combination.
+    {
+        static int s_modReads = 0;
+        static bool s_f20 = false;
+        hotkeySetKeyboardReaderForTest([](int vk) {
+            if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT) ++s_modReads;
+            return vk == VK_F20 && s_f20;
+        });
+        for (int variant = 0; variant < 5; ++variant) {
+            Hotkey a;   // pressed()
+            Hotkey b;   // pressedWith(false, held, focused)
+            a.setKey(VK_F20, variant == 4 ? kHotkeyCtrl : 0);
+            b.setKey(VK_F20, variant == 4 ? kHotkeyCtrl : 0);
+            a.setGameMirrored(variant & 1);
+            b.setGameMirrored(variant & 1);
+            s_f20 = false;
+            s_modReads = 0;
+            const bool ra = a.pressed();
+            const bool rb = b.pressedWith(false, (variant & 2) ? kHotkeyCtrl : 0, (variant & 1) != 0);
+            check(ra == rb && !ra, "key up: pressed() and pressedWith(false,...) agree: no edge");
+            check(s_modReads == 0, "key up: no modifier is read");
+            check(!a.takeMissedWhileUnfocused() && !b.takeMissedWhileUnfocused(),
+                  "key up: nothing is recorded as missed while unfocused");
+            // Next frame, key down: both latches were left false, so the press is an edge
+            // under the same conditions (game-mirrored = focused).
+            s_f20 = true;
+            check(b.pressedWith(true, variant == 4 ? kHotkeyCtrl : 0, true),
+                  "key up then down: the edge is still there");
+        }
+        hotkeySetKeyboardReaderForTest(nullptr);
+    }
     // Focus is the keyboard's rule: a pad or joystick press with another window up is
     // missed, said once, and not fired when focus returns.
     {
@@ -1848,7 +1881,7 @@ void testLegacyOnFootRowsStayOutOfMenu() {
     int nativePageRows = 0;
     for (int i = 0; i < kCount; ++i)
         if (strcmp(kMenuRows[i].page, "native_on_foot") == 0) ++nativePageRows;
-    check(nativePageRows == 18, "the Native on foot page has 18 rows (F205 added ADS: view circle and F205b removed it again, the circle following ADS: scope zoom; F177: Aiming choice at start, the [menu] key menu.aim_choice_prompt, which the page shows under Look to aim; "
+    check(nativePageRows == 20, "the Native on foot page has 20 rows (the look to aim ADS vertical aim switch, under Look and aim; F216: View bob, the [fix] key native_on_foot_view_bob, under Comfort; F205 added ADS: view circle and F205b removed it again, the circle following ADS: scope zoom; F177: Aiming choice at start, the [menu] key menu.aim_choice_prompt, which the page shows under Look to aim; "
                                 "A1: ADS: scope zoom joined Aiming down sights; F127: 21 rows went to edvr.ini and the installer's window, and Reticle follows was retired; "
                                 "F128: Visor axis (test) was retired with the correction always on; the panel cursor's F155 retired its F154's Panel cursor (test) row with the "
                                 "drawn placement shipped; F146: the ADS sight switch, the two ADS sight trims and the full outfit switch were retired, and the four Weapon UI trims "
@@ -1863,6 +1896,7 @@ void testLegacyOnFootRowsStayOutOfMenu() {
             {"native_on_foot_turn_style", "Look and aim"},
             {"native_on_foot_snap_turn_deg", "Look and aim"},
             {"native_on_foot_look_to_aim_smoothing_ms", "Look and aim"},
+            {"native_on_foot_look_to_aim_ads_vertical", "Look and aim"},
             {"native_on_foot_ads_sight_eye", "Aiming down sights"},
             {"native_on_foot_ads_head_aim", "Aiming down sights"},
             {"native_on_foot_ads_scope_zoom", "Aiming down sights"},
@@ -1875,6 +1909,7 @@ void testLegacyOnFootRowsStayOutOfMenu() {
             {"native_on_foot_hud_element_scale", "HUD"},
             {"native_on_foot_hud_spread", "HUD"},
             {"native_on_foot_hud_follow", "HUD"},
+            {"native_on_foot_view_bob", "Comfort"},   // F216: View bob (a user setting) under its own heading, after the HUD rows
             // F177: the [menu] key is the last row of the table (the ini's order) and has no group; the page moves it under Look to aim when it builds
             {"aim_choice_prompt", "", "menu"},
         };
@@ -2094,6 +2129,42 @@ void testLegacyOnFootRowsStayOutOfMenu() {
         check(found == 1 && shaped && beside,
               "ADS left arm reach (F185, TEMPORARY) is one [experimental] number row right after Hip elbow swivel max, on its page and under its heading: 0.8..1, step 0.01, unsigned, live, shipped 0.92");
     }
+    // F220 (TEMPORARY): "HUD stays with view" is an [experimental] on/off choice right after "Body follows view" (F215), on the same page and under the same heading, live, shipped on.
+    {
+        int bodyRow = -1, hudRow = -1, found = 0;
+        bool shaped = true;
+        for (int i = 0; i < kCount; ++i) {
+            const MenuRowDef& d = kMenuRows[i];
+            if (strcmp(d.section, "experimental") != 0) continue;
+            if (strcmp(d.key, "native_on_foot_body_follows_view") == 0) bodyRow = i;
+            if (strcmp(d.key, "native_on_foot_hud_stays_with_view") == 0) {
+                hudRow = i;
+                ++found;
+                shaped = shaped && d.kind == MenuKind::Choice && d.tier == MenuTier::Experimental && strcmp(d.label, "HUD stays with view") == 0 && strcmp(d.choices, "on|off") == 0 && strcmp(d.shipped, "on") == 0 &&
+                         d.applies == 1;
+            }
+        }
+        const bool beside = bodyRow >= 0 && hudRow == bodyRow + 1 && strcmp(kMenuRows[hudRow].page, kMenuRows[bodyRow].page) == 0 && strcmp(kMenuRows[hudRow].group, kMenuRows[bodyRow].group) == 0;
+        check(found == 1 && shaped && beside, "HUD stays with view (F220, TEMPORARY) is one [experimental] on/off row right after Body follows view, on its page and under its heading: live, shipped on");
+    }
+    // F222 (TEMPORARY): "Steady body in turns" is an [experimental] on/off choice right after "HUD stays with view" (F220), on the same page and under the same heading, live, shipped on.
+    {
+        int hudRow = -1, turnRow = -1, found = 0;
+        bool shaped = true;
+        for (int i = 0; i < kCount; ++i) {
+            const MenuRowDef& d = kMenuRows[i];
+            if (strcmp(d.section, "experimental") != 0) continue;
+            if (strcmp(d.key, "native_on_foot_hud_stays_with_view") == 0) hudRow = i;
+            if (strcmp(d.key, "native_on_foot_steady_body_in_turns") == 0) {
+                turnRow = i;
+                ++found;
+                shaped = shaped && d.kind == MenuKind::Choice && d.tier == MenuTier::Experimental && strcmp(d.label, "Steady body in turns") == 0 && strcmp(d.choices, "on|off") == 0 && strcmp(d.shipped, "on") == 0 &&
+                         d.applies == 1;
+            }
+        }
+        const bool beside = hudRow >= 0 && turnRow == hudRow + 1 && strcmp(kMenuRows[turnRow].page, kMenuRows[hudRow].page) == 0 && strcmp(kMenuRows[turnRow].group, kMenuRows[hudRow].group) == 0;
+        check(found == 1 && shaped && beside, "Steady body in turns (F222, TEMPORARY) is one [experimental] on/off row right after HUD stays with view, on its page and under its heading: live, shipped on");
+    }
     // F170 (TEMPORARY): "Crouched ADS torso square" is the thirteenth number row of the developer tier's native on foot rows (the twelfth before F181 put "Hip elbow swivel max" before it, the tenth before F180 put the two rows of its own between, the eighth before F178 put the two "Standing ADS body" rows between, the seventh before
     // F171 put "Crouched ADS body left / right" before that), right after the hip elbow swivel row on the same page and under the same heading: 0..1 of the shoulder line's blade in steps of 0.05, not signed,
     // live, shipped 0.0 since F173 (1.0 before: the turn was on), labelled without (test). It carries no old value over.
@@ -2227,6 +2298,7 @@ void testVisualPage() {
         {"visual", "star_glow", "Stars"},
         {"visual", "cockpit_glass", "The cockpit"},
         {"visual", "cockpit_glass_dirt", "The cockpit"},
+        {"visual", "cockpit_glass_lights", "The cockpit"},
     };
     constexpr int kWant = static_cast<int>(sizeof(want) / sizeof(want[0]));
     int at = 0, world = -1;
@@ -2243,7 +2315,7 @@ void testVisualPage() {
         if (strcmp(kMenuRows[i].key, "world_scale") == 0) world = i;
         ++at;
     }
-    check(inOrder && at == kWant, "VR's Visual page is Screen curve, Intro background picture, World scale, Intro movie, Star glow, Cockpit glass and Legacy glass dirt, Fix tier, in edvr.ini order under their headings (the desktop window rows moved to their own page, 2026-10-28)");
+    check(inOrder && at == kWant, "VR's Visual page is Screen curve, Intro background picture, World scale, Intro movie, Star glow, Cockpit glass, Legacy glass dirt and Legacy glass lights, Fix tier, in edvr.ini order under their headings (the desktop window rows moved to their own page, 2026-10-28)");
     for (int i = 0; i < kCount; ++i) {
         const bool moved = strcmp(kMenuRows[i].key, "panel_curvature") == 0 || strcmp(kMenuRows[i].key, "intro_backdrop") == 0 || strcmp(kMenuRows[i].key, "intro_video") == 0;
         if (moved && strcmp(kMenuRows[i].section, "advanced") != 0) checkf(strcmp(kMenuRows[i].page, "fixes") != 0, "%s.%s is no longer on the Fixes page", kMenuRows[i].section, kMenuRows[i].key);
@@ -2263,6 +2335,12 @@ void testVisualPage() {
             check(menuSteppedNumber(g, 100.0, 1, 1) == 110.0 && menuSteppedNumber(g, 0.0, -1, 1) == 0.0 && menuSteppedNumber(g, 300.0, 1, 1) == 300.0 && menuFormatNumber(g, 150.0) == "150 %",
                   "a press steps by 10, the ends hold at 0 and 300, and the row reads \"150 %\"");
         }
+        int lights = -1;
+        for (int i = 0; i < kCount; ++i)
+            if (strcmp(kMenuRows[i].section, "visual") == 0 && strcmp(kMenuRows[i].key, "cockpit_glass_lights") == 0) lights = i;
+        check(lights >= 0 && lights == dirt + 1, "the Legacy glass lights row is directly under the Legacy glass dirt row");
+        if (lights >= 0)
+            check(strcmp(kMenuRows[lights].label, "Legacy glass lights") == 0 && strcmp(kMenuRows[lights].shipped, "off") == 0 && kMenuRows[lights].applies == 1, "Legacy glass lights is a live row, shipped off");
     }
     if (world < 0) return;
     const MenuRowDef& d = kMenuRows[world];

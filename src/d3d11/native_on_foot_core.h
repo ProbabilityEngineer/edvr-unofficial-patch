@@ -3074,10 +3074,16 @@ struct AdsActionReject {
     bool latched = false;
     uint64_t edgeMs = 0;
     uint64_t statusRevisionAtEdge = 0;
+    bool accepted = false;   // F235: the game has reported ADS while this request was held
 };
-// A veto needs changed Status.json content observed after the request and a 1.5 s acceptance grace. Repeated reads of identical content are not fresh evidence.
-// Changed content can still report a slow transition: a later authoritative ADS=true clears the veto while held. It also starts a new grace, so a later game
-// rejection (for example a reload) can still veto the held request after a new false status. Content freshness is not proof of native weapon readiness.
+// F235: a drop of the game's ADS under a held request it had accepted is the game interrupting the aim, not refusing it: a reload takes the game out of ADS for about
+// 2 s and it takes ADS back by itself while the button is held (Steam, 2026-11-09: Status.json off about 2.0 s at each reload). The 1.5 s grace vetoed the request
+// near the reload's end, so the view left the sights and came back 0.5 s later. Such a drop is held for up to this long from the game's last ADS read; past it the
+// veto latches as before (a drop the game does not end, the request held through a sprint or the like).
+constexpr uint64_t kAdsAcceptedDropMaxMs = 5000;
+// A veto needs changed Status.json content observed after the request and a grace: 1.5 s for a request the game has not accepted, kAdsAcceptedDropMaxMs once it has
+// (F235). Repeated reads of identical content are not fresh evidence. Changed content can still report a slow transition: a later authoritative ADS=true clears the
+// veto while held and starts a new grace. Content freshness is not proof of native weapon readiness.
 inline bool adsActionRejectStep(AdsActionReject& s, bool actionAds, uint64_t nowMs, bool journalKnown, bool journalAds, uint64_t statusRevision) noexcept {
     if (!actionAds) {
         s = AdsActionReject{};
@@ -3085,6 +3091,7 @@ inline bool adsActionRejectStep(AdsActionReject& s, bool actionAds, uint64_t now
     }
     if (journalKnown && journalAds) {
         s.latched = false;
+        s.accepted = true;
         s.edgeMs = nowMs ? nowMs : 1;
         s.statusRevisionAtEdge = statusRevision;
         return false;
@@ -3095,8 +3102,9 @@ inline bool adsActionRejectStep(AdsActionReject& s, bool actionAds, uint64_t now
         s.statusRevisionAtEdge = statusRevision;
         return false;
     }
+    const uint64_t graceMs = s.accepted ? kAdsAcceptedDropMaxMs : kAdsActionRejectGraceMs;
     if (journalKnown && !journalAds && statusRevision != 0 && statusRevision != s.statusRevisionAtEdge && nowMs >= s.edgeMs &&
-        nowMs - s.edgeMs >= kAdsActionRejectGraceMs) s.latched = true;
+        nowMs - s.edgeMs >= graceMs) s.latched = true;
     return s.latched;
 }
 // The bound logical action is the prompt request; the journal is fallback when the action sample is absent/stale. `eligible` is restricted by the caller to an
@@ -5410,6 +5418,19 @@ struct GripSteady {
 // across kOffHandSteadyFrames prior samples. Once acquired, valid same-identity attaches retain authority through orientation motion; the off-arm
 // IK weight ramps on release over kOffHandRampSec.
 constexpr double kOffHandMaxM = 0.40, kOffHandSteadyDeg = 5.0, kOffHandRampSec = 0.15;
+// The distance rule per item: acquire within acquireM, hold until past releaseM. Every item but one keeps kOffHandMaxM for both, as before.
+// The Genetic Sampler ($humanoid_sampletool_name;) rests its FP left hand 40.0 cm from the right (37.9 to 40.7 cm over the flight of
+// 2026-11-08, log 142644): on kOffHandMaxM itself, so the rule flapped there and the left elbow flared (recording 20261108_132840: up to 28 cm
+// over the hand). The left hand comes in only to take the canister out after the third sample (18 to 26 cm, held at 25.8). The sampler's
+// limits sit between the two, with hysteresis: the resting hand stays the game's 3P arm, and the hand that takes the canister is followed.
+struct OffHandLimits {
+    double acquireM = kOffHandMaxM, releaseM = kOffHandMaxM;
+};
+constexpr OffHandLimits kSamplerOffHand{0.32, 0.35};
+inline OffHandLimits offHandLimits(const char* name) noexcept {
+    if (name && std::strcmp(name, "$humanoid_sampletool_name;") == 0) return kSamplerOffHand;
+    return OffHandLimits{};
+}
 // F182c: an input that is invalid only because the FP snapshot is stale (older than kIkPoseDeviationMaxGapMs, in the game's stalls) keeps the decision and the history for up to this much hook
 // time (a call counts at most 0.1 s), instead of releasing the hand and needing kOffHandSteadyFrames + 1 fresh frames to take it back. See OffHand::step.
 constexpr double kOffHandStaleKeepSec = 3.0;
@@ -5487,7 +5508,8 @@ struct OffHand {
     // explicit one-hand policy, separation limit, disarm or identity change releases it. History advances only on unique P1 frames.
     Out step(double dt, bool armed, bool ok, const float a51[16], const float a52[16], bool allowTwoHand = true,
              uint32_t frame = 0xFFFFFFFFu, uint32_t itemId = 0, uint32_t rigGen = 0, uint64_t fpRigId = 0, uint32_t fpGen = 0,
-             uint64_t acceptedNativeEpoch = 0, bool sourceSuspended = false, bool staleOnly = false) noexcept {
+             uint64_t acceptedNativeEpoch = 0, bool sourceSuspended = false, bool staleOnly = false,
+             OffHandLimits limits = OffHandLimits{}) noexcept {
         // staleOnly (F182c): ok is false only because the FP snapshot is older than the gap (the pair, the generation and the rig are otherwise readable). An attached hand keeps its decision and its history
         // through such calls, for up to kOffHandStaleKeepSec of hook time; a fresh call resumes the rule below from the kept history, and a pair that really changed (past kOffHandMaxM, the explicit
         // one-hand policy, an identity change) releases as it always did once fresh frames show it.
@@ -5568,7 +5590,7 @@ struct OffHand {
                 const double dx[3] = {static_cast<double>(a52[12]) - a51[12], static_cast<double>(a52[13]) - a51[13], static_cast<double>(a52[14]) - a51[14]};
                 o.dist = ikLen(dx);
                 o.ok = std::isfinite(o.dist);
-                closeEnough = o.ok && o.dist <= kOffHandMaxM;
+                closeEnough = o.ok && o.dist <= (attached ? limits.releaseM : limits.acquireM);
                 if (uniqueFrame && allowTwoHand && o.ok && closeEnough) {
                     pos = (pos + 1) % (kOffHandSteadyFrames + 1);
                     for (int i = 0; i < 9; ++i) hist[pos][i] = rel[i];
@@ -5642,6 +5664,9 @@ inline double supportCupBlendStep(double current, bool requested, bool targetVal
     const double w = current - s;
     return w > 0.0 ? w : 0.0;
 }
+// The Energylink and the Profile Analyser: the left hand never holds them, so the two-hand detector is vetoed and the left arm keeps the game's own pose.
+// The Genetic Sampler is not here: its left hand takes the canister out after the third sample, so the detector runs for it with tighter distance
+// limits instead (offHandLimits above; ea13030c had it here, and the canister came out with no hand on it).
 inline bool gameAuthoredLeftArm(const char* name) noexcept {
     return name && (std::strcmp(name, "$humanoid_rechargetool_name;") == 0 || std::strcmp(name, "$humanoid_companalyser_name;") == 0);
 }

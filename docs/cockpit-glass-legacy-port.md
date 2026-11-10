@@ -2,6 +2,8 @@
 
 ## Status
 
+Open 2026-11-05: in flat the dirt goes after a velocity change in normal space, until a reload. Cause measured: t12 is emptied after the swap's bind. Fix FLOWN OK in flat 2026-11-05 on `ddb725c0`, merged to main that day, ran in VR. The dirt's smear under the upscaler: FLOWN OK in flat, merged: under legacy the whole canopy draw goes into the post-upscale weapons layer ("The dirt layer", last section). VR was reported smearing 2026-11-06 (no log); the same route for VR FLOWN OK by eye on `d006d0e3`, on main `82ae83dd` ("The dirt layer in VR", end of the doc). Open 2026-11-06: station and hangar lights do not light the dirt, because neither this shader nor the game's reads local lights; the game's point and spot lists hold the pad's lights at the glass's depths, FLOWN on `ea6efed8`; an unshadowed spot light loop is the Visual option `visual.cockpit_glass_lights = off | station`, shipped off, `station` FLOWN OK by eye in flat and VR ("Station lights", end of the doc). The canopy draws at the render's size and is added into the layer when the layer is at least 1.5 times the render: half route FLOWN in VR on `ceeb4414`, about 0.22 ms a frame against about 1.1 to 1.5 ms for full, "half looks fine". Its final form has no key and has not itself flown. See "Clean glass after a supercruise exit", last section.
+
 State 2026-11-04: **FLOWN ON STEAM FLAT, NOT FLOWN IN VR, MERGING TO MAIN FOR USER FEEDBACK.** `visual.cockpit_glass = odyssey | legacy` (default `odyssey`, the game
 unchanged), flat and VR, Visual tab. Branch `claude/cockpit-glass-shader-port-1852e3`. With `legacy`, EDVR's
 own pixel shader (`cockpit_glass_shader.h`) is handed to the real `PSSetShader` in place of the game's intact
@@ -853,3 +855,278 @@ follow the level as the intact canopy does.
 - ruled out: lighting the canopy from t1 alone in a hangar, because the
   sun's colour there is 1e-13; hangar light reaches the glass only
   through local lights and probes (section 7).
+
+## Clean glass after a supercruise exit (2026-11-05)
+
+Report (Sean, flat, Frontier, `v0.22.0-rc.7`): the dirt is there when he drops out of
+supercruise, goes when he changes velocity in normal space, and comes back only after
+a trip to the main menu. Toggling the key at 15:28 did not appear to bring it back.
+Evidence: log `edvr_gfx_20261105_154759` with `experimental.cockpit_glass_probe` on,
+supercruise exit 15:50:52, Shift+NumLock 15:51:20; also `edvr_gfx_20261105_151811`.
+
+The capture's frame (`flat_pixels\20261105_225120_427_23036_1`, frame 17528) has clean
+glass with the sun ahead of the ship.
+
+The test (Sean's screen recording, 16:02:44, log `edvr_gfx_20261105_155949`, exit
+16:02:13): after losing the dirt he turned away from the star and back, and it
+flickers. The recording is 30 fps, so it drops most of the game's frames. Video frame
+56 has the full streaks over the pane; 55 and 57 have none, with the sun ahead of the
+ship. None of the seven other frames checked has them. So the streak texture and the
+dirt level can both still reach the pixels, and the replacement can still draw dirt
+in the bad state. Sean's description has not separated what turning away does.
+
+Open, each per frame: (a) the sun's shadow term, `sunShadow` returning about 0 on most
+frames; (b) `probeAmbient`, whose buffers' contents the probe does not log; (c) t12 or
+b13 overwritten between the bind and the draw on most frames, which the probe does not
+read either (it stops at t11 and b2). The flash with the sun ahead also means this
+doc's first guess was wrong that a sun ahead gives the dirt no direct light through
+`ndl`, unless the flash is (b).
+
+The test build `a2dcd3ef` (log `edvr_gfx_20261105_163445`) counted, at every canopy
+draw, what was really bound:
+
+| Window ending | Binds | All ours | t12 not the streaks | b13 or PS wrong |
+|---|---|---|---|---|
+| 16:36:45 | 1394 | 1394 | 0 | 0 |
+| 16:37:15 (exit 16:37:10, then the velocity change) | 2996 | 2415 | 581 | 0 |
+| 16:37:45 | 3058 | 0 | 3058 | 0 |
+
+So it is (c), for t12 alone: something writes t12 after the swap's bind and before the
+draw, and the streak sample then reads something else, or 0, so the albedo has no dirt.
+The bind happens only at the pixel shader's bind, so nothing puts it back. What writes
+t12 is not known yet, and neither is why a velocity change starts it. The single-frame
+flash fits a frame where the write fell before the bind.
+
+The fix: `cockpitGlassBeforeDraw`, before each draw while the swap's inputs are bound,
+checks t12 and b13, binds the swap's own again, and keeps what it found for the
+hand-back at the next pixel shader, which also closes #188's stale t12 restore. The
+build logs the first view it finds and counts these draws in each 30 s window, so the
+flight names the writer's view. The temporary `no_shadow` switch from the test build
+came out with this: the dirt needs t12 whatever the shadow does.
+
+What the flight must show: the dirt stays through a velocity change; the probe's t12
+count is 0 with `cockpit glass: canopy draws that found another binding` counting; and
+nothing else that uses t12 changes, since it gets its binding back at the next pixel
+shader bind.
+
+Flown on `ddb725c0` (Frontier, flat, log `edvr_gfx_20261105_165800`), Sean: "Dirt stays
+on now". The first rebind is at 17:00:02.6, about 0.8 s before the supercruise edge, so
+supercruise is not what starts it: t12 was empty, not another view, so whatever writes
+it is clearing the slot. In the window to 17:00:31, 2032 canopy draws found it empty and
+were put right, and the probe's t12 count is 0 of 3057. What clears it is still not
+named. VR on the same flight: t12 was found empty on 4,801 of 4,816 canopy draws just
+after the switch, falling to about 355 a window; how the dirt looked there was not
+reported. The probe's per-draw counts came out with the merge, and the rebind count
+stays in the window lines.
+
+A second report on the same flight, fixed in flat under "The dirt layer": with the dirt staying, Sean sees it smear
+when the ship moves, in flat under DLSS. With anti-aliasing off the smear goes (Sean,
+2026-11-05). Open hypothesis: the canopy writes no depth, so the dirt is a transparent
+layer over the stars, and the one motion value per pixel cannot suit both. Evidence
+wanted: a Shift+NumLock capture during a turn, for the motion on the glass pixels. Seen
+already and not explained: at 15:51, flying straight with the dirt gone, the glass
+pixels carried about 1 px of motion spreading from the centre with a sky depth.
+
+- ruled out: the legacy shader itself as the smear, because the smear goes with
+  anti-aliasing off, with the same shader and the same dirt.
+- ruled out as the main cause of the lost dirt: (a) and (b), because the dirt's albedo
+  is zero without t12 at every one of those draws, whatever the light does.
+
+- ruled out: the swap stopping, because binds equal canopy-seen in every window of
+  both logs, about 3,000 in 30 s, after the exit as before.
+- ruled out: another EDVR scope rebinding the stock shader (#188), because the
+  capture's canopy draws have actual PS `D41DCE1D76396A60`, the replacement, in the
+  bad state.
+- ruled out: another pixel shader painting the canopy, because the probe has
+  `other-ps=0` and only `4E4FF61E8A08FC7E` with `8C091FFD08644E02` in every window.
+- ruled out: the constants the shader reads from cb1 and cb2 changing, because
+  cb1[56], [90], [245], [261] and cb2[0], [6], [7], [8], [13], [15] are the same in
+  samples 1 to 6, and cb2[17] moves only in its unused w. Samples 5 and 6 are after
+  the capture of the bad state. cb1[227], [228] and [253] were not in the table read
+  and are not ruled out. The sun's colour and direction stay nonzero.
+- ruled out: the SRVs t0 to t11 and the samplers and output state changing, because
+  those lines are the same in samples 2 to 6.
+
+### The dirt layer (2026-11-05, FLOWN OK IN FLAT, merged to main; VR not done)
+
+Flown on `f4149bb4` (Frontier, flat, DLSS, log `edvr_gfx_20261105_184510`), Sean: "That's
+fixed". 2,314, 2,699 and 2,684 canopy draws in the three 30 s windows from 18:47:10 were
+in the layer, none left in the scene by the decision, all composited by tonemap
+difference. Weapons fire stayed in the layer with no stand-down (1,049 matched frames in
+one window). About 90 fps, as on the earlier flat flight; the GPU cost itself is not
+measured. Not reported: the strut edges, things in front of the glass, the look in a
+hangar. Canopy binds run 300-360 a window above the draws taken, about 12 a second: not
+explained; the new `flat ui layer legacy glass:` line prints the reasons. VR is unchanged,
+and whether the dirt smears there has not been reported.
+
+The smear is the dirt being a transparent layer over the stars under one motion value per pixel (the hypothesis above, not yet measured on the glass pixels). The design
+takes the whole canopy draw out of the upscaler instead of tuning around it. Flat only, `legacy` only, no key: it is behaviour.
+
+What was built. A new family `kLegacyGlass` (`ui_layer_math.h`, appended after `kMapGrid`) names the pair VS `8C091FFD08644E02` with PS `4E4FF61E8A08FC7E`, the game's hashes
+as the binding shadow records them (the swap is at bind time). The canopy's draw is issued once, by the game, into the eye's additive weapons layer W (the weapons fire's
+layer): `flatUiLayerDecide`, then `FlatRuntimeDrawScope::beginActualDraw`, then `uiLayerBegin` swap the target, viewport and blend. EDVR's own shader stays bound, so no
+second pass and no new shader variant. The blend is the canopy's SRC_ALPHA, INV_SRC_ALPHA (census `bl=15,6,1/5,6,1`: the leading 1 is the enable flag, then src 5, dst 6,
+op 1, and the same for alpha), which the layer converts as an over: colour as the game, alpha as transmittance. The shader writes radiance divided by alpha, so over the
+cleared layer the layer holds the radiance, the light the scene would have had added. W is composited by the existing tonemap difference, T(F_up + L) - T(F_up). The
+scene's 2 percent darkening from the alpha base (`kLegacyBaseAlpha`) is given up on purpose.
+
+When it is named. Only while `cockpitGlassLegacyLive()` and the swap is bound (`cockpitGlassSwapActive()`), through flat's rule alone (`UiFamilyFacts.legacyGlass`, set by
+`flatUiFamilyOf`). `holo_families.h` and `ui_layer_math.h` kept the canopy off the crisp take because covering it in the over-blended HUD layer would smear the stars behind
+it; the additive layer covers nothing, and `odyssey` and VR never set the fact, so the exclusion stands for them. The memo of pair facts leaves `uiMayAsk` false for the
+canopy, so the producer-run and offscreen shortcuts see the pair as before; the adapter asks through `FlatPairFacts::legacyGlassPair` and the live flag. Any refusal
+(layer not live, stand-down, tonemap unproven, no camera rows, a decision declined) leaves the draw in the scene as now. The ice and condensation overlay is untouched.
+
+Pixel position. In the layer SV_Position is in layer pixels, and the probe ambient looks its light cluster up by the game's. The block at b13 is now two registers (32 bytes):
+the dirt level, then `game = layer * xy + zw`, from `ui_holo_remap::params`. `beginInner` sets it before anything of the game's state is changed and `restore()` puts the
+identity back; every scene bind starts from the identity and uploads only on a change. A scale of 0 reads as the identity in the shader.
+
+What reaches the log. `flat ui layer: the first legacy glass taken`, the flat window's `legacy glass:` line (asked, decided, taken, refused-at-issue, refused with reasons,
+and the look), `legacy glass:` in the layer's own window (draws taken, left by reason, eye-frames by composite kind, layers lost) and a once-only line at the first composite.
+A window where the family was never asked says so, which a build that never ran it cannot print.
+
+Known and not established. (1) Whether the canopy tests depth, and against what, in the layer: if it does, the layer seeds a copy of the scene depth at the layer's size for it
+(`seedLayerDepth`), at the weapons fire's cost, and the first flight must read the `legacy glass` first-seen line's depth text. (2) Scene draws issued after the canopy now lie
+under the dirt instead of over it (the known limit of the HDR phase). (3) Whether the flat scope plans other work for the canopy pair, which would refuse it as `other-work`.
+(4) The GPU cost of drawing the canopy at the layer's size. (5) The loss path: a layer holding only glass is counted as lost glass and stands the weapons half down after 30
+frames, as the weapons fire does. The flight must show the family taken every frame in `legacy`, no `legacy glass` line in `odyssey`, the dirt not smearing under DLSS, and
+the weapons fire unchanged.
+
+### The dirt layer in VR (2026-11-06, FLOWN OK BY EYE, not merged)
+
+Flown on `d006d0e3` (Frontier, VR, 4032x4034 from 2016x2017, DLSS; log `edvr_gfx_20261106_060451`), Sean: "Looks good in VR". 4,626 and 5,324 canopy draws in the last two 30 s
+windows, 2.00 a frame, none left in the scene, all composited by tonemap difference, none lost, no stand-down. Not measured: a run on `odyssey` to compare, so the cost is not known. In the
+same log the depth seed is 0.485 ms a frame (4 seeds) and UI draws 0.836 ms, both shared with other families. Whether the runtime's motion smoothing was off is not recorded, and the
+reporter's own result is not in.
+
+A user reported the smear in VR, with no log, headset or AA setting. Sean's last VR log (Frontier, `edvr_gfx_20261105_143434`) ran DLSS at 50% per axis, 2016x2017 to 4032x4034, so
+the upscaler has less to work with than in flat. That the upscaler is the cause in VR is a hypothesis.
+
+What was built: VR's family rule (`uiLayerFamilyOf`, `vscreen.cpp`) sets `UiFamilyFacts.legacyGlass` for the canopy vertex shader on the HDR target, with `cockpitGlassLegacyLive()` and
+`cockpitGlassSwapActive()`, the same two tests as flat. The decision, the layer, the pixel map and the `legacy glass:` line are the code flat flew. Still no key: it is behaviour.
+
+What one flight separates, with the runtime's motion smoothing off and DLSS on:
+
+| What the flight shows | Reading |
+|---|---|
+| `legacy glass:` draws taken every window, none left, smear gone | the upscaler was the cause; the fix works |
+| Draws taken, smear still there | ruled out: the upscaler; next is the runtime's reprojection |
+| Draws left in the scene | read the reasons in the line; the test says nothing about the cause |
+
+What VR adds to flat's unknowns. (1) Flat flew at a layer the same size as its target (3840x2160 both), so a pixel map other than 1:1 has not flown; at 2:1 it moves the probe ambient's
+lookup, so a wrong map shows as dirt lit from the wrong place. (2) The depth test: the canopy tests the seeded copy, which comes from the 2016x2017 depth in VR, so the dirt's edge against
+struts and anything nearer may step at render pixels. (3) The canopy's matrices carrying the eye's jitter was read from flat's recipes; if VR's do not, the cancel adds jitter and the dirt
+shimmers. (4) The cost: four times the pixels shaded per eye at this render scale, a depth seed, the composite on both eyes every frame the canopy draws and the two 130.1 MB layers and
+their scratch from the first canopy draw. Compare the `EDVR GPU census` with `odyssey`. (5) A lost layer of glass counts toward the weapons half's stand-down in VR too.
+
+### Station lights (2026-11-06, EXPLAINED, nothing built)
+
+Sean: no dirt under hangar and station lights, even bright spot lights; only sunlight shows it. EDVR's shader takes the dirt's light from two places: t1, the directional light, whose
+colour is 1e-13 docked (section 7), and one probe sample at the roughest mip (`kAmbientMip` 7). That sample is close to a flat average of the room, so a spot light cannot show as a
+highlight on the dirt, and with the sun gone only the probe's low level is left. It reads no local light at all.
+
+The game's own canopy does not either. Disassembling `4E4FF61E8A08FC7E`, its only reads of t0 are the probe count at cluster +28 and the probe ids at cluster +2212, and its t2 reads are in
+that probe loop. Its other light loop runs over the directional lights (CB1[245].y). So nothing in the shader being replaced shows how local lights are stored. How the Horizons client's
+dirt looked in a station is not known: the captures of section 12 are all in space.
+
+Lighting the dirt from local lights means new work. Read offline from forward-lit game shaders (61 pixel shaders use this cluster arithmetic; `26EA073903FD8909` is the clearest, the cull
+compute is `074CB657FDBD43E6`):
+
+| Cluster count at | List starts at | Holds | Records in t2 |
+|---|---|---|---|
+| +0 | +36, 128 ids | point lights (radius, no cone), CONFIRMED | `id<<4` + cb1[249].z and .w |
+| +4 | +548, 128 ids | spot lights (cone, optional shadow and cookie), CONFIRMED | `id<<5` + cb1[250].z and .w |
+| +8 to +20 | +1060, +1316, +1572, +1828 | other types; which is which is INFERRED only | cb1[250].xy to cb1[252].xy |
+| +24, +32 | +2084, +2340 | not identified | cb1[252].w, cb1[253].x, cb1[253].w, cb1[254].x |
+| +28 | +2212, 32 ids | reflection probes, what the canopy reads | as above |
+
+A spot's first record: position xyz, packed direction in .w (largest component dropped), radius as a float at +24. Its second: intensity, a 10:10:10 colour, source radius, cos outer and cos
+inner as 16-bit fractions, then at +16 a cone exponent and a scale as half floats and 16-bit shadow and cookie indices, plus one, 0 meaning none. Falloff is
+saturate(1-(d^2/R^2)^2)^2 / max(d^2, srcR^2); the cone is pow(saturate((cos - outer)/(inner - outer)), exponent).
+
+The canopy has t0 and t2 bound and the same shared constant buffer, so an unshadowed loop over points and spots can be written with what it already binds, if cb1[249..250] are filled at that
+draw (INFERRED). A spot's shadow atlas and cookie texture are not bound to the canopy, so those would need more. Counted from the listing, not profiled: about 70 instructions a point light and
+110 a spot, unshadowed, per pixel at the layer's size. Without shadows a light behind the hull still lights the dirt.
+
+Not known, and it decides everything: whether a hangar's lights are in these lists at all. The probe flight of section 7 does not say: it logged t0 and t2's sizes (43,720,704 bytes, which is
+18,432 clusters, and 270,448) and not their contents, and it did not log cb1[249..254]. A baked or other path would leave these lists empty.
+
+The probe build (2026-11-06, branch `claude/glass-local-lights`, NOT FLOWN): `experimental.cockpit_glass_probe = on` now also copies t0 and t2 at each sample's canopy draw (one first, then one
+every 30 s, 12 at most) and logs cb1[227..228] and [248..254]. Each sample prints a `light lists:` grid line, a `list <name>:` line for all nine lists, zeros included, and up to 8 point and 8 spot
+lights in full from slices between 0.5 and 8 m. Each sample copies and scans about 44 MB, so expect a hitch every 30 s in this build.
+
+| What a docked sample shows | Reading |
+|---|---|
+| Point or spot lists hold lights at the glass's slices, with the radius reaching the cockpit | a loop can light the dirt; try it behind a temporary key |
+| Lights in the lists at farther slices only | the lights do not reach the glass in the game's own terms; a loop would add nothing |
+| All lists but `probe` are zero | the hangar's lights come another way; this route is ruled out |
+| A count past capacity, or absurd positions and radii | the layout is misread; nothing above stands until it is put right |
+
+Flown on `ea6efed8` (Frontier, VR, on a station's pad, log `edvr_gfx_20261106_064801`), four samples. The first row: **the pad's lights are in the lists, at the glass's depths.** No count past capacity, and
+the positions, radii and colours are plausible, so the layout stands for points and spots. The records are in the camera's space (their lengths hold while their directions move with the head).
+
+- Spots, 22 to 89 distinct, 8 printed a sample. Two kinds near the pad, by the shader's falloff at the camera, before the cone and a shadow: warm spots, radius 31.73, intensity 149,280 at 15.5 and 16.5 m,
+  give about 500; in S4, radius 96.06, intensity 34,912,000 at about 82 m, give about 950. White spots, radius 30.70, intensity 289,000, sat 32 to 36 m away, past their radius, so they give 0 at the camera.
+- Points, at most 128 in one cluster: the cockpit's own small lights, radius 0.5 to 3 m, intensity 7 to 64, within 2 m. They would light the dirt too, some orange and some blue.
+- The sun was on here: t1's colour 350, 335, 325 in all four samples, so "docked, the sun is off" (section 7) holds in a hangar and not on every pad; the shadow map keeps it off the glass.
+- Most warm and big spots carry a shadow index, and the shadow atlas is not bound to the canopy. `count+12` (18 lights) and `count+24` (8 or 9, in every cluster) are not identified. Which spot is the lamp Sean
+  pointed at is not known: this build did not print a spot's direction.
+
+The loop (2026-11-06, branch `claude/glass-local-lights`, NOT FLOWN). Temporary key `experimental.cockpit_glass_lights`, live, flat and VR: `off` (the default), `spots`, or `all` (spots and points).
+It goes in the shader's b13 block, y of register 0. Each light is the game's falloff and cone, then Lambert and glare with the same 1/pi as the sun in `main`, so the rig holds a light of 1000 at the glass equal to a
+sun of 1000 from that direction. Up to 16 spots and 16 points a pixel; no shadow or cookie. Remove the key once the choice is made: ship the winner as behaviour.
+
+Unproven: that 1/pi fits (the game's own spot loop in `26EA073903FD8909` is specular only, so it does not show the diffuse scale); whether no shadows looks right; the cost, from the `EDVR GPU census` with the key
+`off` against `spots` and `all` at the same spot. The flight compares them on one pad.
+
+Flown on `3eb20d23` (Frontier, FLAT, DLAA-sized DLSS route, log `edvr_gfx_20261106_073717`), `spots` for the whole flight, Sean: "That looks really good". About 4,300 canopy draws a window in the layer, none left in
+the scene. Presents held 6.94 ms (p95 6.98), the 144 fps cap, so that says only that the cap was met, not what the loop costs. The census does not time the canopy draw on its own in flat. Not flown: VR with the loop, where the
+canopy is shaded at 4032x4034 twice a frame; `all`; `off` to compare.
+
+Made a Visual option on Sean's word (2026-11-06, NOT FLOWN as a row): `visual.cockpit_glass_lights = off | station | all`, shipped `off`, the row "Legacy glass lights" under Legacy glass dirt in both menus, dimmed unless
+the look is `legacy`. It replaces `experimental.cockpit_glass_lights`, whose `spots` is `station` here. Whether to ship it on waits for the VR cost.
+
+Flown in VR on `153ebf3f` (Frontier, Pimax Crystal Super, 90 Hz, DLSS 2016x2017 to 4032x4034, log `edvr_gfx_20261106_085228`), Sean: it costs some frame time. About 75 fps on the pad in every window, 4,484 to 4,548 canopy draws in the layer, none left. The census has no canopy timer: it times "UI draws" whole, 34 a frame, the canopy's 2 among them, and the setting changed every few seconds, so the windows are mixes. Weighting 1.645, 1.457 and 1.231 ms by the time at each setting gives about 0.7 ms off, 1.3 station, 1.65 all: the lights cost about 0.6 and 0.95 ms a frame for both eyes. A rough solve, not a measurement.
+
+Options, none built: (1) draw the whole canopy at the render's size and add it to the layer bilinearly, a quarter of the pixels for all of its shading, the probes and the moment shadow as well as the loop, and no depth seed for it; the question is whether the streaks stay sharp enough, and it gains nothing where the layer is the render's size. (2) a light-only pass into a small target, sampled by the full shader; it cuts the loop alone, for one more draw. (3) a lower cap and earlier rejection, a modest gain. The next build needs a canopy timer in the census first, so any gain is measured.
+
+Which side the dirt is lit from is not settled. Sean, 2026-11-06: no dirt from the cockpit lights with `all`, and the dirt brightens more when a lamp faces him. That leans to the outer side, as Lambert with an outward normal would leave a light inside at zero, but a spot's cone and the glare lobe also brighten toward a lamp facing the viewer. The cockpit lights are also weak: about 100 at most on a small patch, against about 500 for a warm spot. Temporary key `visual.cockpit_glass_lights_sides = one | both` (default one, local lights only, not the sun) lets one flight compare. A lamp behind the ship lighting the dirt with `one` would mean the inner side.
+
+Flown in VR on `ceeb4414` (Frontier, Pimax Crystal Super, log `edvr_gfx_20261106_105922`), Sean: "half looks fine", and no visible difference between station and station plus cockpit lights. The canopy timer, half with station lights, two clean windows: 0.218 and 0.226 ms a frame, 5,038 and 5,086 draws, all by the half route, about 85 fps (2,566 and 2,543 frames). Full was only flown in short bursts: 656 of 4,588 draws gave 0.412 ms, 456 of 4,638 gave 0.325 ms, which solve to about 1.1 to 1.5 ms for full, at about 77 fps in those windows. Rough, but the half route saves about 1 ms. Off at half was held for about 4 s only, so the loop's own share at half is not measured.
+
+ruled out: the cockpit's point lights showing on the dirt, because `all` with `both` sides (held 13 s at 11:01:57) looks the same as `station` to Sean. The lights are in the lists but weak: about 100 at most on a small patch against about 500 for a warm spot.
+
+The 300-360 canopy binds a window above the draws taken (open since "The dirt layer") are named by this log: `refused=360 (not-hdr-target=360)`. About 12 a second the canopy pair is drawn into a target that is not the HDR
+one, and that draw stays in the scene. What that target is, and whether its dirt shows, is not known.
+
+#### Built 2026-11-06 (branch `claude/glass-local-lights`, full build green, NOT FLOWN): the canopy timer, a half-resolution route, a cheap rejection
+
+1. The canopy timer. The census section `AlteredLegacyGlass` (`gpu_census.h`) times the canopy's own draw from the layer's issue to `uiLayerEnd` (`ui_layer.cpp`), so it runs in both profiles and whichever route; it
+   is not a draw class, because flat never calls the "UI draws" scope. The altered line now ends with `Also timed on their own and NOT added to together: legacy glass canopy draws <ms> (<n>/frame, <k> timed)`
+   or `legacy glass canopy draws -`. In VR the same draw is also inside "UI draws" (the two sections have separate turns, so the spans never overlap); "together" is the three classes it was and excludes the canopy.
+   The section has no turn until it is called in the window, so `odyssey` samples as before. A canopy drawn into the layer with `-` on this line means the timer did not run; `<n>/frame` with `0 timed` means
+   the calls were counted and never reached the section's turn.
+2. `visual.cockpit_glass_resolution = full | half` (TEMPORARY, default `full`, live). With `half`, and only when the eye's weapons layer is at least 1.5 times the draw's target on both axes
+   (`uiLegacyGlassHalfRes`, `ui_layer_math.h`), the canopy goes into a per-eye target G at the draw target's size (R16G16B16A16_FLOAT, 2016x2017, 32.5 MB an eye at the flown size), with G's own depth-stencil
+   seeded at that size, and G is added bilinearly into W once an eye-frame in the tonemap re-issue's bracket, before the source pass adds F_up (`sharpGlassAddPass`, the source pass's own shaders with target 0 unbound).
+   The decision makes G and the add pass's pieces first; if it cannot, the draw keeps the full route and it is said once. At 1:1 (flat) nothing changes with either value. One more difference from the full route:
+   the full route's over-blend darkened the weapons fire already in W by the canopy's alpha (2 percent at the base); G is separate, so the fire is not darkened.
+3. The cheap rejection (`localLights`, `cockpit_glass_shader.h`): a light whose strength times its brightest colour channel is under 1.0 is skipped (the sun is 300 to 2,400 here). A spot is rejected before its cone is
+   worked when the strength without the cone is already under 1.0 and the exponent is not negative (the cone is at most 1); the colour is decoded after the test. `cockpit_glass_test` holds lights of 0.8 and 1.2,
+   a half-bright colour at 1.4 and 2.4, the cone factor, and a mix. The sun's path is not touched.
+
+What the flight must show, on a pad as before, VR at 2016x2017 to 4032x4034, the three settings of `visual.cockpit_glass_lights` in the same order for both values of the key:
+
+| Log line | Reading |
+|---|---|
+| `EDVR GPU census, Elite's own draws that EDVR alters`: `legacy glass canopy draws <ms> (2.00/frame, N timed)` | the canopy's cost per frame for both eyes; compare `full` and `half` at `off`, `station`, `all`. `-` with canopy draws in the `legacy glass:` line: the timer did not run |
+| `legacy glass:` window line, `draws by route: half N, full M` | `half` asked: N about 2 a frame and M 0; adds into W ran about 2 a frame (one a frame an eye), failed 0 |
+| the same line ending `HALF WAS ASKED AND NO DRAW TOOK THAT ROUTE` | the key was read and nothing took the route: read `kept on the full route by the layer/target ratio` and `by G or the add pass not ready` |
+| the same line ending `DRAWS WENT TO G AND NO ADD INTO W RAN` | the canopy is drawn and never added: the picture would have no dirt |
+| once, `legacy glass: half resolution ... the first canopy draw went into the ... glass target G` | G's size and memory; the depth-stencil is printed with it |
+| the dirt by eye | the streaks as sharp as `full`, no shimmer (G is unjittered: the cancel is the jitter at scale 1), the dirt's edge against the struts not stepped, the lamp's highlight where it was |
+
+#### The cleanup (2026-11-06, on Sean's word after the flight of `ceeb4414`)
+
+Removed, each with a flight behind it: `visual.cockpit_glass_resolution` (half is the behaviour wherever `uiLegacyGlassHalfRes` holds, full elsewhere); `visual.cockpit_glass_lights_sides` (one side, as the sun; Sean saw no difference with both, and which side is the lit one is still not known); the value `all` of `visual.cockpit_glass_lights` and the point light loop. A saved `all` now reads as off. The canopy timer stays. The half route has flown only on the Pimax Crystal Super at DLSS 50 percent; DLAA is 1:1 and keeps the full route, and FSR has not flown with it. The loop's cost on its own at half is not measured.
+
+Also in the log: `ui quality: memory` now lists G and its depth-stencil. The HDR seed census item mixes two sizes in a window with `half` (G's seed is 2016x2017 beside the HDR layer's), and says so.

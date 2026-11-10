@@ -233,6 +233,11 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         {L"vs_A6A39338C06E03A1", L"ps_1AE6AB9A94C0456E", false},
         // 2026-11-05 (Frontier 12:48, Holo-Me): the commander's suit and helmet, keyed for VR with the second skin.
         {L"vs_01DA82F8D0EA0C99", L"ps_2C3ADCD2FCD47298", false},
+        // 2026-11-05 (Frontier 14:37, a bartender): an NPC's eyes, keyed for VR with the second skin.
+        {L"vs_33A5025C48FC8259", L"ps_7AA0441EE0E88667", false},
+        // 2026-11-08 (Frontier 11:03, on foot beside the SRV at a planet): the family's stock G-buffer material that
+        // refused the view for want of a source, drawn with the HDR world camera's bytes. Keyed in both profiles.
+        {L"vs_DE545DC8EE4FBB87", L"ps_60D69AB6C65C549A", false},
     };
     for (const auto& p : pairs) onePair(device, context, root, p, &check);
     // Candidates: pairs seen drawing stock that are not keyed. Each is tried
@@ -242,6 +247,10 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // while its live owner/coverage is assessed.
     const Pair candidates[] = {
         {L"vs_DE545DC8EE4FBB87", L"ps_A6070F9DD1CFB601", false},
+        // 2026-11-08: a flat user's spell of no-supported-motion-source-pair began on this pair (an untrusted nominee at
+        // frame 3986). It passes whole on WARP, but no trace has named it as the refusing draw and its camera has not been
+        // compared with the HDR's, so it is not keyed: a pair with another camera would turn treated frames into refusals.
+        {L"vs_DE545DC8EE4FBB87", L"ps_E364F5637AB0261C", false},
         // Historical double-patch candidate: BA58 is EDVR's generated 4375
         // substitution, proven by production-patcher hashes in 162120.
         {L"vs_5B4D8E894EEDA8B4", L"ps_BA58469C3D6120A7", true},
@@ -410,6 +419,7 @@ int wmain(int argc, wchar_t** argv) {
         {0x114AF608F86D9ED8ull, 0xA17504A2627767F2ull}, {0xD99AFDC250D19A3Full, 0xE86271E464CCDC1Dull},
         {0xA6A39338C06E03A1ull, 0x1AE6AB9A94C0456Eull},   // 2026-11-01: the NPC hair's forward pass
         {0x01DA82F8D0EA0C99ull, 0x2C3ADCD2FCD47298ull},   // 2026-11-05: the commander's suit and helmet
+        {0x33A5025C48FC8259ull, 0x7AA0441EE0E88667ull},   // 2026-11-05: an NPC's eyes
     };
     static_assert(edvr::engine_velocity_family::kFamilyCount <= edvr::engine_velocity_detail::kMaxFamilies,
                   "every keyed family has its own substituted-draw counter");

@@ -40,6 +40,10 @@ inline constexpr FlatPageRow kFlatPageRows[] = {
     // menu builds none of, so the row is on this tab and not on VR's Performance page; the generator fails the build for a `flat_performance` row not listed here.
     {"fix", "hud_antialiasing",  FlatRowRead::Allowlist},
     {"fix", "optimized_stations", FlatRowRead::Allowlist},
+    // Directly under Optimized stations, and dimmed while that is off (menu.cpp): `menu performance`, so VR's Performance page shows it too (VR culls a carrier only for now).
+    {"fix", "station_window_distance", FlatRowRead::Allowlist},
+    // Under it, and dimmed while Optimized stations is off (menu.cpp): the rooms behind a carrier's shut doors; also `menu performance`, on VR's page.
+    {"fix", "skip_rooms_behind_doors", FlatRowRead::Allowlist},
 };
 inline constexpr size_t kFlatPageRowCount = sizeof(kFlatPageRows) / sizeof(kFlatPageRows[0]);
 
@@ -64,6 +68,8 @@ inline constexpr FlatPageRow kFlatVisualRows[] = {
     {"visual", "cockpit_glass", FlatRowRead::Allowlist},
     // Legacy glass dirt (2026-11-05): how much dirt the legacy look draws, in percent. Dimmed unless cockpit_glass is legacy (menu.cpp cockpitGlassDirtRowDisabled).
     {"visual", "cockpit_glass_dirt", FlatRowRead::Allowlist},
+    // Legacy glass lights (2026-11-06): which lights reach that dirt. Dimmed unless cockpit_glass is legacy, as the row above.
+    {"visual", "cockpit_glass_lights", FlatRowRead::Allowlist},
     {"fix", "particle_billboard", FlatRowRead::Allowlist},
 };
 inline constexpr size_t kFlatVisualRowCount = sizeof(kFlatVisualRows) / sizeof(kFlatVisualRows[0]);

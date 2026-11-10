@@ -709,6 +709,7 @@ enum class UiLayerFamily : uint8_t {
                        // family's number moves (docs\galaxy-map-vr-2026-11-03.md, Fix 2).
     kMapPlane,         // the System Map's flat icons (vs 88DCF1164C640EC3 with ps FEDE6C9825C3828E, n=6), drawn after the bodies with the depth test the game gave them, named only while the System Map's camera is up (UiFamilyFacts.mapSystem): the vertex shader is a general one, also drawn on the Galaxy Map and in the world.
     kMapGrid,          // the System Map's grid: the same pair at n=1014, drawn before most bodies at viewport depth 0. In the layer it takes no depth test; the bodies are cut out of the layer after it (galaxy_map_vs.h, THE CUT-OUT BEHIND THE BODIES). Both appended after kMapMarks (2026-11-05).
+    kLegacyGlass,      // the canopy under visual.cockpit_glass = legacy (vs 8C091FFD08644E02 with ps 4E4FF61E8A08FC7E; cockpit_glass.cpp swaps the pixel shader for EDVR's own at bind time): the whole draw is taken into the eye's additive weapons layer W, so the dirt leaves the upscaler. Named only while UiFamilyFacts.legacyGlass is set, which flat's rule and VR's set only while the legacy look is live (docs\cockpit-glass-legacy-port.md, "The dirt layer"). Appended after kMapGrid (2026-11-05).
     kCount
 };
 
@@ -737,6 +738,7 @@ inline const char* uiLayerFamilyName(UiLayerFamily f) {
         case UiLayerFamily::kMapMarks: return "map rings and stems";
         case UiLayerFamily::kMapPlane: return "map plane icons";
         case UiLayerFamily::kMapGrid: return "map grid";
+        case UiLayerFamily::kLegacyGlass: return "legacy glass";
         default: return "none";
     }
 }
@@ -752,13 +754,22 @@ inline bool uiLayerFamilyTakesHdr(UiLayerFamily f) {
            f == UiLayerFamily::kSupercruiseBars || f == UiLayerFamily::kSpaceDust ||
            f == UiLayerFamily::kMapCanvas || f == UiLayerFamily::kMapSprite || f == UiLayerFamily::kOnFootHud ||
            f == UiLayerFamily::kWeaponsFire || f == UiLayerFamily::kShieldRipple || f == UiLayerFamily::kScopeMark ||
-           f == UiLayerFamily::kNormalSpaceDust || f == UiLayerFamily::kMapMarks || f == UiLayerFamily::kMapPlane || f == UiLayerFamily::kMapGrid;
+           f == UiLayerFamily::kNormalSpaceDust || f == UiLayerFamily::kMapMarks || f == UiLayerFamily::kMapPlane || f == UiLayerFamily::kMapGrid ||
+           f == UiLayerFamily::kLegacyGlass;
 }
 
-// The families drawn into the eye's additive weapons layer W (the weapons fire's light and the scope's gunsight mark, which the game blends additively too) and so
-// composited by the same tonemap difference, T(F_up + L) - T(F_up), after the upscale. The ONE list: the decision, the layer's draw path and the rigs' routing model ask it.
+// The families drawn into the eye's additive weapons layer W (the weapons fire's light and the scope's gunsight mark, which the game blends additively too, and the legacy
+// canopy's glare and dirt, whose replacement shader's output over a black layer is the same added light) and so composited by the same tonemap difference,
+// T(F_up + L) - T(F_up), after the upscale. The ONE list: the decision, the layer's draw path and the rigs' routing model ask it.
 inline bool uiLayerFamilyUsesWeaponsLayer(UiLayerFamily f) {
-    return f == UiLayerFamily::kWeaponsFire || f == UiLayerFamily::kScopeMark;
+    return f == UiLayerFamily::kWeaponsFire || f == UiLayerFamily::kScopeMark || f == UiLayerFamily::kLegacyGlass;
+}
+
+// Whether the legacy canopy's draw takes the half-resolution route, drawn at the draw target's size and added into the weapons layer: the eye's weapons layer is at least 1.5 times the draw's target on
+// BOTH axes (2 * layer >= 3 * target, in integers). At 1:1 (flat at its native size) the route would only add a pass, so the draw keeps the full route and flat behaves as it did.
+inline bool uiLegacyGlassHalfRes(uint32_t layerW, uint32_t layerH, uint32_t targetW, uint32_t targetH) {
+    if (!layerW || !layerH || !targetW || !targetH) return false;
+    return 2ull * layerW >= 3ull * targetW && 2ull * layerH >= 3ull * targetH;
 }
 
 // Which half governs a family: the weapons fire is its own half, and so is the shield ripple (as a half of its own: `rippleOn` is its live state, with
@@ -1062,7 +1073,12 @@ struct UiFamilyFacts {
     bool mapSystem = false;       // VR: the System Map's camera is up, so its flat plane's pair is named
     bool mapPlaneIcon = false;    // that pair's draw is one of the plane's icons (n=6)
     bool mapPlaneGrid = false;    // or the grid (n=1014). Flat's census shows the pair at another count too, a mesh of 58416 indices: that stays in the scene
+    bool legacyGlass = false;     // visual.cockpit_glass is legacy (cockpitGlassLegacyLive) and the replacement is bound, so the canopy pair is named; with `odyssey` nothing sets it
 };
+
+// The canopy pair (holo_families.h kHoloCanopy; cockpit_glass_core.h kReplacedPsHash is the same pixel shader, which tools\cockpit_glass_test holds equal). The shadow records the game's
+// hashes, not the swapped shader's, so these are what a draw's key carries while the swap is in.
+constexpr uint64_t kUiVsLegacyGlass = kHoloCanopy, kUiPsLegacyGlass = 0x4E4FF61E8A08FC7Eull;
 
 // How the rule reached its answer, for the family census (ui_layer.cpp).
 enum class UiFamilyWhy : uint8_t {
@@ -1099,7 +1115,8 @@ inline const char* uiFamilyWhyName(UiFamilyWhy w) {
 inline bool uiLayerFamilyHdrVsMayWant(uint64_t vs) {
     return vs == kUiVsPanel || vs == kUiVsLoader || uiVsIsMapOverlay(vs) || vs == kUiVsMapPlane || vs == kUiVsMapLinesA || vs == kUiVsMapLinesB || uiVsIsHoloPanel(vs) || vs == kUiVsFlightHud || vs == kUiVsSprite ||
            vs == kUiVsOrbitLines || vs == kUiVsSupercruiseBars || vs == kUiVsSpaceDust || vs == kVsNormalSpaceDust || weaponsFireVs(vs) || shieldRefractVs(vs) ||
-           uiHoloGenericHash(vs) || vs == kHoloTargetSphere || uiOnFootHudVs(vs) || vs == kUiVsScopeMark;
+           uiHoloGenericHash(vs) || vs == kHoloTargetSphere || uiOnFootHudVs(vs) || vs == kUiVsScopeMark ||
+           vs == kUiVsLegacyGlass;   // runtime-gated like the scope mark (UiFamilyFacts.legacyGlass): the byte holds hashes only, the facts decide per draw
 }
 
 inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why = nullptr) {
@@ -1115,7 +1132,10 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         // is deliberately NOT on that list -- it sits in front of the whole
         // sky, and covering it would smear the stars behind it, the depth
         // pass's own reasoning -- and neither are the two the phase-3
-        // review refused. Two exact target-sphere pixel shaders are now
+        // review refused. The canopy is named below only under the legacy
+        // look (UiFamilyFacts.legacyGlass): it is
+        // taken into the additive layer, which adds light and covers nothing,
+        // so the stars behind it are not touched. Two exact target-sphere pixel shaders are now
         // considered separately: their original screen-depth address must be
         // repaired and all dependencies prepared before redirecting. Unknown
         // sphere variants and the shared world/cockpit corona remain stock.
@@ -1152,6 +1172,7 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
                   ? UiLayerFamily::kHoloGeneric
               : (f.nativeOnFoot && uiOnFootHudMatch(f.vs, f.ps)) ? UiLayerFamily::kOnFootHud
               : (f.scopeMark && f.vs == kUiVsScopeMark && f.ps == kUiPsScopeMark) ? UiLayerFamily::kScopeMark
+              : (f.legacyGlass && f.vs == kUiVsLegacyGlass && f.ps == kUiPsLegacyGlass) ? UiLayerFamily::kLegacyGlass
               : UiLayerFamily::kNone;
         if (out != UiLayerFamily::kNone) w = UiFamilyWhy::kDirect;
     } else if (f.excluded) {
@@ -1985,6 +2006,23 @@ inline double uiLayerPercentile(float* v, uint32_t n, double frac) {
     if (!v || !n) return 0.0;
     std::sort(v, v + n);
     return uiLayerSortedPercentile(v, n, frac);
+}
+
+// The same number as uiLayerPercentile, by selection instead of a full sort: the interpolation reads only the two order
+// statistics at lo and lo+1, and nth_element leaves every element after lo >= v[lo], so the (lo+1)th statistic is the minimum of
+// the rest. O(n) instead of O(n log n); v is left partitioned (any order is a valid input to another call). Samples are finite
+// timer sums, so there is no NaN to order differently.
+inline double uiLayerPercentileSelect(float* v, uint32_t n, double frac) {
+    if (!v || !n) return 0.0;
+    const double pos = frac * static_cast<double>(n - 1);
+    uint32_t lo = static_cast<uint32_t>(pos);
+    if (lo > n - 1) lo = n - 1;
+    const uint32_t hi = lo + 1 < n ? lo + 1 : lo;
+    const double t = pos - static_cast<double>(lo);
+    std::nth_element(v, v + lo, v + n);
+    const float a = v[lo];
+    const float b = hi != lo ? *std::min_element(v + lo + 1, v + n) : a;
+    return static_cast<double>(a) * (1.0 - t) + static_cast<double>(b) * t;
 }
 
 // THE TONEMAP RE-ISSUE'S SCENE IMAGES (docs/cockpit-hud-layer-design-2026-09-27.md, "2026-10-20: bloom counted twice").

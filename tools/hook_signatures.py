@@ -1980,6 +1980,8 @@ AUDIT_EXACT_ONLY = (
     ("d3d11/avatar_skeleton_core.h", "the extracted avatar skeleton's exact-build vtables and slots"),
     ("d3d11/shop_screen_core.h", "F209's exact-build Pioneer Supplies buy screens: five hook addresses, their prologue bytes and three vtables, checked against the build's PE identity and the "
      "prologue bytes before any is placed (native_on_foot_hooks.cpp, in this family, places them); making them self-locating needs the signature table regenerated"),
+    ("d3d11/preview_headlook_core.h", "F233's exact-build HeadlookCamera: its producer (0x1074650, 15 pinned bytes) and its two vtables, taken only on the known build and only after the pin matches "
+     "(native_preview_camera.cpp, in the audit, hooks it through the resolver); making them self-locating needs the signature table regenerated"),
     ("d3d11/native_on_foot_f212.h", "F212's exact-build conversation look: the address and all 17 bytes of the look springs' target setter (a leaf with no unwind data), checked against the "
      "build's PE identity and every byte before the hook is placed (native_on_foot_hooks.cpp, in this family, places it); making it self-locating needs the signature table regenerated"),
     ("d3d11/native_on_foot_f87.h", "the exact-build interaction prompt probe's addresses and pins"),
@@ -1989,6 +1991,7 @@ AUDIT_EXACT_ONLY = (
     ("d3d11/native_on_foot_f141.h", "the exact-build ADS sight point hooks (they feed the ADS eye), called functions, vtable and slot"),
     ("d3d11/native_on_foot_f154.h", "the exact-build screen-space owner's vtable slot and the stolen size of its hook"),
     ("d3d11/mem_tick.cpp", "a diagnostic whose addresses are not in the table"),
+    ("d3d11/concourse_camera_test.cpp", "the TEMPORARY concourse camera test (docs/concourse-cull-2026-11-05.md): installs only when gameBuildKnown(), so its RVAs are the known build's and need no resolver"),
     ("d3d11/srv_radar_anchor.cpp", "the SRV radar anchor's exact-build hooks: the placement setter, the slot camera"),
     ("d3d11/terrain_cull_cover*", "terrain cull cover, which finds its site by its own scan on an unknown build"),
 )

@@ -7,6 +7,7 @@
 #include "gpu_census.h"       // issue #38: the per-feature GPU cost census
 #include "gpu_pass_profile.h" // TEMPORARY GPU pass profiler (hotkey.gpu_pass_profile): one bool read per hook unarmed
 #include "blend_probe.h"      // TEMPORARY blend probe (hotkey.blend_probe): one relaxed load per eye draw unarmed
+#include "concourse_pane.h"   // TEMPORARY concourse panes (diag.concourse_pane_mode): one relaxed load per real draw while nothing is armed
 #include "../common/d3d11_gpu_command_slots.h"
 #include "vr_runtime.h"
 
@@ -2627,6 +2628,14 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     if (uiLayerCrispOn() && self == g_state->ownerCtx) {
         uiLayerCrispNoteEyeDraw(self, kind, count, instances, args.startInstance);
     }
+    // TEMPORARY (the concourse cull's VR proving build, optimized_station.cpp): the camera probe's tone-draw lines. One atomic load while idle.
+    if (concourseVrProbeToneArmed() && self == g_state->ownerCtx) {
+        concourseVrProbeToneDraw(self, kind, count, instances, args.startInstance);
+    }
+    // TEMPORARY (the concourse cull's VR bake, concourse_pane.h): the game's tonemap, once per eye, is where a bake frame is captured. One relaxed load while no bake runs.
+    if (concourseVrBakeToneArmed() && self == g_state->ownerCtx) {
+        concoursePaneVrBakeToneDraw(self, kind, count, instances, args.startInstance);
+    }
     // The pool probe (object_probe.h): one bool while off; a few t33 reads a
     // frame until the pool is known, then one a second. The bool is now read
     // HERE: objectProbeWantsDraws() is the callee's own first test, inline,
@@ -4280,6 +4289,11 @@ __declspec(noinline) UiLayerFamily uiLayerFamilyOf(State* s, char kind, UINT cou
         f.ps = bindingShaderHash(BindSlot::Ps);
     else if (f.targetKind == 1 && (weaponsFireVs(f.vs) || shieldRefractVs(f.vs)))  // The weapons fire: the pair is the key too
         f.ps = bindingShaderHash(BindSlot::Ps);
+    // The legacy canopy: named only while the replacement is bound for this draw, so a swap that was refused and `odyssey` leave the game's own canopy draw in the scene. The pair is the key too.
+    else if (f.targetKind == 1 && f.vs == kUiVsLegacyGlass && cockpitGlassLegacyLive() && cockpitGlassSwapActive()) {
+        f.legacyGlass = true;
+        f.ps = bindingShaderHash(BindSlot::Ps);
+    }
     // A2: the scope's gunsight mark. Its pair is also the weapon and tool material, so the key is the pair drawing 6 indices in 1 instance with a learned interface surface (the readout
     // atlas) sampled, and only while the scope lens is armed for the frame, or (C1a, crisp_reticle.h) while the frame thread's gate has the sights of a weapon the lens does not name up. The
     // cheap tests come first: the hash of an ordinary draw is not read (uiScopeMarkFacts, the rule the rig drives). Outside a press of the sights the second arming is down: one more load.
@@ -5081,6 +5095,37 @@ static inline void nativeOnFootMarkerTee(ID3D11DeviceContext* self, uint32_t ins
     }
 }
 
+// The two setters the mask uses are the game's own entry points, past the thunks (no binding shadow, issue epoch or blend generation moves: the state
+// is put back before anything else looks). A slot that was never hooked (realOMSetDepthStencilState stays null on a vtable too short for it) is the
+// context's own method.
+static void STDMETHODCALLTYPE stationMaskSetBlend(ID3D11DeviceContext* ctx, ID3D11BlendState* state, const FLOAT factor[4], UINT sampleMask) {
+    if (g_state->realOMSetBlendState) g_state->realOMSetBlendState(ctx, state, factor, sampleMask);
+    else ctx->OMSetBlendState(state, factor, sampleMask);
+}
+static void STDMETHODCALLTYPE concoursePaneSetPs(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps, ID3D11ClassInstance* const* instances, UINT count) {
+    if (g_state->realPSSetShader) g_state->realPSSetShader(ctx, ps, instances, count);
+    else ctx->PSSetShader(ps, instances, count);
+}
+static void STDMETHODCALLTYPE stationMaskSetDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* state, UINT stencilRef) {
+    if (g_state->realOMSetDepthStencilState) g_state->realOMSetDepthStencilState(ctx, state, stencilRef);
+    else ctx->OMSetDepthStencilState(state, stencilRef);
+}
+static void STDMETHODCALLTYPE concoursePaneSetSrv(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11ShaderResourceView* const* srvs) {
+    if (g_state->realPSSetShaderResources) g_state->realPSSetShaderResources(ctx, start, n, srvs);
+    else ctx->PSSetShaderResources(start, n, srvs);
+}
+static void STDMETHODCALLTYPE concoursePaneSetVs(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs, ID3D11ClassInstance* const* instances, UINT count) {
+    if (g_state->realVSSetShader) g_state->realVSSetShader(ctx, vs, instances, count);   // past hookedVSSetShader: no shadow, no issue epoch
+    else ctx->VSSetShader(vs, instances, count);
+}
+static void STDMETHODCALLTYPE concoursePaneDraw(ID3D11DeviceContext* ctx, UINT count, UINT start) {
+    if (g_state->realDraw) g_state->realDraw(ctx, count, start);   // past hookedDraw: the mark pass's triangle is not a game draw
+    else ctx->Draw(count, start);
+}
+// TEMPORARY (concourse_pane.h): the entry points the glass panes' scope and mark pass put state through. The input layout, topology and rasteriser state setters
+// the mark pass also uses are not hooked, so it calls the context's own.
+static const ConcoursePaneCalls kConcoursePaneCalls = {&stationMaskSetBlend, &concoursePaneSetPs, &concoursePaneSetSrv, &stationMaskSetDepth, &concoursePaneSetVs,
+                                                       &concoursePaneDraw};
 // The argument buffer holds the counts, so the census records n=0 i=0
 // and args= names the buffer. Kind 'Z' indexed, 'Y' not.
 void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
@@ -5090,7 +5135,10 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
         FlatRuntimeDrawScope flatDraw(self, 0, 'Z');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw(args, off);
-        g_state->realDrawIndexedInstancedIndirect(self, args, off);
+        {
+            ConcoursePaneScope pane(self, 0, 0, 0, 'Z', kConcoursePaneCalls);   // the outside's indirect draws are withheld like its direct ones; no mirror (the counts are on the GPU)
+            if (!pane.withheld()) g_state->realDrawIndexedInstancedIndirect(self, args, off);
+        }
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawIndexedInstancedIndirect(self, args, off); });
         return;
@@ -5113,7 +5161,10 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         if (pixelProbeLive(g_state)) pixelProbeBefore(g_state, self);
         if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     }
-    g_state->realDrawIndexedInstancedIndirect(self, args, off);
+    {
+        ConcoursePaneScope pane(self, 0, 0, 0, 'Z', kConcoursePaneCalls);   // withheld like a direct draw; no mirror (the counts are on the GPU)
+        if (!pane.withheld()) g_state->realDrawIndexedInstancedIndirect(self, args, off);
+    }
     // Indirect: the GPU-side argument buffer means count/instances are not
     // knowable here, the same reason drawCensusDrawDirect above logs 0,0.
     if (!foreignContext(self) && pixelProbeLive(g_state)) pixelProbeAfterEye(g_state, self, 0, 0, true);
@@ -5126,7 +5177,10 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
         FlatRuntimeDrawScope flatDraw(self, 0, 'Y');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw(args, off);
-        g_state->realDrawInstancedIndirect(self, args, off);
+        {
+            ConcoursePaneScope pane(self, 0, 0, 0, 'Y', kConcoursePaneCalls);   // the outside's indirect draws are withheld like its direct ones; no mirror (the counts are on the GPU)
+            if (!pane.withheld()) g_state->realDrawInstancedIndirect(self, args, off);
+        }
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawInstancedIndirect(self, args, off); });
         return;
@@ -5149,7 +5203,10 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         if (pixelProbeLive(g_state)) pixelProbeBefore(g_state, self);
         if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     }
-    g_state->realDrawInstancedIndirect(self, args, off);
+    {
+        ConcoursePaneScope pane(self, 0, 0, 0, 'Y', kConcoursePaneCalls);   // withheld like a direct draw; no mirror (the counts are on the GPU)
+        if (!pane.withheld()) g_state->realDrawInstancedIndirect(self, args, off);
+    }
     if (!foreignContext(self) && pixelProbeLive(g_state)) pixelProbeAfterEye(g_state, self, 0, 0, true);
 }
 
@@ -5430,17 +5487,6 @@ static inline bool flatStationSkipsDraw(ID3D11DeviceContext* self) {
 // If the masking states cannot be made the draw is not issued and the plans still get their begin and end. Which way it went is counted (the station's
 // 30 s line); a path that never runs reads 0.
 static edvr::stationmask::Mask g_stationSunMask;
-// The two setters the mask uses are the game's own entry points, past the thunks (no binding shadow, issue epoch or blend generation moves: the state
-// is put back before anything else looks). A slot that was never hooked (realOMSetDepthStencilState stays null on a vtable too short for it) is the
-// context's own method.
-static void STDMETHODCALLTYPE stationMaskSetBlend(ID3D11DeviceContext* ctx, ID3D11BlendState* state, const FLOAT factor[4], UINT sampleMask) {
-    if (g_state->realOMSetBlendState) g_state->realOMSetBlendState(ctx, state, factor, sampleMask);
-    else ctx->OMSetBlendState(state, factor, sampleMask);
-}
-static void STDMETHODCALLTYPE stationMaskSetDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* state, UINT stencilRef) {
-    if (g_state->realOMSetDepthStencilState) g_state->realOMSetDepthStencilState(ctx, state, stencilRef);
-    else ctx->OMSetDepthStencilState(state, stencilRef);
-}
 class FlatStationSunGate {
 public:
     FlatStationSunGate(ID3D11DeviceContext* self, const FlatRuntimeDrawScope& scope, bool stationSkip) : ctx_(self) {
@@ -5510,7 +5556,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         // Planet patch motion (celestial_motion.h): the flat profile's capture of a colour-pass patch draw, before the game's own issue.
         if (self == g_state->ownerCtx && celestialMotionLive() && bindingShaderHash(BindSlot::Vs) == kCelestialPatchVs) celestialMotionNoteDraw(self);
         // TEMPORARY (cockpit_glass_probe.h): the canopy draw's state, before anything substitutes a binding; one load while off.
-        if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'D', count, 1);
+        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'D', count, 1);
         ++g_state->thunkHits[kHitDraw];
         // Capture original game bindings before the temporal scope substitutes
         // the engine-motion PS/MRT or the output-copy SRV.
@@ -5525,7 +5571,8 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         FlatStationSunGate sun(self, flatDraw, stationSkip);   // built 2026-10-21: only a skipped sun draw is changed (no real call, or a masked one)
         {
             FlatParticleScope particle(self, 'D', count, 1);
-            if (sun.issues()) g_state->realDraw(self, count, start);
+            ConcoursePaneScope pane(self, count, start, 0, 'D', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (sun.issues() && !pane.withheld()) g_state->realDraw(self, count, start);
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
@@ -5538,7 +5585,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     gpuFrameCommandIfLive(self);
     // F45 (TEMPORARY instrument): a non-instanced draw reads instance stream entry 0 (the marker probe's record match); staging copies only.
     if (nativeOnFootMarkerProbeLive() && self == g_state->ownerCtx) nativeOnFootMarkerTee(self, 1, 0, 'D', count, start, 0);
-    if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'D', count, 1);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
+    if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'D', count, 1);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
     if (self == g_state->ownerCtx) { temporalPassCountDraw(); if (temporalPassWantsDraw()) temporalPassNoteDraw(self); }   // tags the camera write before it / counts a mini-render's draws
     DrawClock clock;
     ++g_state->thunkHits[kHitDraw];
@@ -5560,14 +5607,18 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         // forwardWithVerdict's own return for the owner's blocked UI layer is kept; the game's draw otherwise as it is issued there.
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
-            g_state->realDraw(self, count, start);
+            {
+                ConcoursePaneScope pane(self, count, start, 0, 'D', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+                if (!pane.withheld()) g_state->realDraw(self, count, start);
+            }
             if (clock.on) clock.realCall(r0);
         }
     } else forwardWithVerdict(self, v, flags, 'D', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
-            g_state->realDraw(self, count, start);
+            ConcoursePaneScope pane(self, count, start, 0, 'D', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (!pane.withheld()) g_state->realDraw(self, count, start);
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
@@ -5585,7 +5636,10 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, 0, 0);
         FlatRuntimeDrawScope flatDraw(self, 0, 'A');
         if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw();
-        g_state->realDrawAuto(self);
+        {
+            ConcoursePaneScope pane(self, 0, 0, 0, 'A', kConcoursePaneCalls);   // the outside's DrawAuto is withheld like its direct draws; no mirror (the count is on the GPU)
+            if (!pane.withheld()) g_state->realDrawAuto(self);
+        }
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
         flatDraw.uiReissue([&] { ReissueClock flatClock(ReissueCaller::FlatUi); g_state->realDrawAuto(self); });
         return;
@@ -5597,7 +5651,10 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
     // No verdict on this path: the fast path's decision is the gate and the AA alone (draw_fast_path.h).
     if (self == g_state->ownerCtx && !drawPathFast(DrawVerdict::kNone)) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
-    g_state->realDrawAuto(self);
+    {
+        ConcoursePaneScope pane(self, 0, 0, 0, 'A', kConcoursePaneCalls);   // withheld like a direct draw; no mirror (the count is on the GPU)
+        if (!pane.withheld()) g_state->realDrawAuto(self);
+    }
 }
 void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
                                          UINT startIndex, INT baseVertex) {
@@ -5606,7 +5663,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     if (runtimeFlatProfile()) {
         const bool stationSkip = flatStationSkipsDraw(self);
         if (self == g_state->ownerCtx && celestialMotionLive() && bindingShaderHash(BindSlot::Vs) == kCelestialPatchVs) celestialMotionNoteDraw(self);
-        if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'I', count, 1);   // TEMPORARY (cockpit_glass_probe.h)
+        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'I', count, 1);   // TEMPORARY (cockpit_glass_probe.h)
         ++g_state->thunkHits[kHitDrawIndexed];
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDraw(self, count, 1);
         {
@@ -5620,7 +5677,11 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'I', count, 1);
-            if (sun.issues()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            ConcoursePaneScope pane(self, count, startIndex, baseVertex, 'I', kConcoursePaneCalls);
+            if (sun.issues() && !pane.withheld()) {
+                g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+                while (pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);   // the mirror: the same draw again (concourse_pane.h)
+            }
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
@@ -5632,7 +5693,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     gpuFrameCommandIfLive(self);
     // F45 (TEMPORARY instrument): a non-instanced draw reads instance stream entry 0 (the marker probe's record match); staging copies only.
     if (nativeOnFootMarkerProbeLive() && self == g_state->ownerCtx) nativeOnFootMarkerTee(self, 1, 0, 'I', count, startIndex, baseVertex);
-    if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'I', count, 1);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
+    if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'I', count, 1);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
     if (self == g_state->ownerCtx) { temporalPassCountDraw(); if (temporalPassWantsDraw()) temporalPassNoteDraw(self); }
     DrawClock clock;
     ++g_state->thunkHits[kHitDrawIndexed];
@@ -5654,14 +5715,24 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         uiLayerMapRunEnd(self);   // as in hookedDraw
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
-            g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            {
+                ConcoursePaneScope pane(self, count, startIndex, baseVertex, 'I', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
+                if (!pane.withheld()) {
+                    g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+                    while (pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+                }
+            }
             if (clock.on) clock.realCall(r0);
         }
     } else forwardWithVerdict(self, v, flags, 'I', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
-            g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            ConcoursePaneScope pane(self, count, startIndex, baseVertex, 'I', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
+            if (!pane.withheld()) {
+                g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+                while (pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            }
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
@@ -5696,7 +5767,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     if (runtimeFlatProfile()) {
         const bool stationSkip = flatStationSkipsDraw(self);
         if (self == g_state->ownerCtx && celestialMotionLive() && bindingShaderHash(BindSlot::Vs) == kCelestialPatchVs) celestialMotionNoteDraw(self);
-        if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'N', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h)
+        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'N', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h)
         if (self == g_state->ownerCtx && flatTemporalCapturing())
             flatTemporalDraw(self, perInstance, instances);
         {
@@ -5711,7 +5782,8 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'N', perInstance, instances);
-            if (sun.issues()) g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
+            ConcoursePaneScope pane(self, perInstance, startVertex, 0, 'N', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (sun.issues() && !pane.withheld()) g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
@@ -5723,7 +5795,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     gpuFrameCommandIfLive(self);
     // F44 (TEMPORARY instrument): before the verdict, so the bindings read are the game's; copies into EDVR's staging only.
     if (nativeOnFootMarkerProbeLive() && self == g_state->ownerCtx) nativeOnFootMarkerTee(self, instances, startInstance, 'N', perInstance, startVertex, 0);
-    if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'N', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
+    if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'N', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
     if (self == g_state->ownerCtx) { temporalPassCountDraw(); if (temporalPassWantsDraw()) temporalPassNoteDraw(self); }
     noteStaleForward(kSlotDrawInstanced, reinterpret_cast<const void*>(g_state->realDrawInstanced),
                      "DrawInstanced");
@@ -5754,15 +5826,20 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         uiLayerMapRunEnd(self);   // as in hookedDraw
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
-            g_state->realDrawInstanced(self, perInstance, drawn, startVertex, startInstance);
+            {
+                ConcoursePaneScope pane(self, perInstance, startVertex, 0, 'N', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+                if (!pane.withheld()) g_state->realDrawInstanced(self, perInstance, drawn, startVertex, startInstance);
+            }
             if (clock.on) clock.realCall(r0);
         }
     } else forwardWithVerdict(self, v, flags, 'N', perInstance, drawn, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
-            g_state->realDrawInstanced(self, perInstance, drawn, startVertex,
-                                       startInstance);
+            ConcoursePaneScope pane(self, perInstance, startVertex, 0, 'N', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (!pane.withheld())
+                g_state->realDrawInstanced(self, perInstance, drawn, startVertex,
+                                           startInstance);
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
@@ -5782,7 +5859,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     if (runtimeFlatProfile()) {
         const bool stationSkip = flatStationSkipsDraw(self);
         if (self == g_state->ownerCtx && celestialMotionLive() && bindingShaderHash(BindSlot::Vs) == kCelestialPatchVs) celestialMotionNoteDraw(self);
-        if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'X', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h)
+        if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'X', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h)
         if (self == g_state->ownerCtx && flatTemporalCapturing())
             flatTemporalDraw(self, perInstance, instances);
         {
@@ -5798,9 +5875,14 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'X', perInstance, instances);
-            if (sun.issues())
+            ConcoursePaneScope pane(self, perInstance, startIndex, baseVertex, 'X', kConcoursePaneCalls);
+            if (sun.issues() && !pane.withheld()) {
                 g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                   baseVertex, startInstance);
+                while (pane.nextMirrorPass())
+                    g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
+                                                      baseVertex, startInstance);
+            }
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
@@ -5812,7 +5894,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     gpuFrameCommandIfLive(self);
     // F44 (TEMPORARY instrument): before the verdict, so the bindings read are the game's; copies into EDVR's staging only.
     if (nativeOnFootMarkerProbeLive() && self == g_state->ownerCtx) nativeOnFootMarkerTee(self, instances, startInstance, 'X', perInstance, startIndex, baseVertex);
-    if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'X', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
+    if (cockpitGlassLegacyLive() && self == g_state->ownerCtx) cockpitGlassBeforeDraw(self); if (cockpitGlassProbeLive() && self == g_state->ownerCtx) cockpitGlassProbeDraw(self, 'X', perInstance, instances);   // TEMPORARY (cockpit_glass_probe.h): before the verdict
     if (self == g_state->ownerCtx) { temporalPassCountDraw(); if (temporalPassWantsDraw()) temporalPassNoteDraw(self); }
     noteStaleForward(kSlotDrawIndexedInstanced, reinterpret_cast<const void*>(g_state->realDrawIndexedInstanced),
                      "DrawIndexedInstanced");
@@ -5858,8 +5940,14 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             // The game's own draw, and only it (gpu_census.h): the weapon and screen motion
             // reissues below have sections of their own.
             GpuCensusAlteredScope timed(self, altered);
-            g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
-                                              baseVertex, startInstance);
+            ConcoursePaneScope pane(self, perInstance, startIndex, baseVertex, 'X', kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
+            if (!pane.withheld()) {
+                g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
+                                                  baseVertex, startInstance);
+                while (pane.nextMirrorPass())
+                    g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
+                                                      baseVertex, startInstance);
+            }
         }
         // Stop the draw-hook clock here: the weapon-motion re-issue below is EDVR's own work, counted under "draw reissue CPU:" and not inside "draw hook CPU:".
         if (clock.on) clock.realCall(r0);
@@ -5907,6 +5995,9 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                 temporalPassNoteRigidDraw(temporalEye, scene, sceneVs);
                 if(scene)scene->Release();
             }
+            // TEMPORARY (the concourse cull's VR bake, concourse_pane.h): while a bake runs, each eye's camera rows (VS b1 270..279) are copied on the GPU at its first
+            // recognised scene draw of the frame. One relaxed load otherwise.
+            if (recognisedScene && concourseVrBakeSnapArmed()) concoursePaneVrBakeSnapDraw(self);
             // The VR camera census (vr_camera_census.h): at the 2D screen's composite, once an eye. g_vrWorldWants is true
             // whenever the census is wanted, so with the key off this is one load of a false bool.
             if (g_vrWorldWants && vrCameraCensusWanted()) cameraCensusEyeDraw(self);

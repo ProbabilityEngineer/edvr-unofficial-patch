@@ -41,6 +41,9 @@ inline bool flatProfileReadsKey(const char* key) {
         // The legacy glass's dirt level (visual.cockpit_glass_dirt, cockpit_glass.cpp): percent, 0 to 300, read live with the look, in both profiles. The row under it.
         // Unlisted, getIntInRange answers 0 here whatever the file says, which is a clean pane, and the row could never raise it.
         std::strcmp(key, "visual.cockpit_glass_dirt") == 0 ||
+        // Which lights reach that dirt (visual.cockpit_glass_lights, cockpit_glass_core.h lightsLevelOf): off | station, read live with the look, in both profiles. The row under that.
+        // Unlisted, getString answers "off" here whatever the file says, and the row could never turn them on.
+        std::strcmp(key, "visual.cockpit_glass_lights") == 0 ||
         // The smoke and steam plumes, and the other camera-facing billboards (particle_fix.cpp, docs\particle-billboards.md): steady | stock, in both
         // profiles, the Visual tab's Billboards row. Unlisted, getString answers "off" here, which the reader takes for "not stock or steady;
         // running stock", so the row could never turn the fix on.
@@ -53,6 +56,34 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "fix.ui_quality") == 0 ||
         // The optimized station (optimized_station.cpp), on in flat as in VR (built v14.34). Unlisted, getString answers "off" here and the station never starts.
         std::strcmp(key, "fix.optimized_stations") == 0 ||
+        // How far from a station window the real view takes over from the bake (optimized_station.cpp, the Window 3D distance row).
+        std::strcmp(key, "fix.station_window_distance") == 0 ||
+        // The rooms behind a carrier's shut bulkhead doors (optimized_station.cpp, the door rule; the Skip rooms behind doors row).
+        std::strcmp(key, "fix.skip_rooms_behind_doors") == 0 ||
+        // TEMPORARY (the concourse cull and its glass panes, optimized_station.cpp and concourse_pane.cpp, docs\concourse-cull-2026-11-05.md): flat and VR alike.
+        // Unlisted, getString answers "off" here (the cull and the pane mode stay off, a hotkey reads empty and binds nothing) and the keys log nothing. Remove with the arc.
+        std::strcmp(key, "diag.concourse_cull") == 0 ||
+        std::strcmp(key, "diag.concourse_keep") == 0 ||
+        std::strcmp(key, "diag.concourse_pane_mode") == 0 ||
+        std::strcmp(key, "diag.concourse_panes") == 0 ||
+        std::strcmp(key, "diag.concourse_clear_share") == 0 ||
+        std::strcmp(key, "diag.concourse_mirror_beyond") == 0 ||
+        std::strcmp(key, "diag.concourse_glow") == 0 ||
+        std::strcmp(key, "diag.concourse_backdrop_radius") == 0 ||
+        std::strcmp(key, "diag.concourse_bake_near") == 0 ||
+        std::strcmp(key, "diag.concourse_bake_dirs") == 0 ||
+        std::strcmp(key, "diag.concourse_glass") == 0 ||
+        std::strcmp(key, "hotkey.concourse_cull") == 0 ||
+        std::strcmp(key, "hotkey.concourse_pane_capture") == 0 ||
+        std::strcmp(key, "hotkey.concourse_pane_mode") == 0 ||
+        std::strcmp(key, "hotkey.concourse_view_test") == 0 ||
+        std::strcmp(key, "hotkey.concourse_backdrop_parallax") == 0 ||
+        std::strcmp(key, "hotkey.concourse_camera_test") == 0 ||
+        std::strcmp(key, "hotkey.concourse_light_test") == 0 ||
+        std::strcmp(key, "hotkey.concourse_room_test") == 0 ||
+        // TEMPORARY (the VR proving build): flat reads them only to log that a press is not in VR.
+        std::strcmp(key, "hotkey.concourse_vr_hold_probe") == 0 ||
+        std::strcmp(key, "hotkey.concourse_vr_camera_probe") == 0 ||
         // The flat jitter cycle's length (flat_runtime.cpp, FlatLivePhase::phaseCount; temporal_math.h). Developer tier, no flat panel
         // row. Unlisted, getInt answers 0 here whatever the file says, which the reader takes for out of range and reads as 8.
         std::strcmp(key, "advanced.temporal_aa_jitter_phases") == 0 ||

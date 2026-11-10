@@ -945,6 +945,50 @@ void testGate() {
                   uiLayerSortedPercentile(nullptr, 0, 0.5) == 0.0 &&
                   uiLayerSortedPercentile(one, 1, 0.5) == 0.25,
               "full 8192-sample route window reuses its sort with unchanged interpolation");
+        {
+            // The price line's median/p95 by selection must print the very text the sorted definition printed. Fixtures: empty, 1, 2,
+            // odd and even counts, ties, all-equal, ascending/descending, a full 8192 window, and a pseudo-random one. (No NaN: a
+            // route sum is a finite timer difference, and std::sort on NaN is undefined anyway.)
+            auto priceText = [](double med, double p95, uint32_t n) {
+                char buf[64];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.3f/%.3f (%u)", med, p95, n);
+                return std::string(buf);
+            };
+            std::vector<std::vector<float>> sets;
+            sets.push_back({});
+            sets.push_back({0.25f});
+            sets.push_back({0.9f, 0.1f});
+            sets.push_back({3.f, 1.f, 2.f});
+            sets.push_back({4.f, 1.f, 3.f, 2.f});
+            sets.push_back({1.f, 1.f, 1.f, 2.f, 2.f, 9.f, 9.f});
+            sets.push_back(std::vector<float>(100, 0.5f));
+            {
+                std::vector<float> a, d, r;
+                uint32_t x = 12345u;
+                for (uint32_t i = 0; i < 8192; ++i) {
+                    a.push_back(static_cast<float>(i) * 0.001f);
+                    d.push_back(static_cast<float>(8191 - i) * 0.001f);
+                    x = x * 1664525u + 1013904223u;
+                    r.push_back(static_cast<float>(x >> 12) * 1e-5f);
+                }
+                sets.push_back(a);
+                sets.push_back(d);
+                sets.push_back(r);
+                for (uint32_t n : {5u, 6u, 19u, 20u, 21u, 99u, 100u, 101u, 1000u, 4097u})
+                    sets.push_back(std::vector<float>(r.begin(), r.begin() + n));
+            }
+            bool same = true;
+            for (const auto& s : sets) {
+                std::vector<float> oldV = s, newV = s;
+                const uint32_t n = static_cast<uint32_t>(s.size());
+                const double op95 = uiLayerPercentile(oldV.data(), n, 0.95);
+                const double omed = uiLayerSortedPercentile(oldV.data(), n, 0.5);
+                const double np95 = uiLayerPercentileSelect(newV.data(), n, 0.95);
+                const double nmed = uiLayerPercentileSelect(newV.data(), n, 0.5);
+                if (priceText(omed, op95, n) != priceText(nmed, np95, n) || omed != nmed || op95 != np95) same = false;
+            }
+            check(same, "price line text by selection equals the sorted text on every fixture");
+        }
         check(std::strcmp(uiRouteStageName(UiRouteStage::kSeed), "depth-stencil seed") == 0 &&
                   std::strcmp(uiRouteStageName(UiRouteStage::kComposite), "composite") == 0,
               "the price line's stage names");
@@ -1421,6 +1465,14 @@ void testFlatLayerRules() {
                             UiLayerFamily::kMapSprite, UiLayerFamily::kSupercruiseBars, UiLayerFamily::kSpaceDust,
                             UiLayerFamily::kNormalSpaceDust, UiLayerFamily::kOrbitLines})
         check(uiLayerFamilyTakesHdr(f), "flat layer: every family it asks for is one the shared HDR take draws");
+    // 2026-11-05: the legacy canopy is asked for, but only under the legacy look: flat's rule names it with the fact and not without, the draw hook asks through the pair-facts bit and the
+    // live flag, and the memo's uiMayAsk (producer-run and offscreen shortcuts) stays false for it so `odyssey` is untouched (flat_temporal_test pins the memo).
+    check(flatUiLayerTakesFamily(UiLayerFamily::kLegacyGlass) && uiLayerFamilyTakesHdr(UiLayerFamily::kLegacyGlass) && flatUiSceneSlotOf(UiLayerFamily::kLegacyGlass) == -1 &&
+              flatUiFamilyOf(kUiVsLegacyGlass, kUiPsLegacyGlass, true) == UiLayerFamily::kLegacyGlass &&
+              flatUiFamilyOf(kUiVsLegacyGlass, kUiPsLegacyGlass, false) == UiLayerFamily::kNone && flatUiFamilyOf(kUiVsLegacyGlass, kUiPsLegacyGlass) == UiLayerFamily::kNone,
+          "flat layer: the legacy canopy is asked for, named only with the legacy fact (odyssey names nothing), and has no scene slot");
+    check(flatUiLegacyGlassPair(kUiVsLegacyGlass, kUiPsLegacyGlass) && !flatUiLegacyGlassPair(kUiVsLegacyGlass, 0) && !flatUiLegacyGlassPair(0, kUiPsLegacyGlass),
+          "flat layer: the canopy pair is the pair, not either shader");
     check(flatUiSceneSlotOf(UiLayerFamily::kSupercruiseBars) == 0 && flatUiSceneSlotOf(UiLayerFamily::kSpaceDust) == 1 &&
               flatUiSceneSlotOf(UiLayerFamily::kNormalSpaceDust) == 2 && flatUiSceneSlotOf(UiLayerFamily::kOrbitLines) == 3 &&
               flatUiSceneSlotOf(UiLayerFamily::kHolo) == -1 && flatUiSceneSlotOf(UiLayerFamily::kMapCanvas) == -1,
@@ -2310,6 +2362,17 @@ void testFamilyRule() {
     f.vs = kHoloCanopy;
     check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
           "the canopy is refused: not one of the take's eight, it sits in front of the whole sky");
+    // The legacy look names the canopy PAIR (kLegacyGlass) only through flat's fact, into the additive layer that covers nothing: the stars behind it are not touched. odyssey and VR never set it.
+    f.ps = kUiPsLegacyGlass;
+    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
+          "odyssey and VR: the canopy pair is no family without the legacy fact (the exclusion of holo_families.h stands)");
+    f.legacyGlass = true;
+    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kLegacyGlass && why == UiFamilyWhy::kDirect,
+          "legacy (flat's rule): the canopy pair is the legacy glass family");
+    f.ps = 0x3EAF4DB5B3E21089ull;
+    check(uiLayerFamilyFor(f) == UiLayerFamily::kNone, "legacy: the quality 2 canopy pixel shader with the same vertex shader is not named");
+    f.legacyGlass = false;
+    f.ps = 0;
     f.vs = kHoloWorldMarkerReticle;
     f.ps = 0x2D037A047171BF3Bull;
     check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
@@ -2530,11 +2593,11 @@ void testSupercruiseLines() {
                                fam == UiLayerFamily::kSupercruiseBars || fam == UiLayerFamily::kSpaceDust ||
                                fam == UiLayerFamily::kMapCanvas || fam == UiLayerFamily::kMapSprite || fam == UiLayerFamily::kOnFootHud ||
                                fam == UiLayerFamily::kWeaponsFire || fam == UiLayerFamily::kShieldRipple || fam == UiLayerFamily::kScopeMark ||
-                               fam == UiLayerFamily::kNormalSpaceDust || fam == UiLayerFamily::kMapMarks || fam == UiLayerFamily::kMapPlane || fam == UiLayerFamily::kMapGrid;
+                               fam == UiLayerFamily::kNormalSpaceDust || fam == UiLayerFamily::kMapMarks || fam == UiLayerFamily::kMapPlane || fam == UiLayerFamily::kMapGrid || fam == UiLayerFamily::kLegacyGlass;
         takesHdr = takesHdr && uiLayerFamilyTakesHdr(fam) == expectHdr;
         sceneLines = sceneLines && uiLayerFamilyIsSceneLines(fam) == (fam == UiLayerFamily::kOrbitLines || fam == UiLayerFamily::kSupercruiseBars);
     }
-    check(takesHdr, "SC3a: uiLayerFamilyTakesHdr is exactly the holo panels, flight HUD, sprite, holograms, orbit lines, bars, space dust, the two map families, the on-foot HUD (F26), the weapons fire, the shield ripple, the scope mark, the normal-space dust, the VR map rings and stems, and the System Map's plane icons and grid");
+    check(takesHdr, "SC3a: uiLayerFamilyTakesHdr is exactly the holo panels, flight HUD, sprite, holograms, orbit lines, bars, space dust, the two map families, the on-foot HUD (F26), the weapons fire, the shield ripple, the scope mark, the normal-space dust, the VR map rings and stems, the System Map's plane icons and grid, and the legacy canopy");
     check(sceneLines, "SC3b: uiLayerFamilyIsSceneLines is exactly the orbit lines and the bars (the two dusts have no width to give: they are exempt from the density rule)");
     check(uiLayerWiderThanRender(5040, 4873, 2016, 1949) && uiLayerWiderThanRender(4032, 3898, 2016, 1949) &&
               !uiLayerWiderThanRender(2016, 1949, 2016, 1949) && !uiLayerWiderThanRender(4032, 1949, 4032, 1949) &&
@@ -2837,8 +2900,8 @@ void testSupercruiseLines() {
     n.vs = kUiVsSupercruiseBars;
     n.ps = kUiPsSupercruiseBars;
     check(uiLayerFamilyFor(n) == UiLayerFamily::kSupercruiseBars, "ND1f: ...and the bars the bars");
-    check(static_cast<int>(UiLayerFamily::kScopeMark) + 1 == static_cast<int>(UiLayerFamily::kNormalSpaceDust) && static_cast<int>(UiLayerFamily::kNormalSpaceDust) + 1 == static_cast<int>(UiLayerFamily::kMapMarks) && static_cast<int>(UiLayerFamily::kMapMarks) + 1 == static_cast<int>(UiLayerFamily::kMapPlane) && static_cast<int>(UiLayerFamily::kMapPlane) + 1 == static_cast<int>(UiLayerFamily::kMapGrid) && static_cast<int>(UiLayerFamily::kMapGrid) + 1 == static_cast<int>(UiLayerFamily::kCount),
-          "ND1g: the family is appended after the scope mark, the map marks (2026-11-04) after it, and the System Map's plane icons and grid (2026-11-05) last before kCount (no older family's number moved)");
+    check(static_cast<int>(UiLayerFamily::kScopeMark) + 1 == static_cast<int>(UiLayerFamily::kNormalSpaceDust) && static_cast<int>(UiLayerFamily::kNormalSpaceDust) + 1 == static_cast<int>(UiLayerFamily::kMapMarks) && static_cast<int>(UiLayerFamily::kMapMarks) + 1 == static_cast<int>(UiLayerFamily::kMapPlane) && static_cast<int>(UiLayerFamily::kMapPlane) + 1 == static_cast<int>(UiLayerFamily::kMapGrid) && static_cast<int>(UiLayerFamily::kMapGrid) + 1 == static_cast<int>(UiLayerFamily::kLegacyGlass) && static_cast<int>(UiLayerFamily::kLegacyGlass) + 1 == static_cast<int>(UiLayerFamily::kCount),
+          "ND1g: the family is appended after the scope mark, the map marks (2026-11-04) after it, the System Map's plane icons and grid and the legacy canopy (2026-11-05) last before kCount (no older family's number moved)");
     check(uiLayerFamilyEnabled(UiLayerFamily::kNormalSpaceDust, true, false) && !uiLayerFamilyEnabled(UiLayerFamily::kNormalSpaceDust, false, true) &&
               !uiLayerFamilyUsesWeaponsLayer(UiLayerFamily::kNormalSpaceDust),
           "ND1h: fix.ui_quality's half governs it (not the weapons layer's)");
@@ -3022,8 +3085,9 @@ void testSupercruiseLines() {
         const float rows[3][3] = {{1, 0, 0}, {0, 0.7071f, 0.7071f}, {0, -0.7071f, 0.7071f}};
         const float position[3] = {49996.656f, 41092.668f, 23990.863f};
         const float arrow[3] = {-0.336f, 0.338f, 0.916f};
+        const float origin[3] = {0.0f, 0.0f, 0.0f};   // the ray from the tracking origin, as before the head was latched
         float farPt[4] = {};
-        check(edvr::mappointer::farPoint(rows, position, arrow, 1.0f, farPt) == edvr::mappointer::Why::kOk && farPt[3] == 1.0f, "GP1: the arrow of the 11-04 dumps gives a far point and keeps the game's fourth lane");
+        check(edvr::mappointer::farPoint(rows, position, arrow, origin, 1.0f, farPt) == edvr::mappointer::Why::kOk && farPt[3] == 1.0f, "GP1: the arrow of the 11-04 dumps gives a far point and keeps the game's fourth lane");
         float rel[3] = {farPt[0] - position[0], farPt[1] - position[1], farPt[2] - position[2]};
         const float relLength = std::sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
         check(std::fabs(relLength - edvr::mappointer::kFarDistance) < 10.0f, "GP2: the far point is 100000 units from the camera");
@@ -3036,15 +3100,103 @@ void testSupercruiseLines() {
         check(std::fabs(axes[0] / arrow[0] - edvr::mappointer::kFarDistance / arrowLength) < 500.0f, "GP4: on an axis the far point is the arrow scaled by 100000 / |P|");
         const float tiny[3] = {0.01f, 0.0f, 0.02f}, large[3] = {10.0f, 10.0f, 10.0f}, nonFinite[3] = {std::nanf(""), 0.0f, 1.0f};
         float sink[4];
-        check(edvr::mappointer::farPoint(rows, position, tiny, 1.0f, sink) == edvr::mappointer::Why::kBadArrow && edvr::mappointer::farPoint(rows, position, large, 1.0f, sink) == edvr::mappointer::Why::kBadArrow &&
-                  edvr::mappointer::farPoint(rows, position, nonFinite, 1.0f, sink) == edvr::mappointer::Why::kBadArrow,
+        check(edvr::mappointer::farPoint(rows, position, tiny, origin, 1.0f, sink) == edvr::mappointer::Why::kBadArrow && edvr::mappointer::farPoint(rows, position, large, origin, 1.0f, sink) == edvr::mappointer::Why::kBadArrow &&
+                  edvr::mappointer::farPoint(rows, position, nonFinite, origin, 1.0f, sink) == edvr::mappointer::Why::kBadArrow,
               "GP5: an arrow shorter than 0.1, longer than 10 or not finite is refused");
         float badRows[3][3];
         std::memcpy(badRows, rows, sizeof(badRows));
         badRows[1][2] = std::nanf("");
         const float badPosition[3] = {position[0], std::numeric_limits<float>::infinity(), position[2]};
-        check(edvr::mappointer::farPoint(badRows, position, arrow, 1.0f, sink) == edvr::mappointer::Why::kBadPose && edvr::mappointer::farPoint(rows, badPosition, arrow, 1.0f, sink) == edvr::mappointer::Why::kBadPose,
-              "GP6: a non-finite pose is refused");
+        const float badFrom[3] = {0.0f, std::nanf(""), 0.0f};
+        check(edvr::mappointer::farPoint(badRows, position, arrow, origin, 1.0f, sink) == edvr::mappointer::Why::kBadPose && edvr::mappointer::farPoint(rows, badPosition, arrow, origin, 1.0f, sink) == edvr::mappointer::Why::kBadPose &&
+                  edvr::mappointer::farPoint(rows, position, arrow, badFrom, 1.0f, sink) == edvr::mappointer::Why::kBadPose,
+              "GP6: a non-finite pose or ray origin is refused");
+        // GP30: the ray from the head as the map opened (galaxy_map_pointer_core.h, THE RAY'S ORIGIN). The far point's direction in the map's axes is (P - F) / |P - F|, so a
+        // head 2.75 cm to the right of the tracking origin turns it by about 0.0275 / |P| radians, and the zero origin is the old far point.
+        {
+            const float from[3] = {0.0275f, 0.0f, 0.0f};
+            float fromPt[4] = {};
+            check(edvr::mappointer::farPoint(rows, position, arrow, from, 1.0f, fromPt) == edvr::mappointer::Why::kOk && fromPt[3] == 1.0f, "GP30: a ray origin off the tracking origin gives a far point");
+            float relF[3] = {fromPt[0] - position[0], fromPt[1] - position[1], fromPt[2] - position[2]}, axesF[3];
+            edvr::mappointer::inMapAxes(rows, relF, axesF);
+            const float pf[3] = {arrow[0] - from[0], arrow[1] - from[1], arrow[2] - from[2]};
+            const float pfLength = std::sqrt(pf[0] * pf[0] + pf[1] * pf[1] + pf[2] * pf[2]);
+            bool along = true;
+            for (int i = 0; i < 3; ++i) along = along && std::fabs((axesF[i] - from[i]) / edvr::mappointer::kFarDistance - pf[i] / pfLength) < 2e-3f;
+            check(along, "GP30: in the map's axes the far point lies along P - F from F");
+            const double cosTurn = (double(axesF[0]) * axes[0] + double(axesF[1]) * axes[1] + double(axesF[2]) * axes[2]) /
+                                   (std::sqrt(double(axesF[0]) * axesF[0] + double(axesF[1]) * axesF[1] + double(axesF[2]) * axesF[2]) * std::sqrt(double(axes[0]) * axes[0] + double(axes[1]) * axes[1] + double(axes[2]) * axes[2]));
+            const double turn = std::acos((std::min)(1.0, cosTurn));
+            check(turn > 0.5 * 0.0275 / arrowLength && turn < 1.5 * 0.0275 / arrowLength, "GP30: 2.75 cm of origin turns the far point by about 0.0275 / |P| radians");
+            float d0[3], dF[3];
+            check(edvr::mappointer::arrowDirectionFrom(arrow, origin, d0) && edvr::mappointer::arrowDirection(arrow, dF) && d0[0] == dF[0] && d0[1] == dF[1] && d0[2] == dF[2] &&
+                      edvr::mappointer::arrowDirectionFrom(arrow, from, dF) && std::fabs(dF[0] - pf[0] / pfLength) < 1e-6f,
+                  "GP30: the System Map's ray takes the same direction, and the zero origin is the arrow's own");
+        }
+        // GP31: the head as the map opened. The eyes of dump 141733701001 (x -0.0381 and +0.0169): not taken from the pair standing at the open, nor before two more
+        // writes; then held while the head moves; a pair that is one eye twice is refused; a recentre (the midpoint jumping to the origin) drops it and the next two writes take it again.
+        {
+            using namespace edvr::mappointer;
+            HeadLatch h;
+            const float dump[2][3] = {{-0.0381338f, 0.0062042f, -0.0053397f}, {0.0168694f, 0.0065751f, -0.0022555f}};
+            check(!latchOffer(h, true, dump, 10), "GP31: nothing is taken before a map opens");
+            latchOpen(h, 10);
+            check(!latchOffer(h, true, dump, 10) && !latchOffer(h, true, dump, 11) && !h.have, "GP31: the pair standing at the open, and one write past it, are not taken");
+            check(latchOffer(h, true, dump, 12) && h.have && std::fabs(h.at[0] - (-0.0106322f)) < 1e-6f && std::fabs(h.apart - 0.0551f) < 2e-4f && h.taken == 1,
+                  "GP31: two writes past the open take the eyes' midpoint, 1 cm left of the origin, the eyes 0.055 apart");
+            const float leaned[2][3] = {{0.0019f, 0.0062f, -0.0053f}, {0.0569f, 0.0066f, -0.0023f}};   // the head 4 cm to the right
+            check(!latchOffer(h, true, leaned, 20) && std::fabs(h.at[0] - (-0.0106322f)) < 1e-6f, "GP31: the point is held while the head moves");
+            const float oneEye[2][3] = {{0.0019f, 0.0062f, -0.0053f}, {0.0021f, 0.0062f, -0.0053f}};
+            const uint64_t refusedBefore = h.refused;
+            check(!latchOffer(h, true, oneEye, 21) && h.refused == refusedBefore + 1, "GP31: a pair 0.2 mm apart is one eye twice, refused");
+            check(!latchOffer(h, false, dump, 22) && h.have, "GP31: no pair changes nothing");
+            const float recentred[2][3] = {{-0.0275f, 0.0001f, 0.0f}, {0.0275f, 0.0001f, 0.0f}};
+            check(latchOffer(h, true, recentred, 30) && !h.have && h.afterRecentre == 1 && h.at[0] == 0.0f, "GP31: a jump of the midpoint to the origin is a recentre: the point is dropped");
+            check(!latchOffer(h, true, recentred, 31) && latchOffer(h, true, recentred, 32) && h.have && std::fabs(h.at[0]) < 1e-6f && h.taken == 2, "GP31: and taken again two writes later, at the origin");
+            const float walked[2][3] = {{0.0525f, 0.0f, 0.0f}, {0.1075f, 0.0f, 0.0f}};   // 8 cm away, not near the origin: a head moved, not a recentre
+            check(!latchOffer(h, true, walked, 40) && h.have && h.afterRecentre == 1, "GP31: a jump that does not land at the origin is not a recentre");
+            // A recentre read half way (one eye refreshed, the other not) still lands two readings on; a head drifting onto the origin 3 mm a frame does not.
+            latchOpen(h, 100);
+            auto pairAt = [](float x, float out[2][3]) { out[0][0] = x - 0.0275f; out[1][0] = x + 0.0275f; out[0][1] = out[1][1] = out[0][2] = out[1][2] = 0.0f; };
+            float pair[2][3];
+            pairAt(-0.04f, pair);
+            check(latchOffer(h, true, pair, 102) && h.have && std::fabs(h.at[0] + 0.04f) < 1e-6f, "GP31: a head 4 cm left of the origin is taken");
+            pairAt(-0.02f, pair);
+            check(!latchOffer(h, true, pair, 103) && h.have, "GP31: the half-way reading of a recentre changes nothing yet");
+            pairAt(0.0f, pair);
+            const uint32_t recentresBefore = h.afterRecentre;
+            check(latchOffer(h, true, pair, 104) && !h.have && h.afterRecentre == recentresBefore + 1, "GP31: the reading after it, at the origin, is the recentre");
+            latchOpen(h, 200);
+            pairAt(0.012f, pair);
+            check(latchOffer(h, true, pair, 202) && h.have, "GP31: a head 1.2 cm right of the origin is taken");
+            bool drifted = true;
+            for (int i = 1; i <= 4; ++i) {
+                pairAt(0.012f - 0.003f * i, pair);
+                drifted = drifted && !latchOffer(h, true, pair, 202 + i) && h.have;
+            }
+            check(drifted && h.afterRecentre == recentresBefore + 1 && std::fabs(h.at[0] - 0.012f) < 1e-6f, "GP31: a head drifting onto the origin 3 mm a reading keeps the point");
+            latchClose(h);
+            check(!h.have && h.at[0] == 0.0f && !latchOffer(h, true, dump, 50), "GP31: closing the map drops the point and takes none");
+        }
+        // GP32: the shared point reads back what was stored, and zero before anything was.
+        {
+            edvr::mappointer::SharedPoint sp;
+            float got[3] = {1.0f, 1.0f, 1.0f};
+            sp.load(got);
+            check(got[0] == 0.0f && got[1] == 0.0f && got[2] == 0.0f, "GP32: the shared point is the tracking origin before a store");
+            const float put[3] = {-0.0106f, 0.0064f, -0.0038f};
+            sp.store(put);
+            sp.load(got);
+            check(got[0] == put[0] && got[1] == put[1] && got[2] == put[2], "GP32: a stored point reads back bit for bit");
+        }
+        // GP34: the live head for the hover while the arrow is on a panel: the eyes of dump 141144750001 give their midpoint; a pair that is one eye twice gives none.
+        {
+            const float eyes[2][3] = {{-0.0977282f, -0.0050083f, -0.0162150f}, {-0.0583167f, -0.0012308f, 0.0235430f}};
+            float head[3] = {};
+            check(edvr::mappointer::liveHead(eyes, head) && std::fabs(head[0] + 0.0780224f) < 1e-6f && std::fabs(head[2] - 0.0036640f) < 1e-6f, "GP34: the dump's eyes give the head at their midpoint");
+            const float oneEye[2][3] = {{0.0019f, 0.0062f, -0.0053f}, {0.0021f, 0.0062f, -0.0053f}};
+            check(!edvr::mappointer::liveHead(oneEye, head), "GP34: a pair 0.2 mm apart is not two eyes and gives no head");
+        }
         // The System Map's click: the arrow's real positions over 19 frames of one dump, with the mouse still, all hold the first frame's answer bit for bit; a mouse step, a moved camera or a position that is not the arrow's does not.
         {
             using namespace edvr::mappointer;
@@ -3118,6 +3270,15 @@ void testSupercruiseLines() {
                   pointer.find("return pointerCall(s, original, k, in, idx, out, caller == s.systemReturn);") != std::string::npos &&
                   pointer.find("const bool open = galaxy || system;") != std::string::npos && pointer.find("const bool system = mappointer::systemMapOn(galaxy, s.armed.load(std::memory_order_acquire), s.systemReturn, mapCameraAnyOpen());") != std::string::npos && pointer.find("mapui::setGates(galaxy, open);") != std::string::npos,
               "GP14: any caller but the two maps' pointer calls goes straight to the original projector; the System Map's is optional and pinned, and its gate opens the pointer alone, not the Galaxy Map's fixed icons");
+        {
+            const std::string mapUiText = slurp("src/d3d11/galaxy_map_ui.cpp");
+            check(pointer.find("farPoint(pose.rows, pose.position, arrow, from, game[3], farIn)") != std::string::npos && pointer.find("s.rayFrom.load(from);") != std::string::npos &&
+                      pointer.find("arrowDirectionFrom(arrow, s.latch.at, d)") != std::string::npos && pointer.find("if (open) latchFrame(s);") != std::string::npos &&
+                      pointer.find("latchOpen(s.latch,") != std::string::npos && pointer.find("mapui::setArrowOrigin(s.latch.at);") != std::string::npos &&
+                      mapUiText.find("std::memcpy(&g_bodies.rows[kMapArrowRow][1], from, sizeof(from));") != std::string::npos &&
+                      pointer.find("if (mapui::over() && mapCameraEyes(eyes, nullptr) && liveHead(eyes, from))") != std::string::npos,
+                  "GP33: the hover's far point and the System Map's ray take the head as the map opened (the live head while the arrow is on a panel), the latch runs on every open frame, and the arrow row keeps it across the table's reset");
+        }
         std::ifstream copyRoute("src/d3d11/map_ui_depth.h", std::ios::binary);
         check(!copyRoute.good() && screen.find("map_ui_depth.h") == std::string::npos && screen.find("mapuidepth") == std::string::npos && pointer.find("mapuidepth") == std::string::npos &&
                   pointer.find("map_ui_depth.h") == std::string::npos,
