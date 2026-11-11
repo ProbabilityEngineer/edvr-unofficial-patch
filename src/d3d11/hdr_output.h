@@ -119,10 +119,13 @@ bool hdrOutputWidenTexture(const D3D11_TEXTURE2D_DESC& asked, D3D11_TEXTURE2D_DE
 // how much memory widening costs right now, not only how many were made.
 void hdrOutputWidenedCreated(ID3D11Texture2D* texture, const D3D11_TEXTURE2D_DESC& wide);
 
-// The widened-texture census (diagnostic): during a census window, note which
-// shaders write and read each widened texture. One relaxed load when no window
-// is open. Owner context only; the caller checks that.
-void hdrOutputCensusDraw();
+// Every draw on the owner context (the caller checks that). At the tone draw
+// it learns the shape of the texture the tone shader writes, saves it, and says
+// whether that texture is wide (advanced.hdr_widen = auto widens only learned
+// shapes). During a census window it also notes which shaders write and read
+// each widened texture. Otherwise one pointer compare and one relaxed load.
+void hdrOutputNoteDraw(ID3D11DeviceContext* ctx);
+// The census's compute half (CS UAV 0-3).
 void hdrOutputCensusDispatch();
 
 // The view format to use over a resource this feature widened. Returns true

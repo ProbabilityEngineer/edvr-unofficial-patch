@@ -58,6 +58,22 @@ order, with RenoDX's max-channel compression around the LUT, before the
 highlight shoulder. `off` compiles to bytecode identical to the flown
 `be4d8c67` shaders.
 
+Narrowed widening (2026-11-11): the census showed about 200 widened textures
+alive (1.3-1.6 GB as FP16) and 5,500 created in 27 minutes. Only the tone
+target (2268x1473 RT|SRV at 0.75 scale) carries HDR to the final copy. The
+creation number is not stable: `hdr_widen = 27` hit it in one session and
+missed in the next. `advanced.hdr_widen = auto`, the new default, learns the
+tone target's shape (`hdrrules::TextureShape`) at its first tone draw and saves
+it to `edvr_hdr_tone_targets.txt` beside the ini. From then on only textures
+of a learned shape are widened. A session with nothing learned, or a tone draw
+into an 8-bit target, widens every candidate while it learns.
+
+Station and colour checks against SDR (2026-11-11): the hardpoint boxes are
+blown out with chrome paint and crushed with black under every DXMT build and
+under D3DMetal without EDVR, so they are the game's. The window popping and
+the darker hangar come from `fix.optimized_stations`. HUD colours match
+D3DMetal in SDR. Orange too red in HDR came from `hdr_highlights = hue`.
+
 Widening census (diagnostic): once per session window, the log names, for
 each widened target (candidate number as in `hdr: target #N`), the shaders
 that wrote it (RTV 0, CS UAV 0-3) and read it (PS SRV 0-3).

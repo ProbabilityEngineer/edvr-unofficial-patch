@@ -119,8 +119,8 @@ inline bool flatProfileReadsKey(const char* key) {
         // fix.hdr's highlight roll-off (hdr_output.cpp): channel | hue, channel by default. Unlisted, getString answers "off",
         // which is neither, so hue could never be chosen from a flat file.
         std::strcmp(key, "advanced.hdr_highlights") == 0 ||
-        // fix.hdr's widening selection (hdr_output.cpp, hdrrules::parseWidenList): all | candidate list, a diagnostic for narrowing
-        // the widening. Unlisted, getString answers "off", which parses as an empty list -- nothing would widen.
+        // fix.hdr's widening selection (hdr_output.cpp, hdrrules::parseWidenMode): auto | all | candidate list, auto by default.
+        // Unlisted, getString answers "off", which parses as an empty list -- nothing would widen and HDR would clip to SDR.
         std::strcmp(key, "advanced.hdr_widen") == 0 ||
         // fix.hdr's display grading (hdr_output.cpp): game | off, game by default. Unlisted, getString answers "off" and the
         // game's gamma, LUT, contrast and saturation would silently vanish from every flat session.

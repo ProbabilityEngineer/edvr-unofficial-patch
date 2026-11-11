@@ -21,6 +21,7 @@
 #include <string.h>   // _stricmp
 
 #include "../common/config.h"
+#include "../common/iniedit.h"   // writeFileAtomic, for the learned tone-target shapes
 #include "../common/log.h"
 #include "hdr_output_rules.h"
 #include "binding_shadow.h"
@@ -92,7 +93,7 @@ struct State {
     bool srgbDecode = true;      // advanced.hdr_gamma: srgb (default) | 2.2
     bool huePreserve = false;    // advanced.hdr_highlights: channel (default) | hue
     bool grading = true;         // advanced.hdr_grading: game (default) | off
-    bool widenAll = true;        // advanced.hdr_widen: all (default) | list of candidates
+    hdrrules::WidenMode widenMode = hdrrules::WidenMode::Auto;  // advanced.hdr_widen
     unsigned long long widenMask = 0;
     hdrrules::HdrNits nits = hdrrules::resolveNits(0.0f, 0.0f, 0.0f, 0.0f);
     bool effectivePq = false;    // what the colour space actually accepted
@@ -295,6 +296,59 @@ void reportWideTextures() {
                     static_cast<unsigned long long>(g_wideAlive.load(std::memory_order_relaxed)),
                     aliveBytes / mb, aliveBytes / 2 / mb,
                     static_cast<unsigned>(kWideReportEveryMs / 1000));
+}
+
+// ---- the learned tone-target shapes -------------------------------------
+// Guarded by g_wideMutex: creates may come from any thread, the tone draw from
+// the owner context's.
+hdrrules::TextureShape g_toneShapes[hdrrules::kMaxToneShapes];
+unsigned g_toneShapeCount = 0;
+bool g_toneLearning = true;          // widen every candidate until the tone target is known
+std::wstring g_toneShapePath;
+const void* g_lastToneRtv = nullptr;
+
+hdrrules::TextureShape shapeOf(const D3D11_TEXTURE2D_DESC& d) {
+    return hdrrules::TextureShape{d.Width, d.Height, d.BindFlags, d.MipLevels, d.MiscFlags,
+                                  d.SampleDesc.Count, d.ArraySize};
+}
+
+// Next to the settings file: edvr_hdr_tone_targets.txt.
+std::wstring toneShapePath() {
+    std::wstring path = Config::get().path();
+    const size_t slash = path.find_last_of(L"\\/");
+    path = slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
+    return path + L"edvr_hdr_tone_targets.txt";
+}
+
+void loadToneShapes() {
+    g_toneShapePath = toneShapePath();
+    g_toneShapeCount = 0;
+    FILE* f = _wfopen(g_toneShapePath.c_str(), L"rb");
+    if (f) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f) && g_toneShapeCount < hdrrules::kMaxToneShapes) {
+            hdrrules::TextureShape shape;
+            if (hdrrules::parseShapeLine(line, &shape)) g_toneShapes[g_toneShapeCount++] = shape;
+        }
+        std::fclose(f);
+    }
+    g_toneLearning = g_toneShapeCount == 0;
+}
+
+// Caller holds g_wideMutex.
+bool saveToneShapes() {
+    std::string text = "# fix.hdr: the shapes of the texture Elite's tone shader draws into, most recent\n"
+                       "# first (width height bind mips misc samples array). Written by EDVR; only these\n"
+                       "# are created 16-bit float. Delete the file to relearn on the next launch.\n";
+    char buf[128];
+    for (unsigned i = 0; i < g_toneShapeCount; ++i) {
+        const auto& t = g_toneShapes[i];
+        std::snprintf(buf, sizeof buf, "tone %u %u %u %u %u %u %u\n", t.width, t.height,
+                      t.bindFlags, t.mipLevels, t.miscFlags, t.sampleCount, t.arraySize);
+        text += buf;
+    }
+    std::wstring error;
+    return writeFileAtomic(g_toneShapePath, text, &error);
 }
 
 constexpr unsigned kInexactViewNotes = 8;
@@ -811,11 +865,25 @@ void hdrOutputStartup() {
     g.cfgPeak = cfg.getFloat("advanced.hdr_peak_nits", 0.0f);
     const std::string gamma = cfg.getString("advanced.hdr_gamma", "srgb");
     g.srgbDecode = _stricmp(gamma.c_str(), "2.2") != 0;
-    const std::string widen = cfg.getString("advanced.hdr_widen", "all");
-    g.widenAll = rules::parseWidenList(widen.c_str(), &g.widenMask);
-    if (g.on && !g.widenAll)
+    const std::string widen = cfg.getString("advanced.hdr_widen", "auto");
+    g.widenMode = rules::parseWidenMode(widen.c_str(), &g.widenMask);
+    if (g.on && g.widenMode == rules::WidenMode::List)
         Log::get().note("hdr: advanced.hdr_widen \"%s\": only those candidates are widened "
                         "(mask 0x%llX); the rest stay 8-bit", widen.c_str(), g.widenMask);
+    if (g.on && g.widenMode == rules::WidenMode::Auto) {
+        std::lock_guard<std::mutex> lock(g_wideMutex);
+        loadToneShapes();
+        if (g_toneShapeCount)
+            Log::get().note("hdr: widening: %u learned tone-target shape(s), the latest %ux%u bind 0x%X; "
+                            "only textures of those shapes are created 16-bit float",
+                            g_toneShapeCount, g_toneShapes[0].width, g_toneShapes[0].height,
+                            g_toneShapes[0].bindFlags);
+        else
+            Log::get().note("hdr: widening: no tone-target shape learned yet; every candidate is widened "
+                            "this session and the tone target's shape is learned at its first draw");
+    }
+    if (g.on && g.widenMode == rules::WidenMode::All)
+        Log::get().note("hdr: widening: advanced.hdr_widen = all; every candidate is widened");
     const std::string grading = cfg.getString("advanced.hdr_grading", "game");
     g.grading = _stricmp(grading.c_str(), "off") != 0;
     if (g.on && g.grading && _stricmp(grading.c_str(), "game") != 0)
@@ -887,12 +955,26 @@ bool hdrOutputWidenTexture(const D3D11_TEXTURE2D_DESC& asked, D3D11_TEXTURE2D_DE
     if (!g.on || !out || !rules::widens(askOf(asked))) return false;
     static std::atomic<unsigned> candidates{0};
     const unsigned candidate = ++candidates;
-    const bool selected = rules::widenSelected(g.widenAll, g.widenMask, candidate);
-    if (candidate <= 24)
+    bool selected = true;
+    const char* why = "created wide";
+    if (g.widenMode == rules::WidenMode::List) {
+        selected = rules::widenSelected(false, g.widenMask, candidate);
+        if (!selected) why = "left 8-bit by advanced.hdr_widen";
+    } else if (g.widenMode == rules::WidenMode::Auto) {
+        std::lock_guard<std::mutex> lock(g_wideMutex);
+        selected = rules::widenInAuto(g_toneShapes, g_toneShapeCount, shapeOf(asked), g_toneLearning);
+        why = !selected ? "left 8-bit, not a learned tone-target shape"
+              : g_toneLearning ? "created wide (learning the tone target: every candidate widens)"
+                               : "created wide, a learned tone-target shape";
+    }
+    // The first 24 candidates, then widened ones only, up to 64 lines.
+    static std::atomic<unsigned> notes{0};
+    const unsigned note = ++notes;
+    if (note <= 24 || (selected && note <= 64))
         Log::get().note("hdr: target #%u %s: %ux%u r8g8b8a8_typeless%s (bind 0x%X, %u mips)",
-                        candidate, selected ? "created wide" : "left 8-bit by advanced.hdr_widen",
-                        asked.Width, asked.Height, selected ? " -> r16g16b16a16_typeless" : "",
-                        asked.BindFlags, asked.MipLevels);
+                        candidate, why, asked.Width, asked.Height,
+                        selected ? " -> r16g16b16a16_typeless" : "", asked.BindFlags,
+                        asked.MipLevels);
     if (!selected) return false;
     ++g.widened;
     t_lastCandidate = candidate;
@@ -1090,7 +1172,59 @@ void hdrOutputWidenedCreated(ID3D11Texture2D* texture, const D3D11_TEXTURE2D_DES
     tracker->Release();
 }
 
-void hdrOutputCensusDraw() {
+// The tone draw: learn what it draws into. Cheap when it is not the tone
+// shader (one pointer compare against the two replacements EDVR handed out).
+void noteToneDraw(ID3D11DeviceContext* ctx) {
+    void* ps = bindingGet(BindSlot::Ps);
+    if (!ps || (ps != g.tonePs && ps != g.toneNoBloomPs)) return;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    if (!rtv) return;
+    if (rtv == g_lastToneRtv) { rtv->Release(); return; }
+    g_lastToneRtv = rtv;
+    ID3D11Resource* resource = nullptr;
+    rtv->GetResource(&resource);
+    rtv->Release();
+    ID3D11Texture2D* texture = nullptr;
+    if (resource) resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture));
+    if (resource) resource->Release();
+    if (!texture) return;
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    texture->Release();
+    const bool wide = desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
+                      desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const hdrrules::TextureShape shape = shapeOf(desc);
+    bool learned = false, saved = false, wasLearning = false;
+    {
+        std::lock_guard<std::mutex> lock(g_wideMutex);
+        wasLearning = g_toneLearning;
+        if (g.widenMode == rules::WidenMode::Auto) {
+            learned = hdrrules::rememberShape(g_toneShapes, &g_toneShapeCount, shape);
+            if (learned) saved = saveToneShapes();
+            // A miss means the shape changed (a resolution or render-scale change):
+            // widen everything again for the rest of the session, so the game's
+            // next re-create is wide, and the next launch narrows to the new shape.
+            if (!wide) g_toneLearning = true;
+        }
+    }
+    Log::get().note("hdr: the tone shader draws into a %ux%u target (bind 0x%X, %u mips, format %u), "
+                    "which is %s.%s%s",
+                    desc.Width, desc.Height, desc.BindFlags, desc.MipLevels, unsigned(desc.Format),
+                    wide ? "16-bit float: HDR reaches the output"
+                         : "8-BIT: HDR is clipped to SDR for this target",
+                    learned ? (saved ? " Its shape is learned and saved; the next launch widens only "
+                                       "textures of a learned shape."
+                                     : " Its shape is learned but could NOT be saved; the next launch "
+                                       "learns again.")
+                            : "",
+                    (!wide && g.widenMode == rules::WidenMode::Auto)
+                        ? (wasLearning ? "" : " Every candidate widens again for the rest of this session.")
+                        : "");
+}
+
+void hdrOutputNoteDraw(ID3D11DeviceContext* ctx) {
+    if (ctx) noteToneDraw(ctx);
     if (!g_censusActive.load(std::memory_order_relaxed)) return;
     const uint64_t ps = bindingShaderHash(BindSlot::Ps);
     censusNoteView(BindSlot::Rtv0, ps, true);

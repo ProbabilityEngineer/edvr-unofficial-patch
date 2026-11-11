@@ -286,6 +286,50 @@ void theShaderLiteralsFitMsvc() {
           "every HDR shader string-literal piece is under MSVC's 16380-byte limit");
 }
 
+// advanced.hdr_widen = auto: the tone target recognised by its learned shape.
+void theLearnedToneTarget() {
+    unsigned long long mask = 1;
+    check(rules::parseWidenMode(nullptr, &mask) == rules::WidenMode::Auto &&
+              rules::parseWidenMode("", &mask) == rules::WidenMode::Auto &&
+              rules::parseWidenMode("AUTO", &mask) == rules::WidenMode::Auto,
+          "unset, empty and auto are the learned mode");
+    check(rules::parseWidenMode(" all", &mask) == rules::WidenMode::All, "all widens every candidate");
+    check(rules::parseWidenMode("27, 3", &mask) == rules::WidenMode::List && mask == ((1ull << 26) | 4ull),
+          "a number list is the diagnostic list");
+    check(rules::parseWidenMode("off", &mask) == rules::WidenMode::List && mask == 0,
+          "the flat gate's \"off\" is an empty list that would widen nothing (so the key must be named)");
+
+    rules::TextureShape tone;
+    check(rules::parseShapeLine("tone 2268 1473 40 1 0 1 1\n", &tone) && tone.width == 2268 &&
+              tone.height == 1473 && tone.bindFlags == 40 && tone.mipLevels == 1,
+          "a saved line reads back as the census's tone target (2268x1473, RT|SRV)");
+    rules::TextureShape junk;
+    check(!rules::parseShapeLine("# comment", &junk) && !rules::parseShapeLine("tone 1 2 3", &junk) &&
+              !rules::parseShapeLine("tone 0 1473 40 1 0 1 1", &junk) &&
+              !rules::parseShapeLine("tone 99999999999 1 40 1 0 1 1", &junk),
+          "comments, short lines, zero sizes and overflow are not shapes");
+
+    rules::TextureShape shapes[rules::kMaxToneShapes];
+    unsigned count = 0;
+    check(rules::widenInAuto(shapes, count, tone, false), "with nothing learned every candidate widens");
+    check(rules::rememberShape(shapes, &count, tone) && count == 1, "the first tone target is learned");
+    check(!rules::rememberShape(shapes, &count, tone) && count == 1, "learning it again changes nothing");
+    rules::TextureShape uav = tone; uav.bindFlags = 0xA8;
+    rules::TextureShape panel{612, 248, 40, 1, 0, 1, 1};
+    check(rules::widenInAuto(shapes, count, tone, false) && !rules::widenInAuto(shapes, count, uav, false) &&
+              !rules::widenInAuto(shapes, count, panel, false),
+          "once learned, only that shape widens: not the same-size UAV target, not a UI panel");
+    check(rules::widenInAuto(shapes, count, panel, true), "a miss this session widens everything again");
+    rules::TextureShape other = tone; other.width = 3024; other.height = 1964;
+    check(rules::rememberShape(shapes, &count, other) && count == 2 && shapes[0] == other && shapes[1] == tone,
+          "a new shape goes first and the old one is kept");
+    check(rules::rememberShape(shapes, &count, tone) && count == 2 && shapes[0] == tone && shapes[1] == other,
+          "a known shape seen again moves to the front without duplicating");
+    for (unsigned i = 0; i < 20; ++i) { rules::TextureShape s{100 + i, 100, 40, 1, 0, 1, 1}; rules::rememberShape(shapes, &count, s); }
+    check(count == rules::kMaxToneShapes && shapes[0].width == 119,
+          "the list is bounded, newest first");
+}
+
 void shaderIdentities() {
     using namespace edvr;
     const auto hello = hdrShaderIdentity("hello", 5);
@@ -343,6 +387,7 @@ int main(int argc, char** argv) {
     theBrightnessRule();
     theWidenList();
     theShaderLiteralsFitMsvc();
+    theLearnedToneTarget();
     shaderIdentities();
 #ifdef _WIN32
     hdr_shader_tests::run(check, hardware);

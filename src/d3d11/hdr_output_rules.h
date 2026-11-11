@@ -190,6 +190,95 @@ inline bool widenSelected(bool all, unsigned long long mask, unsigned candidate)
     return candidate >= 1 && candidate <= 64 && (mask >> (candidate - 1)) & 1ull;
 }
 
+// ---- the tone target, learned ---------------------------------------------
+// Only the texture the tone shader draws into carries HDR values to the final
+// copy (the 2026-11-11 census: every other candidate holds 8-bit content). Its
+// creation order is not stable between sessions, so it is recognised by its
+// shape instead: the census-proven tone target is learned at its first tone
+// draw, saved, and from then on only creates of that shape are widened.
+
+// advanced.hdr_widen.
+enum class WidenMode { Auto, All, List };
+
+// "auto" (or empty, or unset): learned shapes. "all": every candidate.
+// Anything else: a candidate list (parseWidenList).
+inline WidenMode parseWidenMode(const char* text, unsigned long long* mask) {
+    *mask = 0;
+    if (!text) return WidenMode::Auto;
+    const char* p = text;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == 0) return WidenMode::Auto;
+    auto word = [&](const char* w) {
+        unsigned i = 0;
+        for (; w[i]; ++i) {
+            char c = p[i];
+            if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+            if (c != w[i]) return false;
+        }
+        return p[i] == 0 || p[i] == ' ' || p[i] == '\t';
+    };
+    if (word("auto")) return WidenMode::Auto;
+    if (word("all")) return WidenMode::All;
+    parseWidenList(text, mask);
+    return WidenMode::List;
+}
+
+// A texture's shape, everything a create asks for except the format.
+struct TextureShape {
+    unsigned width = 0, height = 0, bindFlags = 0, mipLevels = 0, miscFlags = 0;
+    unsigned sampleCount = 1, arraySize = 1;
+    bool operator==(const TextureShape& o) const {
+        return width == o.width && height == o.height && bindFlags == o.bindFlags &&
+               mipLevels == o.mipLevels && miscFlags == o.miscFlags &&
+               sampleCount == o.sampleCount && arraySize == o.arraySize;
+    }
+};
+
+constexpr unsigned kMaxToneShapes = 8;
+
+// One line of the saved file: "tone W H bind mips misc samples array".
+inline bool parseShapeLine(const char* line, TextureShape* out) {
+    unsigned v[7] = {};
+    const char* p = line;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!(p[0] == 't' && p[1] == 'o' && p[2] == 'n' && p[3] == 'e' && (p[4] == ' ' || p[4] == '\t')))
+        return false;
+    p += 4;
+    for (int i = 0; i < 7; ++i) {
+        while (*p == ' ' || *p == '\t') ++p;
+        bool digits = false;
+        unsigned long long n = 0;
+        while (*p >= '0' && *p <= '9') { n = n * 10 + unsigned(*p - '0'); digits = true; ++p; if (n > 0xFFFFFFFFull) return false; }
+        if (!digits) return false;
+        v[i] = unsigned(n);
+    }
+    if (v[0] == 0 || v[1] == 0 || v[5] == 0 || v[6] == 0) return false;
+    *out = TextureShape{v[0], v[1], v[2], v[3], v[4], v[5], v[6]};
+    return true;
+}
+
+// Adds `shape` at the front (most recent first), dropping a duplicate and the
+// oldest beyond kMaxToneShapes. Returns true when the list changed.
+inline bool rememberShape(TextureShape* shapes, unsigned* count, const TextureShape& shape) {
+    unsigned at = *count;
+    for (unsigned i = 0; i < *count; ++i) if (shapes[i] == shape) { at = i; break; }
+    if (at == 0 && *count > 0) return false;
+    unsigned last = at < *count ? at : (*count < kMaxToneShapes ? *count : kMaxToneShapes - 1);
+    for (unsigned i = last; i > 0; --i) shapes[i] = shapes[i - 1];
+    shapes[0] = shape;
+    if (at == *count && *count < kMaxToneShapes) ++*count;
+    return true;
+}
+
+// Whether a candidate (one rules::widens admits) is widened in Auto mode.
+// Learning -- nothing saved yet, or a miss this session -- widens everything.
+inline bool widenInAuto(const TextureShape* shapes, unsigned count, const TextureShape& shape,
+                        bool learning) {
+    if (learning || count == 0) return true;
+    for (unsigned i = 0; i < count; ++i) if (shapes[i] == shape) return true;
+    return false;
+}
+
 // ---- brightness ----------------------------------------------------------
 
 // The three luminances the HDR shaders are built with, in nits.
