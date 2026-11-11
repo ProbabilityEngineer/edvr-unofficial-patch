@@ -755,9 +755,12 @@ struct State {
     FlatPairFactsMemo pairFacts;                  // what a draw's shader pair alone says (flat_pair_facts.h), owner thread
     FlatOffscreenMemo offscreen;                  // the previous verified class-4 draw of the frame (flat_offscreen_fast.h), owner thread
     FlatOffscreenCounts offscreenCounts;          // what the fast path did since the last Present drained it, owner thread
-    static constexpr int kGpuFrameTimers = 4, kGpuResolveTimers = 2;
+    static constexpr int kGpuFrameTimers = 4, kGpuResolveTimers = 2, kGpuHdrTimers = 2;
     GpuTimer gpuFrameTimer[kGpuFrameTimers];
     GpuTimer gpuResolveTimer[kGpuResolveTimers];
+    GpuTimer gpuHdrTimer[kGpuHdrTimers];
+    bool gpuHdrBusy[kGpuHdrTimers] = {};
+    int gpuHdrOpen = -1;
     bool gpuFrameBusy[kGpuFrameTimers] = {}, gpuResolveBusy[kGpuResolveTimers] = {};
     int gpuFrameOpen = -1, gpuResolveOpen = -1;   // the timer holding this frame's open span
     bool gpuFrameTried = false;                   // this frame already tried to open its span
@@ -3326,6 +3329,14 @@ void gpuPoll(State& s) {
         case GpuTimerPoll::Pending: break;
         }
     }
+    for (int i = 0; i < State::kGpuHdrTimers; ++i) {
+        if (!s.gpuHdrBusy[i] || i == s.gpuHdrOpen) continue;
+        switch (s.gpuHdrTimer[i].poll(ctx, ms)) {
+        case GpuTimerPoll::Ready: s.census.noteGpuHdr(ms); s.gpuHdrBusy[i] = false; break;
+        case GpuTimerPoll::Invalid: s.census.noteGpuInvalid(); s.gpuHdrBusy[i] = false; break;
+        case GpuTimerPoll::Pending: break;
+        }
+    }
 }
 // A reset drops the spans: only on the verified owner thread, where a span still open can be
 // cancelled cleanly (a timer with an open span released from anywhere else would switch the
@@ -3335,9 +3346,11 @@ void gpuReset(State& s) {
     if (!ctx || !gpuTimingOwns(ctx)) return;
     for (auto& t : s.gpuFrameTimer) t.reset(ctx);
     for (auto& t : s.gpuResolveTimer) t.reset(ctx);
+    for (auto& t : s.gpuHdrTimer) t.reset(ctx);
     for (auto& b : s.gpuFrameBusy) b = false;
     for (auto& b : s.gpuResolveBusy) b = false;
-    s.gpuFrameOpen = s.gpuResolveOpen = -1;
+    for (auto& b : s.gpuHdrBusy) b = false;
+    s.gpuFrameOpen = s.gpuResolveOpen = s.gpuHdrOpen = -1;
 }
 // The resolver's hooks (flat_mono_resolve.h): a timestamp pair around its own dispatches and
 // backend call. Called on the thread that resolves, inside the treatment scope.
@@ -3585,6 +3598,27 @@ void flatRuntimeBeforePresent() {
     if (owner()) engineVelocityFlatFrameEnd();
     // The census's whole-frame GPU span ends here, just before the real Present.
     if (owner()) gpuFrameClose(state());
+}
+// fix.hdr's output transform (hdr_output.cpp, hdrOutputBeforePresent): a timestamp pair around its encode, which runs
+// after the frame span above has closed, so it opens its own disjoint scope like any span with none to borrow. Owner
+// thread and the runtime's own immediate context only (the timer is read back on it in gpuPoll); anything else, or
+// no free timer, leaves the frame untimed. The census prints it only when it has samples.
+void flatRuntimeHdrSpanBegin() {
+    if (!owner()) return;
+    auto& s = state();
+    if (s.gpuHdrOpen >= 0 || !s.device || !s.context) return;
+    for (int i = 0; i < State::kGpuHdrTimers; ++i) {
+        if (s.gpuHdrBusy[i]) continue;
+        if (s.gpuHdrTimer[i].begin(s.device.Get(), s.context.Get())) { s.gpuHdrBusy[i] = true; s.gpuHdrOpen = i; }
+        return;
+    }
+}
+void flatRuntimeHdrSpanEnd() {
+    if (!owner()) return;
+    auto& s = state();
+    if (s.gpuHdrOpen < 0) return;
+    s.gpuHdrTimer[s.gpuHdrOpen].end(s.context.Get());
+    s.gpuHdrOpen = -1;
 }
 bool flatRuntimeNativeScale() { return nativeScale.load(std::memory_order_acquire); }
 void flatRuntimePhaseState(float* x, float* y, uint32_t* w, uint32_t* h, uint32_t* applied) {

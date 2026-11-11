@@ -331,6 +331,7 @@ inline int flatCpuTests() {
         expect(all, "every family is on the line of an empty window, as zeros");
         expect(has(text, "EDVR per frame total 0.000 ms"), "and the total is zero");
         expect(has(text, "GPU frame - (") && has(text, "GPU resolve - ("), "a GPU span nobody timed prints a dash, not 0.00");
+        expect(!has(text, "GPU hdr output"), "and the HDR output span is absent without fix.hdr");
         expect(!has(text, "GPU frame p50") && !has(text, "GPU resolve p50"), "and no percentile");
         expect(has(text, "engine motion wrapper D3D calls 0/frame over 0.0 substituted draws/frame"),
                "the draw wrapper's calls print as zero");
@@ -487,6 +488,7 @@ inline int flatCpuTests() {
         }
         for (double ms : {1.0, 2.0, 3.0, 4.0, 5.0}) run.census->noteGpuFrame(ms);
         for (double ms : {0.5, 0.7, 0.9}) run.census->noteGpuResolve(ms);
+        for (double ms : {0.2, 0.3, 0.4, 0.6}) run.census->noteGpuHdr(ms);
         run.census->noteGpuSkipped();
         run.census->noteGpuSkipped();
         run.census->noteGpuSkipped();
@@ -503,6 +505,7 @@ inline int flatCpuTests() {
         expect(has(text, "GPU frame p50 3.00 / p95 5.00 ms (first game draw to Present; 5 timed, 3 skipped, 1 invalid)"),
                "the whole-frame GPU span prints its median, p95 and what could not be timed");
         expect(has(text, "GPU resolve p50 0.70 / p95 0.90 ms (3 timed)"), "the resolver's GPU span prints its median and p95");
+        expect(has(text, "GPU hdr output p50 ") && has(text, " ms (4 timed)"), "fix.hdr's output transform prints its own GPU span");
         // The next window starts empty.
         for (int i = 0; i < 300; ++i) run.frame(16667, false, {});
         flatcpu::WindowReport next;

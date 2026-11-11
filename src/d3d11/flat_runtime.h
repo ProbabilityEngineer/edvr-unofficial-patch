@@ -82,6 +82,9 @@ bool flatRuntimeWorkFull();           // the work tier is Full (the camera relay
 bool flatRuntimeLegacyPlanExists();
 void flatRuntimePresent(IDXGISwapChain*, uint64_t frame, HRESULT, UINT flags);
 void flatRuntimeBeforePresent();
+// The census's GPU span around fix.hdr's output transform (flat_cpu.h "GPU hdr output"); owner thread only.
+void flatRuntimeHdrSpanBegin();
+void flatRuntimeHdrSpanEnd();
 void flatRuntimeResize();
 void flatRuntimeConstantBuffers(UINT start, UINT count, ID3D11Buffer* const*);
 void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const*);
