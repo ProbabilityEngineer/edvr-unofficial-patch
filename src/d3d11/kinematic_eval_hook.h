@@ -78,6 +78,11 @@ void kinematicEvalEmitDetach() noexcept;
 // calls can never pass for correct static motion (the 2026-09-23 review of
 // engine motion).
 bool kinematicEvalEmitHookLive(const char** why) noexcept;
+// Whether the emit hook is refused for the life of the process: the hook set is
+// installed and direct producer 0's relay is not. ensureInstalled installs the
+// direct relays once, with the set, and never again, so nothing retries it.
+// Independent of the gate (a detached emit is not a refused one). Two loads.
+bool kinematicEvalEmitHookRefused() noexcept;
 
 // --- The scheduler stack probe's feed (advanced.scheduler_probe) ------------
 // Targets 0/1 of SchedulerStackProbe are the job bodies' own RVAs, which

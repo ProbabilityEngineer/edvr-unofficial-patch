@@ -2795,8 +2795,9 @@ void testFlatWarningWiring() {
         {&standdownH, "bool warningActive() const { return standing && flatMonoReasonWarrantsWarning(standReason); }", 1,
          "the warning is on while stood down for a reason that found an output copy"},
         {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy &&\n"
-                      "           reason != FlatMonoReason::NoScene;", 1,
-         "and never for no-known-output-copy or no-3d-scene: a startup or loading frame has no final copy, or no scene"},
+                      "           reason != FlatMonoReason::NoScene && reason != FlatMonoReason::EngineMotionAbsent;", 1,
+         "and never for no-known-output-copy, no-3d-scene or engine-motion-hook-not-installed: a startup or loading frame "
+         "has no final copy, or no scene, and the missing hook is not in Elite's settings"},
         {&standdownH, "standReason = runReason;", 1, "a stand-down starts with the reason that entered it"},
         {&standdownH, "standReason = reason;", 1, "and follows each probe frame's own finding"},
     };

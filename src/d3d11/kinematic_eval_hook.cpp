@@ -1410,6 +1410,11 @@ bool kinematicEvalEmitHookLive(const char** why) noexcept {
     return reason==nullptr;
 }
 
+bool kinematicEvalEmitHookRefused() noexcept {
+    return g_evalEntry.ready.load(std::memory_order_acquire) &&
+           !g_directEntries[0].ready.load(std::memory_order_acquire);
+}
+
 const char* kinematicEvalEmitAttach() noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_installMutex);

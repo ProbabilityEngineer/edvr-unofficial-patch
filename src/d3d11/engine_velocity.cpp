@@ -2674,6 +2674,13 @@ void clearLocked() {
 using namespace engine_velocity_detail;
 
 bool engineVelocityActive() noexcept { return live.load(std::memory_order_acquire); }
+bool engineVelocityEmitRefused() noexcept {
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);   // g_verifyWhy is written under it, at configure
+        if (g_verifyWhy) return true;
+    }
+    return kinematicEvalEmitHookRefused();
+}
 
 int engineVelocityFormatUnkeyed(char* out, size_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);

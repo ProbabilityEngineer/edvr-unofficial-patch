@@ -68,6 +68,9 @@ inline bool flatMonoReasonStructural(FlatMonoReason reason) {
     // frame (startup, a loading screen, a 2D menu), which stands the work down silently like no-known-output-copy.
     case FlatMonoReason::RenderSize:
     case FlatMonoReason::NoScene:
+    // Engine motion's emit hook refused for the process (flatEngineMotionVerdict below): no frame can be treated until
+    // the hook is installed, which only a new process or a hook-set retry that succeeds changes.
+    case FlatMonoReason::EngineMotionAbsent:
         return true;
     default:
         return false;
@@ -83,9 +86,10 @@ inline bool flatMonoReasonStructural(FlatMonoReason reason) {
 // for NoScene (section 83): a final copy found in a frame with no scene is a startup, a loading screen or a 2D menu
 // (the rc.5 user's startup showed the warning for ten seconds of pre-scene frames), so it stands the work down and says
 // nothing.
+// EngineMotionAbsent does not warn either: it is not in Elite's settings, and its own "engine motion: STOOD DOWN" line names why.
 inline bool flatMonoReasonWarrantsWarning(FlatMonoReason reason) {
     return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy &&
-           reason != FlatMonoReason::NoScene;
+           reason != FlatMonoReason::NoScene && reason != FlatMonoReason::EngineMotionAbsent;
 }
 
 // What the runtime does in the frame that starts now.
@@ -109,6 +113,18 @@ enum class FlatFrameSeen : uint8_t { None, Structural, Transient, Treatable };
 inline FlatFrameSeen flatFrameSeenFor(bool selected, FlatMonoReason reason) {
     if (selected) return FlatFrameSeen::Treatable;
     return flatMonoReasonStructural(reason) ? FlatFrameSeen::Structural : FlatFrameSeen::Transient;
+}
+
+// Engine motion stood down (2026-11-11, session 183041): CodeHook refused kinematic-build-144315a20, so the emit hook
+// was never installed, and every selected frame then refused at engine-source-not-ready (24,980 refusals) while the
+// runtime still did its full per-draw work, 4-6 ms a frame. The selector cannot see that: the chain is fine. So a
+// frame that was treatable while the emit hook is refused for the process counts as refused for its structure, and
+// the stand-down above pauses the work after its five seconds. Probe frames ask the same question, so the work stays
+// down until the hook is installed; a frame that is not treatable keeps its own verdict.
+inline void flatEngineMotionVerdict(FlatFrameSeen& seen, FlatMonoReason& reason, bool emitRefused) {
+    if (!emitRefused || seen != FlatFrameSeen::Treatable) return;
+    seen = FlatFrameSeen::Structural;
+    reason = FlatMonoReason::EngineMotionAbsent;
 }
 
 enum class FlatStandDownEvent : uint8_t { None, Entered, Resumed };

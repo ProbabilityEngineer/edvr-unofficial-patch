@@ -78,6 +78,12 @@ constexpr unsigned kEngineVelocityScenePrevCb = 2;
 void engineVelocityConfigure(bool on);
 void engineVelocityShutdown();
 bool engineVelocityActive() noexcept;
+// Whether engine-record velocity cannot stand up in this process: the build
+// check refused the executable, or the emit hook was refused for good
+// (kinematicEvalEmitHookRefused). Read whether or not engine motion is
+// configured on, so the flat stand-down can keep asking while it has engine
+// motion paused (flat_standdown.h, flatEngineMotionVerdict).
+bool engineVelocityEmitRefused() noexcept;
 // Engine motion's diagnostics wanted (temporal_pass: advanced.temporal_aa_
 // diagnostics or an eye run): the emit's census runs only
 // then (the 2026-09-23 performance review).
