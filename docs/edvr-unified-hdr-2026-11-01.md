@@ -25,6 +25,20 @@ The brightness is now configurable under `[advanced]`, resolved by
 holds PQ code values in FP16 because the game's interface is drawn after the
 tone pass with values above 1.0.
 
+Crushed shadows (first flight, scene white 700): the output stage decoded the
+game's display-encoded image with a pure 2.2 power, which is RenoDX's
+Windows-monitor assumption. SDR Elite under DXMT is presented through an sRGB
+layer, and the sRGB toe is 5x brighter at code value 0.03 and 19x at 0.01.
+Raising scene white cannot recover that. The fix is `advanced.hdr_gamma`
+(default `srgb`): the sRGB curve up to 1.0, then the 2.2 power for HDR
+highlights; both curves are 1.0 at 1.0.
+
+Blown-out chrome: RenoDX's shoulder works on each channel separately, so a
+saturated highlight drifts to white near the peak (orange 2:1:0.25 at 30x
+scene white comes out about 1:0.95:0.7). `advanced.hdr_highlights = hue`
+shoulders the brightest channel and scales all three together. The default
+`channel` compiles to bytecode identical to the per-channel build.
+
 The remaining cost is the eight widened targets, seven of them full
 resolution. Narrowing them is the open performance item.
 

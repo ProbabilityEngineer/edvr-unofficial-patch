@@ -113,6 +113,12 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "advanced.hdr_scene_nits") == 0 ||
         std::strcmp(key, "advanced.hdr_ui_nits") == 0 ||
         std::strcmp(key, "advanced.hdr_peak_nits") == 0 ||
+        // fix.hdr's shadow decode (hdr_output.cpp): srgb | 2.2, srgb by default. Unlisted, getString answers "off", which reads as
+        // srgb, so the 2.2 alternative could never be chosen from a flat file.
+        std::strcmp(key, "advanced.hdr_gamma") == 0 ||
+        // fix.hdr's highlight roll-off (hdr_output.cpp): channel | hue, channel by default. Unlisted, getString answers "off",
+        // which is neither, so hue could never be chosen from a flat file.
+        std::strcmp(key, "advanced.hdr_highlights") == 0 ||
         // The journal watcher, for the System Map's GuiFocus (journal_watch.h: journalFlatGuiFocus). Its other accessors answer
         // flat with the no-journal values, so enabling the watcher here changes no other flat behaviour. journal_dir names the
         // Saved Games folder when the default is wrong; unlisted, it reads "off" and the watcher looks in a folder named "off".

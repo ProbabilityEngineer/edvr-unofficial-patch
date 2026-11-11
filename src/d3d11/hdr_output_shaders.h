@@ -139,6 +139,13 @@ inline constexpr char kHdrToneReplacementPs[] = R"HLSL(
 // which is not a valid coverage value, and downstream consumers discard on
 // alpha ~= 0. This pass has no HDR effect on alpha.
 SamplerState      s1 : register(s1);
+// 1: the highlight shoulder compresses the brightest channel and scales all
+// three by the same factor, so a bright coloured reflection keeps its hue. 0:
+// RenoDX's per-channel shoulder, under which a saturated highlight drifts to
+// white as it nears the peak. advanced.hdr_highlights (hue | channel).
+#ifndef HDR_TONE_HUE_PRESERVE
+#define HDR_TONE_HUE_PRESERVE 0
+#endif
 #ifndef HDR_TONE_NO_BLOOM
 #define HDR_TONE_NO_BLOOM 0
 #endif
@@ -279,7 +286,15 @@ float4 m(float3 v0 : TEXCOORD1) : SV_Target {
 
     // ---- RenoDX display transform, keeping its gamma encode ----
     float3 y = vanillaPlus(sceneLin);
+#if HDR_TONE_HUE_PRESERVE
+    // Below ANCHOR the shoulder is the identity, so only highlights change.
+    float peakChannel = max(max(y.r, y.g), y.b);
+    float shoulderedPeak = anchoredShoulder(peakChannel.xxx, PEAK_RATIO, ANCHOR,
+                                            SHOULDER_COMPRESSION).x;
+    y *= (peakChannel > ANCHOR) ? shoulderedPeak / peakChannel : 1.0;
+#else
     y = anchoredShoulder(y, PEAK_RATIO, ANCHOR, SHOULDER_COMPRESSION);
+#endif
 
     y *= cb2[10].x;                                      // token 712, output scale
 
@@ -411,6 +426,26 @@ SamplerState      s0 : register(s0);
 #ifndef GRAPHICS_WHITE_NITS
 #define GRAPHICS_WHITE_NITS 500.0
 #endif
+// How the game's display-encoded image becomes light. 1: the sRGB curve up to
+// 1.0 (white), which is how macOS shows the SDR game through DXMT's sRGB layer
+// and how Windows shows SDR content in HDR mode; its linear toe is far brighter
+// near black than a pure power. Above 1.0 (HDR highlights) it continues as the
+// 2.2 power: both curves are 1.0 at 1.0. 0: the 2.2 power throughout, as RenoDX
+// does for a gamma-2.2 Windows monitor. advanced.hdr_gamma.
+#ifndef OUTDECODE_SRGB
+#define OUTDECODE_SRGB 1
+#endif
+
+float3 decodeDisplay(float3 encoded) {
+    float3 a = abs(encoded);
+#if OUTDECODE_SRGB
+    float3 srgb = (a <= 0.04045) ? a / 12.92 : pow((a + 0.055) / 1.055, 2.4);
+    float3 lin = (a <= 1.0) ? srgb : pow(a, DISPLAY_GAMMA);
+#else
+    float3 lin = pow(a, DISPLAY_GAMMA);
+#endif
+    return sign(encoded) * lin;
+}
 
 #if OUTDECODE_PQ
 // D65 linear BT.709 -> D65 linear BT.2020. Product of Reno's
@@ -422,7 +457,7 @@ static const float3x3 TO_2020 = float3x3(
 float3 outputPQ(float3 encoded709) {
     // Reno DecodeSafe is sign-preserving. Clamp after conversion, as in
     // PQ EncodeSafe; clamping before the matrix changes mixed-sign colors.
-    float3 linear709 = sign(encoded709) * pow(abs(encoded709), DISPLAY_GAMMA);
+    float3 linear709 = decodeDisplay(encoded709);
     float3 linear2020 = mul(TO_2020, linear709);
     // Absolute CONTENT nits enter here: pre-PQ 1 == UI (graphics) white.
     // No scRGB gain or H/P compensation in this branch. DXMT handles PQ.
@@ -438,7 +473,7 @@ float4 m(float4 pos : SV_Position) : SV_Target {
 #if OUTDECODE_PQ
     return float4(outputPQ(c.rgb), 1.0);
 #else
-    float3 lin = pow(max(c.rgb, 0.0), DISPLAY_GAMMA);
+    float3 lin = decodeDisplay(max(c.rgb, 0.0));
     return float4(lin * OUTDECODE_GAIN, 1.0);
 #endif
 }

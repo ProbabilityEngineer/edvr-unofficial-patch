@@ -82,6 +82,8 @@ struct State {
     // advanced.hdr_scene_nits / hdr_ui_nits / hdr_peak_nits as read (0 = unset),
     // and what hdrrules::resolveNits made of them once the display was asked.
     float cfgScene = 0.0f, cfgUi = 0.0f, cfgPeak = 0.0f;
+    bool srgbDecode = true;      // advanced.hdr_gamma: srgb (default) | 2.2
+    bool huePreserve = false;    // advanced.hdr_highlights: channel (default) | hue
     hdrrules::HdrNits nits = hdrrules::resolveNits(0.0f, 0.0f, 0.0f, 0.0f);
     bool effectivePq = false;    // what the colour space actually accepted
     bool domainDirty = true;     // re-tag on the next Present (a resize clears the tag)
@@ -289,6 +291,7 @@ bool buildTransformShaders(bool pq) {
     const D3D_SHADER_MACRO macros[] = {{"OUTDECODE_GAIN", n.linearGain},
                                        {"OUTDECODE_PQ", pq ? "1" : "0"},
                                        {"GRAPHICS_WHITE_NITS", n.ui},
+                                       {"OUTDECODE_SRGB", g.srgbDecode ? "1" : "0"},
                                        {nullptr, nullptr}};
     ID3DBlob* ps = compileHlsl(kHdrOutDecodePs, "outdecode_ps", "ps_5_0", "m", macros);
     ID3DBlob* vs = compileHlsl(kHdrOutDecodeVs, "outdecode_vs", "vs_5_0", "m", nullptr);
@@ -327,6 +330,7 @@ bool buildEncodeCompute(bool pq, unsigned width, unsigned height) {
     const D3D_SHADER_MACRO macros[] = {{"OUTDECODE_GAIN", n.linearGain},
                                        {"OUTDECODE_PQ", pq ? "1" : "0"},
                                        {"GRAPHICS_WHITE_NITS", n.ui},
+                                       {"OUTDECODE_SRGB", g.srgbDecode ? "1" : "0"},
                                        {"EDVR_HDR_OUTPUT_WIDTH", w},
                                        {"EDVR_HDR_OUTPUT_HEIGHT", h},
                                        {nullptr, nullptr}};
@@ -632,6 +636,16 @@ void hdrOutputStartup() {
     g.cfgScene = cfg.getFloat("advanced.hdr_scene_nits", 0.0f);
     g.cfgUi = cfg.getFloat("advanced.hdr_ui_nits", 0.0f);
     g.cfgPeak = cfg.getFloat("advanced.hdr_peak_nits", 0.0f);
+    const std::string gamma = cfg.getString("advanced.hdr_gamma", "srgb");
+    g.srgbDecode = _stricmp(gamma.c_str(), "2.2") != 0;
+    const std::string highlights = cfg.getString("advanced.hdr_highlights", "channel");
+    g.huePreserve = _stricmp(highlights.c_str(), "hue") == 0;
+    if (g.on && !g.huePreserve && _stricmp(highlights.c_str(), "channel") != 0)
+        Log::get().note("hdr: advanced.hdr_highlights \"%s\" is not a value this reads; using "
+                        "channel (channel, hue)", highlights.c_str());
+    if (g.on && g.srgbDecode && _stricmp(gamma.c_str(), "srgb") != 0)
+        Log::get().note("hdr: advanced.hdr_gamma \"%s\" is not a value this reads; using srgb "
+                        "(srgb, 2.2)", gamma.c_str());
     if (!g.on) {
         if (_stricmp(mode.c_str(), "off") != 0)
             Log::get().note("hdr: \"%s\" is not a value this reads; HDR is off (on, off)",
@@ -742,20 +756,26 @@ void hdrOutputAttach(ID3D11Device* device) {
     const float displayPeak = displayPeakNits(device, &outputIndex);
     g.nits = hdrrules::resolveNits(g.cfgScene, g.cfgUi, g.cfgPeak, displayPeak);
     Log::get().note("hdr: brightness: scene white %.0f nits%s, UI white %.0f nits%s, peak %.0f "
-                    "nits (%s; the display reports %.0f on output %u)",
+                    "nits (%s; the display reports %.0f on output %u); shadows decoded with %s; "
+                    "highlights rolled off %s",
                     g.nits.scene, g.cfgScene > 0.0f ? "" : " (default)", g.nits.ui,
                     g.cfgUi > 0.0f ? "" : " (default)", g.nits.peak,
                     g.cfgPeak > 0.0f ? "advanced.hdr_peak_nits"
                     : g.nits.peakFromDisplay ? "from the display"
                                              : "fallback, the display gave no usable value",
-                    displayPeak, outputIndex);
+                    displayPeak, outputIndex,
+                    g.srgbDecode ? "the sRGB curve" : "the 2.2 power",
+                    g.huePreserve ? "preserving hue" : "per channel");
     const NitsMacros n = nitsMacros();
+    const char* hue = g.huePreserve ? "1" : "0";
     const D3D_SHADER_MACRO bloom[] = {{"PEAK_WHITE_NITS", n.peak},
                                       {"DIFFUSE_WHITE_NITS", n.scene},
+                                      {"HDR_TONE_HUE_PRESERVE", hue},
                                       {nullptr, nullptr}};
     const D3D_SHADER_MACRO noBloom[] = {{"HDR_TONE_NO_BLOOM", "1"},
                                         {"PEAK_WHITE_NITS", n.peak},
                                         {"DIFFUSE_WHITE_NITS", n.scene},
+                                        {"HDR_TONE_HUE_PRESERVE", hue},
                                         {nullptr, nullptr}};
     const D3D_SHADER_MACRO copyMacros[] = {{"DIFFUSE_WHITE_NITS", n.scene},
                                            {"GRAPHICS_WHITE_NITS", n.ui},

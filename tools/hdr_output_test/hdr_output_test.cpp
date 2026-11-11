@@ -209,9 +209,10 @@ void theFlatProfileReadsTheHdrKeys() {
     check(text.find("\"advanced.hdr_encode\"") != std::string::npos,
           "the flat profile names advanced.hdr_encode, so the domain A/B can be set");
     for (const char* key : {"\"advanced.hdr_scene_nits\"", "\"advanced.hdr_ui_nits\"",
-                            "\"advanced.hdr_peak_nits\""})
+                            "\"advanced.hdr_peak_nits\"", "\"advanced.hdr_gamma\"",
+                            "\"advanced.hdr_highlights\""})
         check(text.find(key) != std::string::npos,
-              "the flat profile names each HDR brightness key, so a flat file's value is read");
+              "the flat profile names each HDR brightness and gamma key, so a flat file's value is read");
 }
 
 // The brightness the shaders are built with. Unset keys keep the fitted
