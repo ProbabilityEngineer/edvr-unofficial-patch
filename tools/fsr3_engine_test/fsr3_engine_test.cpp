@@ -1197,6 +1197,21 @@ void testHdrRoute(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
                   std::fabs(againMean[1] - hdrMean[1]) <= 0.01f * kRadiance &&
                   std::fabs(againMean[2] - hdrMean[2]) <= 0.01f * kRadiance,
               "(l) flipping it back on remakes the context with the HDR set, and it returns what it returned before the flip");
+        // EDHDR's copy route supplies RGBA16F directly; exercise the real SDK, not the resolver's stub.
+        colour->Release();
+        colour = makeTexture(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
+        check(colour != nullptr, "(l) FP16 copy-route input was created");
+        if (colour) {
+            const std::vector<uint16_t> fp16Field(static_cast<size_t>(w) * h * 4, 0x5100); // 40.0
+            ctx->UpdateSubresource(colour, 0, nullptr, fp16Field.data(), w * 8, 0);
+            float fp16Mean[3]; bool fp16Dispatched = false;
+            const bool fp16Ok = run(true, fp16Mean, &fp16Dispatched);
+            check(fp16Dispatched && fp16Ok && edvr::fsr3TestContextFlags(0) == hdrFlags &&
+                  std::fabs(fp16Mean[0] - kRadiance) <= kHdrFieldTolerance * kRadiance &&
+                  std::fabs(fp16Mean[1] - kRadiance) <= kHdrFieldTolerance * kRadiance &&
+                  std::fabs(fp16Mean[2] - kRadiance) <= kHdrFieldTolerance * kRadiance,
+                  "(l) FP16 copy color dispatches with HDR exposure and preserves radiance through FSR3");
+        }
     }
     if (colour) colour->Release();
     if (depth) depth->Release();

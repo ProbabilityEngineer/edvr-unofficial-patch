@@ -86,9 +86,10 @@ static std::vector<Variant> compositeInPlaceVariants() {
 
 static std::vector<LegacyContract> coreLegacyContracts() {
     return {
+        // Re-pinned 2026-10-25: flat FP16 range is selected by mode bit 1; 8-bit arithmetic is unchanged.
         // Re-pinned 2026-10-13 on purpose: the thread group is 32x8, not 8x8 (the launch of 254,000 groups was the cost of the pass at the eye's
         // size: 0.120 ms an eye against 0.090; ui_holo_pass_test --bench-groups holds the two byte for byte). Was 0x237EEBB920BC9015.
-        {"ui_layer_composite_cs", "main", "cs_5_0", nullptr, 0x6488F4CEF2B7D55Cull},
+        {"ui_layer_composite_cs", "main", "cs_5_0", nullptr, 0x10CE867229A4CBD6ull},
         {"ui_layer_coverage_vs", "main", "vs_5_0", nullptr, 0xC0A9BDF65E71A8DCull},
         {"ui_layer_coverage_ps", "main", "ps_5_0", nullptr, 0xA12E6D166D50BDA1ull},
         {"ui_layer_seed", "main", "vs_5_0", nullptr, 0xCC059AB4FCFA26BCull},
@@ -106,6 +107,7 @@ static std::vector<LegacyContract> coreLegacyContracts() {
         {"ui_depth_holo_unlit_ps", "main", "ps_5_0", nullptr, 0xBF9BF9DF94D733DBull},
         {"ui_depth_holo_resolve_vs", "main", "vs_5_0", nullptr, 0x20645D8AD5F63813ull},
         {"ui_depth_holo_resolve_ps", "main", "ps_5_0", nullptr, 0xA0BA9F47CC37A5BAull},
+        // Re-pinned 2026-10-25: flat FP16 range is selected by mode bit 1; 8-bit arithmetic is unchanged.
         // Re-pinned 2026-10-13 on purpose: a 16x16 group holds four of the map's 8x8 blocks, each with its own groupshared flag and its own
         // texel (0.031 ms an eye with one block a group, 0.010 with four; the old text is tools/ui_holo_pass_test/near_light_reference.h,
         // which the rig holds this one to byte for byte). Was 0xB1BF8BF2F8942B44.

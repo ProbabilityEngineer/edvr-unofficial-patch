@@ -247,4 +247,64 @@ inline void uiLayerSmaaGpuTests(ID3D11Device* device, ID3D11DeviceContext* conte
         check(edvr::uiLayerSmaaEnsure(s, device, 96, 96, &again) == edvr::UiLayerSmaaState::kMade,
               "HUD layer SMAA: a device change (release all) clears what failed, so the size is tried afresh");
     }
+    // FP16 layer storage must survive optional HUD SMAA, including at a fixed size
+    // when the reconstruction backend changes its post-tone format.
+    {
+        edvr::UiLayerSmaa s;
+        edvr::UiLayerSmaaFail fail;
+        check(edvr::uiLayerSmaaEnsure(s, device, n, n, &fail) == edvr::UiLayerSmaaState::kMade,
+              "HUD SMAA format switch: start with the upstream RGBA8 output");
+        ComPtr<ID3D11Texture2D> old = s.out;
+        check(edvr::uiLayerSmaaEnsure(s, device, n, n, &fail, DXGI_FORMAT_R16G16B16A16_FLOAT) == edvr::UiLayerSmaaState::kMade &&
+                  s.format == DXGI_FORMAT_R16G16B16A16_FLOAT && s.out.Get() != old.Get(),
+              "HUD SMAA format switch: same-size FP16 output is recreated");
+        D3D11_TEXTURE2D_DESC od{}, ed{}, wd{};
+        if (s.out) s.out->GetDesc(&od);
+        if (s.edges) s.edges->GetDesc(&ed);
+        if (s.weights) s.weights->GetDesc(&wd);
+        check(od.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && ed.Format == DXGI_FORMAT_R8G8_UNORM && wd.Format == DXGI_FORMAT_R8G8B8A8_UNORM,
+              "HUD SMAA FP16: color remains FLOAT while edges and weights retain their required formats");
+        const auto runFp16 = [&](const std::vector<uint16_t>& input, std::vector<uint16_t>& output) {
+            auto layer = ::texture(device, n, n, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE, input.data(), n * 8);
+            auto srv = layer ? ::view(device, layer.Get()) : ComPtr<ID3D11ShaderResourceView>{};
+            std::vector<unsigned char> bytes;
+            if (!srv || !edvr::uiLayerSmaaRun(s, context, srv.Get()) || !readWhole(context, s.out.Get(), bytes, 8)) return false;
+            output.resize(bytes.size() / 2);
+            std::memcpy(output.data(), bytes.data(), bytes.size());
+            return output.size() == size_t(n) * n * 4;
+        };
+        std::vector<uint16_t> input(size_t(n) * n * 4), result;
+        for (size_t i = 0; i < input.size(); i += 4) {
+            input[i] = input[i+1] = input[i+2] = 0x4000; // 2.0, beyond UNORM
+            input[i+3] = 0x3800; // transmittance 0.5
+        }
+        check(runFp16(input, result) && result == input,
+              "HUD SMAA FP16: uniform radiance 2.0 and transmittance 0.5 survive exactly");
+        double before = 0;
+        for (uint32_t y = 0; y < n; ++y) for (uint32_t x = 0; x < n; ++x) {
+            const size_t i = (size_t(y) * n + x) * 4;
+            const bool fill = y >= 16 + x / 4;
+            input[i] = input[i+1] = input[i+2] = fill ? 0x4000 : 0;
+            input[i+3] = fill ? 0 : 0x3c00;
+            before += fill ? 1 : 0;
+        }
+        const bool ran = runFp16(input, result);
+        unsigned fractional = 0; double after = 0; bool convention = ran;
+        for (size_t i = 0; ran && i < result.size(); i += 4) {
+            const float light = ::half(result[i]), transmittance = ::half(result[i+3]);
+            fractional += light > 1.0f && light < 2.0f;
+            after += 1.0 - transmittance;
+            convention = convention && std::fabs(light * 0.5f + transmittance - 1.0f) < 0.003f &&
+                result[i] == result[i+1] && result[i] == result[i+2];
+        }
+        check(ran && fractional >= 12 && convention && std::fabs(after - before) < 0.03 * before,
+              "HUD SMAA FP16: bright staircase is smoothed without clamping radiance or changing premultiplied transmittance");
+        check(edvr::uiLayerSmaaEnsure(s, device, n, n, &fail) == edvr::UiLayerSmaaState::kMade && s.format == DXGI_FORMAT_R8G8B8A8_UNORM,
+              "HUD SMAA format switch: same-size RGBA8 output is restored");
+        check(edvr::uiLayerSmaaEnsure(s, device, n, n, &fail, DXGI_FORMAT_R16G16B16A16_TYPELESS) == edvr::UiLayerSmaaState::kFailed,
+              "HUD SMAA refuses typeless output instead of guessing a view");
+        check(edvr::uiLayerSmaaEnsure(s, device, n, n, &fail, DXGI_FORMAT_R16G16B16A16_FLOAT) == edvr::UiLayerSmaaState::kMade,
+              "HUD SMAA failure for one format does not poison a valid format at the same size");
+    }
+
 }

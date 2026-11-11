@@ -143,6 +143,27 @@ def self_test():
             if not condition:
                 raise AssertionError(why)
 
+        # The separate Windows graphics diagnostic route must not become a
+        # promotion shortcut or silently enter the native runtime build.
+        batch = (Path(__file__).resolve().parents[1] / "build.bat").read_text(encoding="utf-8")
+        expect('if defined EDVR_GRAPHICS_ONLY if not defined EDVR_COMPILE_ONLY (' in batch,
+               "graphics-only must require compile-only")
+        expect('if defined EDVR_GRAPHICS_ONLY if defined EDVR_RIG (' in batch,
+               "graphics-only must reject rig entry")
+        expect('if not defined EDVR_GRAPHICS_ONLY set "EDVR_BUILD_GUARDED=1"' in batch,
+               "Windows graphics-only must retain the build lock")
+        expect('set "BUILD=%ROOT%\\build\\graphics-compile"' in batch,
+               "graphics-only outputs must be isolated")
+        graphics_exit = batch.index('if defined EDVR_GRAPHICS_ONLY goto graphics_compile_only_finish')
+        expect(batch.index('echo [edvr] built %BUILD%\\d3d11.dll') < graphics_exit <
+               batch.index('copy /y "%BUILD%\\d3d11.dll" "%BUILD%\\edvr_openxr_graphics.dll"'),
+               "graphics-only must exit after the graphics link and before the other DLLs")
+        finish = batch.split(":graphics_compile_only_finish\n", 1)[1].split(":compile_only_finish\n", 1)[0]
+        expect('--graphics "%BUILD%\\d3d11.dll" --forbid-import d3dcompiler_47.dll' in finish and
+               'NOT Windows validated and NOT a release asset' in finish and 'exit /b 0' in finish and
+               "build_receipt.py" not in finish,
+               "graphics-only must check the PE and remain explicitly unvalidated")
+
         write("build.bat", b"@echo off\r\n")
         write("src/a.cpp", b"int a;\n")
         write(".gitignore", b"build/\n")
