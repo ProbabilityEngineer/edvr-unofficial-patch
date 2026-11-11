@@ -8,11 +8,8 @@
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>   // IDXGIOutput6::GetDesc1, the display's peak luminance
 
-#include <algorithm>
 #include <atomic>
 #include <mutex>
-#include <unordered_map>
-#include <vector>
 #include <new>
 #include <cstdint>
 #include <cstdio>
@@ -139,6 +136,7 @@ State g;
 // Updated from whichever thread creates or destroys a texture, so atomics.
 std::atomic<uint64_t> g_wideMade{0}, g_wideAlive{0}, g_wideAliveBytes{0}, g_wideMadeBytes{0};
 uint64_t g_wideNextReportMs = 0;
+uint64_t g_wideReportedMade = 0, g_wideReportedAliveBytes = 0;   // what the last line said
 constexpr uint64_t kWideReportEveryMs = 60000;
 
 // {5B1E9C2A-7D43-4E8B-9F0A-3C6D2E8B71A4}
@@ -147,11 +145,9 @@ const GUID kWideTrackerGuid = {0x5b1e9c2a, 0x7d43, 0x4e8b,
 
 // Held only by the texture's private data. Its last Release is the texture's
 // destruction.
-void forgetWideResource(const void* resource);
-
 class WideTracker final : public IUnknown {
 public:
-    WideTracker(uint64_t bytes, const void* resource) : bytes_(bytes), resource_(resource) {}
+    explicit WideTracker(uint64_t bytes) : bytes_(bytes) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         if (riid == __uuidof(IUnknown)) { *out = this; AddRef(); return S_OK; }
@@ -164,7 +160,6 @@ public:
         if (left == 0) {
             g_wideAlive.fetch_sub(1, std::memory_order_relaxed);
             g_wideAliveBytes.fetch_sub(bytes_, std::memory_order_relaxed);
-            forgetWideResource(resource_);
             delete this;
         }
         return left;
@@ -172,105 +167,11 @@ public:
 private:
     std::atomic<ULONG> refs_{1};
     uint64_t bytes_;
-    const void* resource_;
 };
 
-// ---- the usage census (diagnostic) ----------------------------------------
-// Which of the game's passes write and read each widened texture, so the
-// widening can be narrowed to the textures that actually carry HDR values.
-// The candidate number is the one the "hdr: target #N" lines print.
-struct WideInfo {
-    unsigned candidate = 0;
-    unsigned width = 0, height = 0, bind = 0;
-    std::unordered_map<uint64_t, unsigned> writers, readers;  // shader hash -> uses
-};
+// Guards the learned tone-target shapes below: creates may come from any
+// thread, the tone draw from the owner context's.
 std::mutex g_wideMutex;
-std::unordered_map<const void*, WideInfo> g_wideByResource;   // key: the ID3D11Resource*
-thread_local unsigned t_lastCandidate = 0;
-
-void forgetWideResource(const void* resource) {
-    std::lock_guard<std::mutex> lock(g_wideMutex);
-    g_wideByResource.erase(resource);
-}
-
-// Census windows: kCensusFrames Presents, the first kCensusFirstMs after the
-// first one, then every kCensusEveryMs, at most kCensusWindows a session.
-constexpr unsigned kCensusFrames = 240;
-constexpr uint64_t kCensusFirstMs = 45000;
-constexpr uint64_t kCensusEveryMs = 300000;
-constexpr unsigned kCensusWindows = 4;
-uint64_t g_censusStartMs = 0;      // first Present seen with HDR on
-uint64_t g_censusNextMs = 0;
-unsigned g_censusFramesLeft = 0;
-unsigned g_censusWindowsDone = 0;
-std::atomic<bool> g_censusActive{false};
-
-void censusNote(const void* resource, uint64_t hash, bool write) {
-    if (!resource) return;
-    std::lock_guard<std::mutex> lock(g_wideMutex);
-    auto it = g_wideByResource.find(resource);
-    if (it == g_wideByResource.end()) return;
-    auto& m = write ? it->second.writers : it->second.readers;
-    if (m.size() < 64 || m.count(hash)) ++m[hash];
-}
-
-void censusNoteView(BindSlot slot, uint64_t hash, bool write) {
-    void* view = bindingGet(slot);
-    if (!view) return;
-    ResourceInfo info;
-    if (!bindingResolve(view, &info) || !info.isTexture2D) return;
-    censusNote(info.resource, hash, write);
-}
-
-std::string topUses(const std::unordered_map<uint64_t, unsigned>& m) {
-    std::vector<std::pair<unsigned, uint64_t>> v;
-    for (const auto& e : m) v.push_back({e.second, e.first});
-    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    std::string out;
-    char buf[48];
-    for (size_t i = 0; i < v.size() && i < 6; ++i) {
-        std::snprintf(buf, sizeof buf, "%s%016llX x%u", i ? ", " : "",
-                      static_cast<unsigned long long>(v[i].second), v[i].first);
-        out += buf;
-    }
-    if (v.size() > 6) { std::snprintf(buf, sizeof buf, " (+%zu more)", v.size() - 6); out += buf; }
-    return out.empty() ? "none seen" : out;
-}
-
-void censusReport() {
-    std::lock_guard<std::mutex> lock(g_wideMutex);
-    std::vector<const WideInfo*> rows;
-    for (auto& e : g_wideByResource) rows.push_back(&e.second);
-    std::sort(rows.begin(), rows.end(), [](const WideInfo* a, const WideInfo* b) { return a->candidate < b->candidate; });
-    Log::get().note("hdr: widened-texture census #%u over %u frames: %zu alive. Writers are pixel "
-                    "shaders drawing into render target 0 or compute shaders writing UAV 0-3; readers "
-                    "are pixel shaders sampling slots 0-3. Shader hashes are EDVR's.",
-                    g_censusWindowsDone, kCensusFrames, rows.size());
-    for (const WideInfo* w : rows) {
-        Log::get().note("hdr: census #%u target #%u %ux%u bind 0x%X: written by %s; read by %s",
-                        g_censusWindowsDone, w->candidate, w->width, w->height, w->bind,
-                        topUses(w->writers).c_str(), topUses(w->readers).c_str());
-    }
-    for (auto& e : g_wideByResource) { e.second.writers.clear(); e.second.readers.clear(); }
-}
-
-void censusFrame() {
-    const uint64_t now = GetTickCount64();
-    if (!g_censusStartMs) { g_censusStartMs = now; g_censusNextMs = now + kCensusFirstMs; }
-    if (g_censusActive.load(std::memory_order_relaxed)) {
-        if (g_censusFramesLeft && --g_censusFramesLeft == 0) {
-            g_censusActive.store(false, std::memory_order_relaxed);
-            ++g_censusWindowsDone;
-            censusReport();
-            g_censusNextMs = now + kCensusEveryMs;
-        }
-        return;
-    }
-    if (g_censusWindowsDone < kCensusWindows && now >= g_censusNextMs) {
-        g_censusFramesLeft = kCensusFrames;
-        g_censusActive.store(true, std::memory_order_relaxed);
-    }
-}
 
 uint64_t wideBytes(const D3D11_TEXTURE2D_DESC& d) {
     uint64_t total = 0;
@@ -287,20 +188,27 @@ void reportWideTextures() {
     const uint64_t now = GetTickCount64();
     if (now < g_wideNextReportMs) return;
     g_wideNextReportMs = now + kWideReportEveryMs;
-    const double mb = 1048576.0;
+    const uint64_t made = g_wideMade.load(std::memory_order_relaxed);
+    const uint64_t alive = g_wideAlive.load(std::memory_order_relaxed);
     const uint64_t aliveBytes = g_wideAliveBytes.load(std::memory_order_relaxed);
+    // Only when something changed: a steady session logs this once, after its
+    // targets are made, and a creation churn shows as a line a minute.
+    if (made == g_wideReportedMade && aliveBytes == g_wideReportedAliveBytes) return;
+    g_wideReportedMade = made;
+    g_wideReportedAliveBytes = aliveBytes;
+    const double mb = 1048576.0;
     Log::get().note("hdr: widened textures: %llu made this session (%.0f MB as FP16), %llu alive "
-                    "(%.0f MB as FP16, %.0f MB more than 8-bit would take). Every %u s.",
-                    static_cast<unsigned long long>(g_wideMade.load(std::memory_order_relaxed)),
+                    "(%.0f MB as FP16, %.0f MB more than 8-bit would take). Logged when these "
+                    "change, at most every %u s.",
+                    static_cast<unsigned long long>(made),
                     g_wideMadeBytes.load(std::memory_order_relaxed) / mb,
-                    static_cast<unsigned long long>(g_wideAlive.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(alive),
                     aliveBytes / mb, aliveBytes / 2 / mb,
                     static_cast<unsigned>(kWideReportEveryMs / 1000));
 }
 
 // ---- the learned tone-target shapes -------------------------------------
-// Guarded by g_wideMutex: creates may come from any thread, the tone draw from
-// the owner context's.
+// Guarded by g_wideMutex.
 hdrrules::TextureShape g_toneShapes[hdrrules::kMaxToneShapes];
 unsigned g_toneShapeCount = 0;
 bool g_toneLearning = true;          // widen every candidate until the tone target is known
@@ -977,7 +885,6 @@ bool hdrOutputWidenTexture(const D3D11_TEXTURE2D_DESC& asked, D3D11_TEXTURE2D_DE
                         asked.MipLevels);
     if (!selected) return false;
     ++g.widened;
-    t_lastCandidate = candidate;
     *out = asked;
     out->Format = kWideTypeless;
     return true;
@@ -1152,18 +1059,8 @@ void hdrOutputWidenedCreated(ID3D11Texture2D* texture, const D3D11_TEXTURE2D_DES
     const uint64_t bytes = wideBytes(wide);
     g_wideMade.fetch_add(1, std::memory_order_relaxed);
     g_wideMadeBytes.fetch_add(bytes, std::memory_order_relaxed);
-    const void* key = static_cast<ID3D11Resource*>(texture);
-    {
-        std::lock_guard<std::mutex> lock(g_wideMutex);
-        WideInfo info;
-        info.candidate = t_lastCandidate;
-        info.width = wide.Width;
-        info.height = wide.Height;
-        info.bind = wide.BindFlags;
-        g_wideByResource[key] = std::move(info);
-    }
-    WideTracker* tracker = new (std::nothrow) WideTracker(bytes, key);
-    if (!tracker) { forgetWideResource(key); return; }
+    WideTracker* tracker = new (std::nothrow) WideTracker(bytes);
+    if (!tracker) return;
     g_wideAlive.fetch_add(1, std::memory_order_relaxed);
     g_wideAliveBytes.fetch_add(bytes, std::memory_order_relaxed);
     // On success the texture holds its own reference; ours is dropped either
@@ -1225,26 +1122,10 @@ void noteToneDraw(ID3D11DeviceContext* ctx) {
 
 void hdrOutputNoteDraw(ID3D11DeviceContext* ctx) {
     if (ctx) noteToneDraw(ctx);
-    if (!g_censusActive.load(std::memory_order_relaxed)) return;
-    const uint64_t ps = bindingShaderHash(BindSlot::Ps);
-    censusNoteView(BindSlot::Rtv0, ps, true);
-    censusNoteView(BindSlot::PsSrv0, ps, false);
-    censusNoteView(BindSlot::PsSrv1, ps, false);
-    censusNoteView(BindSlot::PsSrv2, ps, false);
-    censusNoteView(BindSlot::PsSrv3, ps, false);
-}
-
-void hdrOutputCensusDispatch() {
-    if (!g_censusActive.load(std::memory_order_relaxed)) return;
-    const uint64_t cs = bindingShaderHash(BindSlot::Cs);
-    censusNoteView(BindSlot::CsUav0, cs, true);
-    censusNoteView(BindSlot::CsUav1, cs, true);
-    censusNoteView(BindSlot::CsUav2, cs, true);
-    censusNoteView(BindSlot::CsUav3, cs, true);
 }
 
 void hdrOutputBeforePresent(IDXGISwapChain* swapChain, ID3D11DeviceContext* context) {
-    if (g.on) { reportWideTextures(); censusFrame(); }
+    if (g.on) reportWideTextures();
     if (!g.on || g.encodeFailed || g.shadersFailed || !swapChain || !context) return;
     prepareDomain(swapChain);
     if (!ensureBackBuffer(swapChain) || !g.backWidth || !g.backHeight) return;

@@ -122,11 +122,8 @@ void hdrOutputWidenedCreated(ID3D11Texture2D* texture, const D3D11_TEXTURE2D_DES
 // Every draw on the owner context (the caller checks that). At the tone draw
 // it learns the shape of the texture the tone shader writes, saves it, and says
 // whether that texture is wide (advanced.hdr_widen = auto widens only learned
-// shapes). During a census window it also notes which shaders write and read
-// each widened texture. Otherwise one pointer compare and one relaxed load.
+// shapes). Otherwise one pointer compare.
 void hdrOutputNoteDraw(ID3D11DeviceContext* ctx);
-// The census's compute half (CS UAV 0-3).
-void hdrOutputCensusDispatch();
 
 // The view format to use over a resource this feature widened. Returns true
 // when `mapped` holds a format to use instead of `asked`: an 8-bit RGBA view

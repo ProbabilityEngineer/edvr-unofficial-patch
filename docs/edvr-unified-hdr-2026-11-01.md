@@ -74,11 +74,14 @@ under D3DMetal without EDVR, so they are the game's. The window popping and
 the darker hangar come from `fix.optimized_stations`. HUD colours match
 D3DMetal in SDR. Orange too red in HDR came from `hdr_highlights = hue`.
 
-Widening census (diagnostic): once per session window, the log names, for
-each widened target (candidate number as in `hdr: target #N`), the shaders
-that wrote it (RTV 0, CS UAV 0-3) and read it (PS SRV 0-3).
-`advanced.hdr_widen` (dev: hidden) takes a candidate list for the narrowing
-A/B. A once-a-minute line counts widened textures made and alive.
+Widening census (removed 2026-11-11): a diagnostic in `4249f715` logged, per
+widened target, the shaders that wrote it (RTV 0, CS UAV 0-3) and read it
+(PS SRV 0-3). It established the tone target above; with `auto` confirmed in
+flight (4 textures, 102 MB, steady for 21 minutes through supercruise and
+docking) it was removed. A tone draw into an 8-bit target is still logged.
+`advanced.hdr_widen` (dev: hidden) takes a candidate list for an A/B. The
+`hdr: widened textures` line counts widened textures made and alive, logged
+when the counts change, checked once a minute.
 
 The remaining cost is the eight widened targets, seven of them full
 resolution. Narrowing them is the open performance item.
