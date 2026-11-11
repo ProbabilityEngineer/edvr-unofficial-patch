@@ -157,6 +157,39 @@ inline bool retriesModeInEightBit(unsigned hr, bool insideOurTransaction,
     return requestFormat == kRgba16Float;
 }
 
+// ---- which candidates widen (diagnostic) ----------------------------------
+
+// advanced.hdr_widen: "all" (or empty) widens every candidate the rule above
+// admits; otherwise a comma-separated list of candidate numbers, 1-based in
+// creation order, as the "hdr: target #N" log lines number them. A number
+// outside 1..64 or a word that is not a number is ignored. Returns true for
+// "all"; otherwise *mask has bit (n-1) set for each listed n.
+inline bool parseWidenList(const char* text, unsigned long long* mask) {
+    *mask = 0;
+    if (!text) return true;
+    const char* p = text;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == 0) return true;
+    if ((p[0] == 'a' || p[0] == 'A') && (p[1] == 'l' || p[1] == 'L') &&
+        (p[2] == 'l' || p[2] == 'L') && (p[3] == 0 || p[3] == ' '))
+        return true;
+    while (*p) {
+        unsigned n = 0;
+        bool digits = false;
+        while (*p >= '0' && *p <= '9') { n = n * 10 + unsigned(*p - '0'); digits = true; ++p; if (n > 1000) n = 1000; }
+        if (digits && n >= 1 && n <= 64) *mask |= 1ull << (n - 1);
+        while (*p && *p != ',') ++p;
+        if (*p == ',') ++p;
+        while (*p == ' ' || *p == '\t') ++p;
+    }
+    return false;
+}
+
+inline bool widenSelected(bool all, unsigned long long mask, unsigned candidate) {
+    if (all) return true;
+    return candidate >= 1 && candidate <= 64 && (mask >> (candidate - 1)) & 1ull;
+}
+
 // ---- brightness ----------------------------------------------------------
 
 // The three luminances the HDR shaders are built with, in nits.

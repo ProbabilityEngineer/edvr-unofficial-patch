@@ -8,6 +8,12 @@
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>   // IDXGIOutput6::GetDesc1, the display's peak luminance
 
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+#include <new>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +23,7 @@
 #include "../common/config.h"
 #include "../common/log.h"
 #include "hdr_output_rules.h"
+#include "binding_shadow.h"
 #include "hdr_shader_identity.h"
 #include "hdr_output_shaders.h"
 
@@ -84,6 +91,9 @@ struct State {
     float cfgScene = 0.0f, cfgUi = 0.0f, cfgPeak = 0.0f;
     bool srgbDecode = true;      // advanced.hdr_gamma: srgb (default) | 2.2
     bool huePreserve = false;    // advanced.hdr_highlights: channel (default) | hue
+    bool grading = true;         // advanced.hdr_grading: game (default) | off
+    bool widenAll = true;        // advanced.hdr_widen: all (default) | list of candidates
+    unsigned long long widenMask = 0;
     hdrrules::HdrNits nits = hdrrules::resolveNits(0.0f, 0.0f, 0.0f, 0.0f);
     bool effectivePq = false;    // what the colour space actually accepted
     bool domainDirty = true;     // re-tag on the next Present (a resize clears the tag)
@@ -123,6 +133,169 @@ struct State {
 };
 
 State g;
+
+// ---- widened-texture accounting ------------------------------------------
+// Updated from whichever thread creates or destroys a texture, so atomics.
+std::atomic<uint64_t> g_wideMade{0}, g_wideAlive{0}, g_wideAliveBytes{0}, g_wideMadeBytes{0};
+uint64_t g_wideNextReportMs = 0;
+constexpr uint64_t kWideReportEveryMs = 60000;
+
+// {5B1E9C2A-7D43-4E8B-9F0A-3C6D2E8B71A4}
+const GUID kWideTrackerGuid = {0x5b1e9c2a, 0x7d43, 0x4e8b,
+                               {0x9f, 0x0a, 0x3c, 0x6d, 0x2e, 0x8b, 0x71, 0xa4}};
+
+// Held only by the texture's private data. Its last Release is the texture's
+// destruction.
+void forgetWideResource(const void* resource);
+
+class WideTracker final : public IUnknown {
+public:
+    WideTracker(uint64_t bytes, const void* resource) : bytes_(bytes), resource_(resource) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (riid == __uuidof(IUnknown)) { *out = this; AddRef(); return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (left == 0) {
+            g_wideAlive.fetch_sub(1, std::memory_order_relaxed);
+            g_wideAliveBytes.fetch_sub(bytes_, std::memory_order_relaxed);
+            forgetWideResource(resource_);
+            delete this;
+        }
+        return left;
+    }
+private:
+    std::atomic<ULONG> refs_{1};
+    uint64_t bytes_;
+    const void* resource_;
+};
+
+// ---- the usage census (diagnostic) ----------------------------------------
+// Which of the game's passes write and read each widened texture, so the
+// widening can be narrowed to the textures that actually carry HDR values.
+// The candidate number is the one the "hdr: target #N" lines print.
+struct WideInfo {
+    unsigned candidate = 0;
+    unsigned width = 0, height = 0, bind = 0;
+    std::unordered_map<uint64_t, unsigned> writers, readers;  // shader hash -> uses
+};
+std::mutex g_wideMutex;
+std::unordered_map<const void*, WideInfo> g_wideByResource;   // key: the ID3D11Resource*
+thread_local unsigned t_lastCandidate = 0;
+
+void forgetWideResource(const void* resource) {
+    std::lock_guard<std::mutex> lock(g_wideMutex);
+    g_wideByResource.erase(resource);
+}
+
+// Census windows: kCensusFrames Presents, the first kCensusFirstMs after the
+// first one, then every kCensusEveryMs, at most kCensusWindows a session.
+constexpr unsigned kCensusFrames = 240;
+constexpr uint64_t kCensusFirstMs = 45000;
+constexpr uint64_t kCensusEveryMs = 300000;
+constexpr unsigned kCensusWindows = 4;
+uint64_t g_censusStartMs = 0;      // first Present seen with HDR on
+uint64_t g_censusNextMs = 0;
+unsigned g_censusFramesLeft = 0;
+unsigned g_censusWindowsDone = 0;
+std::atomic<bool> g_censusActive{false};
+
+void censusNote(const void* resource, uint64_t hash, bool write) {
+    if (!resource) return;
+    std::lock_guard<std::mutex> lock(g_wideMutex);
+    auto it = g_wideByResource.find(resource);
+    if (it == g_wideByResource.end()) return;
+    auto& m = write ? it->second.writers : it->second.readers;
+    if (m.size() < 64 || m.count(hash)) ++m[hash];
+}
+
+void censusNoteView(BindSlot slot, uint64_t hash, bool write) {
+    void* view = bindingGet(slot);
+    if (!view) return;
+    ResourceInfo info;
+    if (!bindingResolve(view, &info) || !info.isTexture2D) return;
+    censusNote(info.resource, hash, write);
+}
+
+std::string topUses(const std::unordered_map<uint64_t, unsigned>& m) {
+    std::vector<std::pair<unsigned, uint64_t>> v;
+    for (const auto& e : m) v.push_back({e.second, e.first});
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string out;
+    char buf[48];
+    for (size_t i = 0; i < v.size() && i < 6; ++i) {
+        std::snprintf(buf, sizeof buf, "%s%016llX x%u", i ? ", " : "",
+                      static_cast<unsigned long long>(v[i].second), v[i].first);
+        out += buf;
+    }
+    if (v.size() > 6) { std::snprintf(buf, sizeof buf, " (+%zu more)", v.size() - 6); out += buf; }
+    return out.empty() ? "none seen" : out;
+}
+
+void censusReport() {
+    std::lock_guard<std::mutex> lock(g_wideMutex);
+    std::vector<const WideInfo*> rows;
+    for (auto& e : g_wideByResource) rows.push_back(&e.second);
+    std::sort(rows.begin(), rows.end(), [](const WideInfo* a, const WideInfo* b) { return a->candidate < b->candidate; });
+    Log::get().note("hdr: widened-texture census #%u over %u frames: %zu alive. Writers are pixel "
+                    "shaders drawing into render target 0 or compute shaders writing UAV 0-3; readers "
+                    "are pixel shaders sampling slots 0-3. Shader hashes are EDVR's.",
+                    g_censusWindowsDone, kCensusFrames, rows.size());
+    for (const WideInfo* w : rows) {
+        Log::get().note("hdr: census #%u target #%u %ux%u bind 0x%X: written by %s; read by %s",
+                        g_censusWindowsDone, w->candidate, w->width, w->height, w->bind,
+                        topUses(w->writers).c_str(), topUses(w->readers).c_str());
+    }
+    for (auto& e : g_wideByResource) { e.second.writers.clear(); e.second.readers.clear(); }
+}
+
+void censusFrame() {
+    const uint64_t now = GetTickCount64();
+    if (!g_censusStartMs) { g_censusStartMs = now; g_censusNextMs = now + kCensusFirstMs; }
+    if (g_censusActive.load(std::memory_order_relaxed)) {
+        if (g_censusFramesLeft && --g_censusFramesLeft == 0) {
+            g_censusActive.store(false, std::memory_order_relaxed);
+            ++g_censusWindowsDone;
+            censusReport();
+            g_censusNextMs = now + kCensusEveryMs;
+        }
+        return;
+    }
+    if (g_censusWindowsDone < kCensusWindows && now >= g_censusNextMs) {
+        g_censusFramesLeft = kCensusFrames;
+        g_censusActive.store(true, std::memory_order_relaxed);
+    }
+}
+
+uint64_t wideBytes(const D3D11_TEXTURE2D_DESC& d) {
+    uint64_t total = 0;
+    const unsigned mips = d.MipLevels ? d.MipLevels : 1;
+    for (unsigned m = 0; m < mips; ++m) {
+        const uint64_t w = (d.Width >> m) ? (d.Width >> m) : 1;
+        const uint64_t h = (d.Height >> m) ? (d.Height >> m) : 1;
+        total += w * h * 8ull;
+    }
+    return total * (d.ArraySize ? d.ArraySize : 1) * (d.SampleDesc.Count ? d.SampleDesc.Count : 1);
+}
+
+void reportWideTextures() {
+    const uint64_t now = GetTickCount64();
+    if (now < g_wideNextReportMs) return;
+    g_wideNextReportMs = now + kWideReportEveryMs;
+    const double mb = 1048576.0;
+    const uint64_t aliveBytes = g_wideAliveBytes.load(std::memory_order_relaxed);
+    Log::get().note("hdr: widened textures: %llu made this session (%.0f MB as FP16), %llu alive "
+                    "(%.0f MB as FP16, %.0f MB more than 8-bit would take). Every %u s.",
+                    static_cast<unsigned long long>(g_wideMade.load(std::memory_order_relaxed)),
+                    g_wideMadeBytes.load(std::memory_order_relaxed) / mb,
+                    static_cast<unsigned long long>(g_wideAlive.load(std::memory_order_relaxed)),
+                    aliveBytes / mb, aliveBytes / 2 / mb,
+                    static_cast<unsigned>(kWideReportEveryMs / 1000));
+}
 
 constexpr unsigned kInexactViewNotes = 8;
 constexpr unsigned kPassNotes = 4;
@@ -638,6 +811,16 @@ void hdrOutputStartup() {
     g.cfgPeak = cfg.getFloat("advanced.hdr_peak_nits", 0.0f);
     const std::string gamma = cfg.getString("advanced.hdr_gamma", "srgb");
     g.srgbDecode = _stricmp(gamma.c_str(), "2.2") != 0;
+    const std::string widen = cfg.getString("advanced.hdr_widen", "all");
+    g.widenAll = rules::parseWidenList(widen.c_str(), &g.widenMask);
+    if (g.on && !g.widenAll)
+        Log::get().note("hdr: advanced.hdr_widen \"%s\": only those candidates are widened "
+                        "(mask 0x%llX); the rest stay 8-bit", widen.c_str(), g.widenMask);
+    const std::string grading = cfg.getString("advanced.hdr_grading", "game");
+    g.grading = _stricmp(grading.c_str(), "off") != 0;
+    if (g.on && g.grading && _stricmp(grading.c_str(), "game") != 0)
+        Log::get().note("hdr: advanced.hdr_grading \"%s\" is not a value this reads; using game "
+                        "(game, off)", grading.c_str());
     const std::string highlights = cfg.getString("advanced.hdr_highlights", "channel");
     g.huePreserve = _stricmp(highlights.c_str(), "hue") == 0;
     if (g.on && !g.huePreserve && _stricmp(highlights.c_str(), "channel") != 0)
@@ -699,14 +882,22 @@ void hdrOutputSwapChainChanged() {
 
 bool hdrOutputWidenTexture(const D3D11_TEXTURE2D_DESC& asked, D3D11_TEXTURE2D_DESC* out) {
     // The whole predicate is hdr_output_rules.h's: format and bind class, no
-    // size test of any kind, and the exclusions it documents.
+    // size test of any kind, and the exclusions it documents. advanced.hdr_widen
+    // can then leave chosen candidates 8-bit (a diagnostic for narrowing).
     if (!g.on || !out || !rules::widens(askOf(asked))) return false;
+    static std::atomic<unsigned> candidates{0};
+    const unsigned candidate = ++candidates;
+    const bool selected = rules::widenSelected(g.widenAll, g.widenMask, candidate);
+    if (candidate <= 24)
+        Log::get().note("hdr: target #%u %s: %ux%u r8g8b8a8_typeless%s (bind 0x%X, %u mips)",
+                        candidate, selected ? "created wide" : "left 8-bit by advanced.hdr_widen",
+                        asked.Width, asked.Height, selected ? " -> r16g16b16a16_typeless" : "",
+                        asked.BindFlags, asked.MipLevels);
+    if (!selected) return false;
+    ++g.widened;
+    t_lastCandidate = candidate;
     *out = asked;
     out->Format = kWideTypeless;
-    if (++g.widened <= 8)
-        Log::get().note("hdr: target #%u created wide: %ux%u r8g8b8a8_typeless -> "
-                        "r16g16b16a16_typeless (bind 0x%X, %u mips)", g.widened, asked.Width,
-                        asked.Height, asked.BindFlags, asked.MipLevels);
     return true;
 }
 
@@ -757,7 +948,7 @@ void hdrOutputAttach(ID3D11Device* device) {
     g.nits = hdrrules::resolveNits(g.cfgScene, g.cfgUi, g.cfgPeak, displayPeak);
     Log::get().note("hdr: brightness: scene white %.0f nits%s, UI white %.0f nits%s, peak %.0f "
                     "nits (%s; the display reports %.0f on output %u); shadows decoded with %s; "
-                    "highlights rolled off %s",
+                    "highlights rolled off %s; the game's display grading %s",
                     g.nits.scene, g.cfgScene > 0.0f ? "" : " (default)", g.nits.ui,
                     g.cfgUi > 0.0f ? "" : " (default)", g.nits.peak,
                     g.cfgPeak > 0.0f ? "advanced.hdr_peak_nits"
@@ -765,17 +956,22 @@ void hdrOutputAttach(ID3D11Device* device) {
                                              : "fallback, the display gave no usable value",
                     displayPeak, outputIndex,
                     g.srgbDecode ? "the sRGB curve" : "the 2.2 power",
-                    g.huePreserve ? "preserving hue" : "per channel");
+                    g.huePreserve ? "preserving hue" : "per channel",
+                    g.grading ? "applied (gamma setting, LUT, contrast, black lift, saturation)"
+                              : "off");
     const NitsMacros n = nitsMacros();
     const char* hue = g.huePreserve ? "1" : "0";
+    const char* grade = g.grading ? "1" : "0";
     const D3D_SHADER_MACRO bloom[] = {{"PEAK_WHITE_NITS", n.peak},
                                       {"DIFFUSE_WHITE_NITS", n.scene},
                                       {"HDR_TONE_HUE_PRESERVE", hue},
+                                      {"HDR_TONE_GRADING", grade},
                                       {nullptr, nullptr}};
     const D3D_SHADER_MACRO noBloom[] = {{"HDR_TONE_NO_BLOOM", "1"},
                                         {"PEAK_WHITE_NITS", n.peak},
                                         {"DIFFUSE_WHITE_NITS", n.scene},
                                         {"HDR_TONE_HUE_PRESERVE", hue},
+                                        {"HDR_TONE_GRADING", grade},
                                         {nullptr, nullptr}};
     const D3D_SHADER_MACRO copyMacros[] = {{"DIFFUSE_WHITE_NITS", n.scene},
                                            {"GRAPHICS_WHITE_NITS", n.ui},
@@ -869,7 +1065,52 @@ ID3D11PixelShader* hdrOutputReplacementPs(const void* bytecode, size_t length) {
     return replacement;
 }
 
+void hdrOutputWidenedCreated(ID3D11Texture2D* texture, const D3D11_TEXTURE2D_DESC& wide) {
+    if (!texture) return;
+    const uint64_t bytes = wideBytes(wide);
+    g_wideMade.fetch_add(1, std::memory_order_relaxed);
+    g_wideMadeBytes.fetch_add(bytes, std::memory_order_relaxed);
+    const void* key = static_cast<ID3D11Resource*>(texture);
+    {
+        std::lock_guard<std::mutex> lock(g_wideMutex);
+        WideInfo info;
+        info.candidate = t_lastCandidate;
+        info.width = wide.Width;
+        info.height = wide.Height;
+        info.bind = wide.BindFlags;
+        g_wideByResource[key] = std::move(info);
+    }
+    WideTracker* tracker = new (std::nothrow) WideTracker(bytes, key);
+    if (!tracker) { forgetWideResource(key); return; }
+    g_wideAlive.fetch_add(1, std::memory_order_relaxed);
+    g_wideAliveBytes.fetch_add(bytes, std::memory_order_relaxed);
+    // On success the texture holds its own reference; ours is dropped either
+    // way, so a refused attach undoes the count at once.
+    texture->SetPrivateDataInterface(kWideTrackerGuid, tracker);
+    tracker->Release();
+}
+
+void hdrOutputCensusDraw() {
+    if (!g_censusActive.load(std::memory_order_relaxed)) return;
+    const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+    censusNoteView(BindSlot::Rtv0, ps, true);
+    censusNoteView(BindSlot::PsSrv0, ps, false);
+    censusNoteView(BindSlot::PsSrv1, ps, false);
+    censusNoteView(BindSlot::PsSrv2, ps, false);
+    censusNoteView(BindSlot::PsSrv3, ps, false);
+}
+
+void hdrOutputCensusDispatch() {
+    if (!g_censusActive.load(std::memory_order_relaxed)) return;
+    const uint64_t cs = bindingShaderHash(BindSlot::Cs);
+    censusNoteView(BindSlot::CsUav0, cs, true);
+    censusNoteView(BindSlot::CsUav1, cs, true);
+    censusNoteView(BindSlot::CsUav2, cs, true);
+    censusNoteView(BindSlot::CsUav3, cs, true);
+}
+
 void hdrOutputBeforePresent(IDXGISwapChain* swapChain, ID3D11DeviceContext* context) {
+    if (g.on) { reportWideTextures(); censusFrame(); }
     if (!g.on || g.encodeFailed || g.shadersFailed || !swapChain || !context) return;
     prepareDomain(swapChain);
     if (!ensureBackBuffer(swapChain) || !g.backWidth || !g.backHeight) return;

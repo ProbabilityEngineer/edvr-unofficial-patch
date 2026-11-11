@@ -149,6 +149,19 @@ SamplerState      s1 : register(s1);
 #ifndef HDR_TONE_NO_BLOOM
 #define HDR_TONE_NO_BLOOM 0
 #endif
+// 1: run the game's own display grading after the tone curve, in the game's
+// order (RenoDX tonemap_*.ps_5_0.hlsl): the gamma setting (cb2[9].z), the
+// colour LUT (t0/s0, strength cb2[11].x, texel cb2[0].x), contrast and black
+// lift (cb2[10].y, cb2[9].y) and saturation (cb2[10].z). The highlight shoulder
+// then runs on the graded image, as RenoDX's post-LUT tone map does. 0: none of
+// it, the imported EDHDR form. advanced.hdr_grading (game | off).
+#ifndef HDR_TONE_GRADING
+#define HDR_TONE_GRADING 1
+#endif
+#if HDR_TONE_GRADING
+Texture3D<float4> t0 : register(t0);
+SamplerState      s0 : register(s0);
+#endif
 #if !HDR_TONE_NO_BLOOM
 SamplerState      s2 : register(s2);
 Texture2D<float4> t2 : register(t2);
@@ -260,6 +273,35 @@ float3 anchoredShoulder(float3 color, float peak, float anchor, float strength) 
     return mad(shoulder_range, dist / denom, color - dist);
 }
 
+#if HDR_TONE_GRADING
+float3 signPow(float3 x, float e) { return sign(x) * pow(abs(x), e); }
+
+// RenoDX ApplyLUT for Vanilla+: compress the brightest channel to 1.0 with the
+// shoulder (anchored at mid grey) so the LUT sees its 0..1 domain, sample it as
+// the game does, blend by strength, then undo the compression. Gamma in and out.
+float3 gameLut(float3 g) {
+    const float strength = cb2[11].x;
+    if (strength == 0.0) return g;
+    float3 lin = signPow(g, DISPLAY_GAMMA);
+    float m = max(max(lin.r, lin.g), lin.b);
+    float scale = (m > ANCHOR) ? anchoredShoulder(m.xxx, 1.0, ANCHOR, SHOULDER_COMPRESSION).x / m : 1.0;
+    float3 inG = signPow(lin * scale, 1.0 / DISPLAY_GAMMA);
+    const float texel = cb2[0].x;
+    float3 outG = t0.Sample(s0, saturate(inG) * (1.0 - texel) + 0.5 * texel).rgb;
+    outG = lerp(inG, outG, strength);
+    return signPow(signPow(outG, DISPLAY_GAMMA) / scale, 1.0 / DISPLAY_GAMMA);
+}
+
+// The game's display grading, in gamma space, in the game's order.
+float3 gameGrading(float3 g) {
+    g = signPow(g, cb2[9].z * 2.2);                      // the game's gamma setting
+    g = gameLut(g);                                      // colour LUT
+    g = g * cb2[10].y + cb2[9].y;                        // contrast and black lift
+    float l = dot(g, float3(0.308600008, 0.609399974, 0.0820000023));
+    return cb2[10].z * (g - l) + l;                      // saturation
+}
+#endif
+
 float4 m(float3 v0 : TEXCOORD1) : SV_Target {
     float E = cb2[2].x;                                  // engine exposure
 
@@ -286,6 +328,9 @@ float4 m(float3 v0 : TEXCOORD1) : SV_Target {
 
     // ---- RenoDX display transform, keeping its gamma encode ----
     float3 y = vanillaPlus(sceneLin);
+#if HDR_TONE_GRADING
+    y = max(signPow(gameGrading(signPow(y, 1.0 / DISPLAY_GAMMA)), DISPLAY_GAMMA), 0.0);
+#endif
 #if HDR_TONE_HUE_PRESERVE
     // Below ANCHOR the shoulder is the identity, so only highlights change.
     float peakChannel = max(max(y.r, y.g), y.b);

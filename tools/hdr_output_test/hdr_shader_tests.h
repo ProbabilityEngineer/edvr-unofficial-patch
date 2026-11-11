@@ -41,6 +41,11 @@ template<class Check> void run(Check check, bool hardware) {
               "tone variant reads sampler s1");
         check(SUCCEEDED(reflection->GetResourceBindingDescByName("cb2", &desc)) && desc.BindPoint == 2,
               "tone variant reads engine b2");
+        check(SUCCEEDED(reflection->GetResourceBindingDescByName("t0", &desc)) && desc.BindPoint == 0 &&
+                  desc.Dimension == D3D_SRV_DIMENSION_TEXTURE3D,
+              "tone variant reads the game's colour LUT as a 3D texture at t0, as the original does");
+        check(SUCCEEDED(reflection->GetResourceBindingDescByName("s0", &desc)) && desc.BindPoint == 0,
+              "tone variant samples the LUT with the game's s0");
         const bool texture = SUCCEEDED(reflection->GetResourceBindingDescByName("t2", &desc));
         const bool sampler = SUCCEEDED(reflection->GetResourceBindingDescByName("s2", &desc));
         check(texture == !noBloom && sampler == !noBloom,

@@ -16,6 +16,7 @@
 #include "../common/timing.h"
 #include "../common/vtable_hook.h"
 #include "binding_shadow.h"
+#include "hdr_output.h"
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"  // drawCensusDispatch: the census records compute
 #include "exposure_chain.h"  // the engine path: which of the second eye's dispatches are not forwarded (pure half)
@@ -728,6 +729,7 @@ void STDMETHODCALLTYPE hookedDispatch(ID3D11DeviceContext* self, UINT x, UINT y,
     if (runtimeFlatProfile()) {
         ++g_state->thunkHits[kHitDispatch];
         if (self == g_state->ownerCtx && flatTemporalCapturing()) flatTemporalDispatch(self, x, y, z);
+        if (self == g_state->ownerCtx && hdrOutputOn()) hdrOutputCensusDispatch();   // fix.hdr's widened-texture census (hdr_output.h)
         FlatRuntimeDispatchScope flatDispatch(self);
         g_state->realDispatch(self, x, y, z);
         return;

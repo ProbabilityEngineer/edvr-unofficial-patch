@@ -119,6 +119,12 @@ inline bool flatProfileReadsKey(const char* key) {
         // fix.hdr's highlight roll-off (hdr_output.cpp): channel | hue, channel by default. Unlisted, getString answers "off",
         // which is neither, so hue could never be chosen from a flat file.
         std::strcmp(key, "advanced.hdr_highlights") == 0 ||
+        // fix.hdr's widening selection (hdr_output.cpp, hdrrules::parseWidenList): all | candidate list, a diagnostic for narrowing
+        // the widening. Unlisted, getString answers "off", which parses as an empty list -- nothing would widen.
+        std::strcmp(key, "advanced.hdr_widen") == 0 ||
+        // fix.hdr's display grading (hdr_output.cpp): game | off, game by default. Unlisted, getString answers "off" and the
+        // game's gamma, LUT, contrast and saturation would silently vanish from every flat session.
+        std::strcmp(key, "advanced.hdr_grading") == 0 ||
         // The journal watcher, for the System Map's GuiFocus (journal_watch.h: journalFlatGuiFocus). Its other accessors answer
         // flat with the no-journal values, so enabling the watcher here changes no other flat behaviour. journal_dir names the
         // Saved Games folder when the default is wrong; unlisted, it reads "off" and the watcher looks in a folder named "off".

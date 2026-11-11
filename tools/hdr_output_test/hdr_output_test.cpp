@@ -210,7 +210,8 @@ void theFlatProfileReadsTheHdrKeys() {
           "the flat profile names advanced.hdr_encode, so the domain A/B can be set");
     for (const char* key : {"\"advanced.hdr_scene_nits\"", "\"advanced.hdr_ui_nits\"",
                             "\"advanced.hdr_peak_nits\"", "\"advanced.hdr_gamma\"",
-                            "\"advanced.hdr_highlights\""})
+                            "\"advanced.hdr_highlights\"", "\"advanced.hdr_widen\"",
+                            "\"advanced.hdr_grading\""})
         check(text.find(key) != std::string::npos,
               "the flat profile names each HDR brightness and gamma key, so a flat file's value is read");
 }
@@ -241,6 +242,22 @@ void theBrightnessRule() {
     check(clamped.scene == rules::kMinWhiteNits && clamped.ui == rules::kMaxWhiteNits &&
               clamped.peak == rules::kMaxPeakNits,
           "out-of-range values clamp to the documented bounds");
+}
+
+// advanced.hdr_widen: "all" or a candidate list. A list that parses to
+// nothing widens nothing, which is why the flat gate must name the key.
+void theWidenList() {
+    unsigned long long mask = 1;
+    check(rules::parseWidenList("all", &mask) && mask == 0, "all widens everything");
+    check(rules::parseWidenList("", &mask), "empty is all");
+    check(rules::parseWidenList(nullptr, &mask), "unset is all");
+    check(!rules::parseWidenList("1,3, 8", &mask) && mask == 0x85ull, "a list sets one bit per candidate");
+    check(!rules::parseWidenList("0,65,x,2", &mask) && mask == 0x2ull, "out-of-range and non-numbers are ignored");
+    check(rules::widenSelected(false, 0x85ull, 3) && !rules::widenSelected(false, 0x85ull, 2),
+          "selection follows the mask");
+    check(rules::widenSelected(true, 0, 40), "all selects any candidate");
+    check(!rules::parseWidenList("off", &mask) && mask == 0,
+          "the flat gate's \"off\" would widen nothing (so the key must be named)");
 }
 
 void shaderIdentities() {
@@ -298,6 +315,7 @@ int main(int argc, char** argv) {
     theDisplayModeRetry();
     theFlatProfileReadsTheHdrKeys();
     theBrightnessRule();
+    theWidenList();
     shaderIdentities();
 #ifdef _WIN32
     hdr_shader_tests::run(check, hardware);

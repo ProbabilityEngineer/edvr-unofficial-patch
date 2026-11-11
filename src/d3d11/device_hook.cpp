@@ -919,6 +919,7 @@ HRESULT STDMETHODCALLTYPE hookedCreateTexture2D(ID3D11Device* self,
         hdrOutputWidenTexture(*desc, &hdrDesc))
         desc = &hdrDesc;
     const HRESULT hr = createTexture2DForwarded(self, desc, init, out);
+    if (desc == &hdrDesc && SUCCEEDED(hr) && out && *out) hdrOutputWidenedCreated(*out, hdrDesc);
     if (self == g_state->device) {
         if (FAILED(hr)) {
             noteDeviceCreateFailure(kDevCreateTexture2D, hr, desc, init, false);

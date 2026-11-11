@@ -113,6 +113,18 @@ void hdrOutputSwapChainChanged();
 // clamps the HDR away before the next pass can read it.
 bool hdrOutputWidenTexture(const D3D11_TEXTURE2D_DESC& asked, D3D11_TEXTURE2D_DESC* out);
 
+// A texture created from hdrOutputWidenTexture's desc. Counts it, and attaches
+// a private-data object the runtime releases when the texture is destroyed, so
+// the periodic "hdr: widened textures" line can say how many are alive and
+// how much memory widening costs right now, not only how many were made.
+void hdrOutputWidenedCreated(ID3D11Texture2D* texture, const D3D11_TEXTURE2D_DESC& wide);
+
+// The widened-texture census (diagnostic): during a census window, note which
+// shaders write and read each widened texture. One relaxed load when no window
+// is open. Owner context only; the caller checks that.
+void hdrOutputCensusDraw();
+void hdrOutputCensusDispatch();
+
 // The view format to use over a resource this feature widened. Returns true
 // when `mapped` holds a format to use instead of `asked`: an 8-bit RGBA view
 // over a 16-bit-float resource reads as R16G16B16A16_FLOAT. Stateless -- it

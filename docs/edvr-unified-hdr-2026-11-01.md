@@ -39,6 +39,31 @@ scene white comes out about 1:0.95:0.7). `advanced.hdr_highlights = hue`
 shoulders the brightest channel and scales all three together. The default
 `channel` compiles to bytecode identical to the per-channel build.
 
+Side-by-side check (native, SDR layer vs EDVR's sRGB decode through DXMT's PQ
+scaling): identical at every brightness setting, so DXMT's absolute model is
+right and the output stage matches SDR.
+
+What the tone replacement dropped: the game's tone shaders (RenoDX
+`tonemap_0xD7E646E3` / `tonemap_no_bloom_0x6BE69EF3`) grade after the curve,
+in gamma space:
+- the gamma setting, `SignPow(g, cb2[9].z*2.2)`;
+- the colour LUT (`t0`/`s0`, strength `cb2[11].x`);
+- contrast and black lift, `g*cb2[10].y + cb2[9].y`;
+- saturation, `cb2[10].z`.
+
+EDVR's import kept none of them. The black lift alone explains shadows staying
+darker than SDR after the decode fix, and the LUT explains familiar colours
+looking off. `advanced.hdr_grading` (default `game`) runs them in the game's
+order, with RenoDX's max-channel compression around the LUT, before the
+highlight shoulder. `off` compiles to bytecode identical to the flown
+`be4d8c67` shaders.
+
+Widening census (diagnostic): once per session window, the log names, for
+each widened target (candidate number as in `hdr: target #N`), the shaders
+that wrote it (RTV 0, CS UAV 0-3) and read it (PS SRV 0-3).
+`advanced.hdr_widen` (dev: hidden) takes a candidate list for the narrowing
+A/B. A once-a-minute line counts widened textures made and alive.
+
 The remaining cost is the eight widened targets, seven of them full
 resolution. Narrowing them is the open performance item.
 
