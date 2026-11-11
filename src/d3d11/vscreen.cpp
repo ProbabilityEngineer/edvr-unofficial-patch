@@ -34,6 +34,7 @@
 #include "backdrop_fix.h"
 #include "billboard_fix.h"
 #include "binding_shadow.h"
+#include "hdr_output.h"
 #include "flat_issue_epoch.h"
 #include "panel_curve.h"
 #include "screen_motion.h"
@@ -5464,6 +5465,7 @@ struct DrawClock {
 // Armed is one bool load; the record is drawCensusOffDraw's own gate (frames left and offscreen), so an unarmed census costs nothing.
 static void flatCensusDraw(ID3D11DeviceContext* self, char kind, uint32_t count, uint32_t instances, const DrawArgs& args) {
     if (drawCensusArmed()) drawCensusOffDraw(self, kind, count, instances, args);
+    if (self == g_state->ownerCtx && hdrOutputOn()) hdrOutputNoteDraw(self);   // fix.hdr: tone-target learning (hdr_output.h)
 }
 
 // Built v14.34: the optimized station's sun skip in the flat profile. Flat draws never reach beginPanelOverride (VR's verdict makes the same call after its

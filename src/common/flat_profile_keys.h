@@ -98,6 +98,33 @@ inline bool flatProfileReadsKey(const char* key) {
         // of the flat panel's Performance tab, directly under UI quality. Unlisted, getBool answers false here whatever the file says, which reads as off, so the
         // row could never turn it on, and the 30 s "flat ui layer smaa:" line shows key=off.
         std::strcmp(key, "fix.hud_antialiasing") == 0 ||
+        // HDR output (hdr_output.cpp): on | off, off by default, read once at startup. Flat is the ONLY profile that has it -- the FP16
+        // swapchain, the widened post-tone targets and the PQ encode are the flat output chain -- so an unlisted key here is not a
+        // degraded feature, it is the whole feature. Unlisted, getString answers exactly "off", which hdrOutputStartup cannot tell
+        // from a file that says off: every hook site stays dark and NOT ONE "hdr:" line is written. That is what happened on the
+        // 2026-11-01 flight, and it is why hdr_output_test reads this file and fails when either name is missing from it.
+        std::strcmp(key, "fix.hdr") == 0 ||
+        // Which domain that output is encoded to (hdr_output.cpp): pq | linear, pq by default. Developer tier, no flat panel row, and
+        // it does nothing while fix.hdr is off. Unlisted, getString answers "off", which is neither value; the reader tests only for
+        // "linear", so the domain stays PQ and the key simply cannot be set -- the A/B it exists for is unreachable from a flat file.
+        std::strcmp(key, "advanced.hdr_encode") == 0 ||
+        // fix.hdr's brightness in nits (hdr_output.cpp, hdrrules::resolveNits): scene white, interface white and peak, read once
+        // at startup. Unlisted, getFloat would never see the file and HDR would keep its defaults whatever the user wrote.
+        std::strcmp(key, "advanced.hdr_scene_nits") == 0 ||
+        std::strcmp(key, "advanced.hdr_ui_nits") == 0 ||
+        std::strcmp(key, "advanced.hdr_peak_nits") == 0 ||
+        // fix.hdr's shadow decode (hdr_output.cpp): srgb | 2.2, srgb by default. Unlisted, getString answers "off", which reads as
+        // srgb, so the 2.2 alternative could never be chosen from a flat file.
+        std::strcmp(key, "advanced.hdr_gamma") == 0 ||
+        // fix.hdr's highlight roll-off (hdr_output.cpp): channel | hue, channel by default. Unlisted, getString answers "off",
+        // which is neither, so hue could never be chosen from a flat file.
+        std::strcmp(key, "advanced.hdr_highlights") == 0 ||
+        // fix.hdr's widening selection (hdr_output.cpp, hdrrules::parseWidenMode): auto | all | candidate list, auto by default.
+        // Unlisted, getString answers "off", which parses as an empty list -- nothing would widen and HDR would clip to SDR.
+        std::strcmp(key, "advanced.hdr_widen") == 0 ||
+        // fix.hdr's display grading (hdr_output.cpp): game | off, game by default. Unlisted, getString answers "off" and the
+        // game's gamma, LUT, contrast and saturation would silently vanish from every flat session.
+        std::strcmp(key, "advanced.hdr_grading") == 0 ||
         // The journal watcher, for the System Map's GuiFocus (journal_watch.h: journalFlatGuiFocus). Its other accessors answer
         // flat with the no-journal values, so enabling the watcher here changes no other flat behaviour. journal_dir names the
         // Saved Games folder when the default is wrong; unlisted, it reads "off" and the watcher looks in a folder named "off".

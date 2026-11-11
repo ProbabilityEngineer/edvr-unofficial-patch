@@ -1572,9 +1572,9 @@ inline int flatHdrRouteTests() {
                "dlaaEvaluate hands the route's bit to the feature it asks for");
         // The resolver hands the frame's bit down to each engine, with no literal in its place.
         const std::string resolve = slurpSource("src/d3d11/flat_mono_resolve.cpp");
-        expect(count(resolve, "f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);") == 1 &&
-                   count(resolve, "2*std::atan(1/sy),reason,true,hdr);") == 1,
-               "the resolver's backend calls pass the frame's hdr bit to the DLSS/DLAA evaluate and to the FSR evaluate");
+        expect(count(resolve, "f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdrColor);") == 1 &&
+                   count(resolve, "2*std::atan(1/sy),reason,true,hdrColor);") == 1,
+               "the resolver's backend calls pass the HDR-or-FP16 color bit to DLSS/DLAA and FSR (without changing the route)");
     }
 
     // ---- the wiring no rig can run: the runtime's default, merge and publication, and the panel's use of them ---------

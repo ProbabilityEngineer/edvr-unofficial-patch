@@ -51,7 +51,7 @@ inline FlatPairFacts flatPairFactsFresh(uint64_t vs, uint64_t ps, bool flat) noe
     f.toneSlot = flat_mono_detail::toneHdrSlot(vs, ps);
     f.mapToneSlot = flatUiMapToneSlotOf(vs, ps);
     f.sourceTone = flatUiSourceTonePair(vs, ps);
-    f.copyPair = vs == flat_mono_detail::kCopyVs && ps == flat_mono_detail::kCopyPs;
+    f.copyPair = flat_mono_detail::outputCopyPair(vs, ps);
     f.legacyGlassPair = flatUiLegacyGlassPair(vs, ps);
     for (int map = 0; map < 2 && !f.uiMayAsk; ++map)
         for (int hdr = 0; hdr < 2 && !f.uiMayAsk; ++hdr)
