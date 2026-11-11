@@ -32,14 +32,17 @@ namespace {
 using Microsoft::WRL::ComPtr;
 // The GPU census's span hooks (flatMonoResolveSetSpanHooks): null unless the flat runtime installed them.
 FlatMonoResolveSpanFn g_spanBegin = nullptr, g_spanEnd = nullptr;
-// One timestamp pair around the resolver's own dispatches and backend call, closed by every exit.
+// One timestamp pair around a part of the resolver's own work (flat_mono_resolve.h, FlatResolveSpan), closed by
+// close() or by every exit.
 struct SpanGuard {
     ID3D11DeviceContext* context;
+    FlatResolveSpan part;
     bool open = false;
-    explicit SpanGuard(ID3D11DeviceContext* c) : context(c) {
-        if (g_spanBegin && g_spanEnd) { g_spanBegin(context); open = true; }
+    SpanGuard(ID3D11DeviceContext* c, FlatResolveSpan p) : context(c), part(p) {
+        if (g_spanBegin && g_spanEnd) { g_spanBegin(context, part); open = true; }
     }
-    ~SpanGuard() { if (open) g_spanEnd(context); }
+    void close() { if (open) { g_spanEnd(context, part); open = false; } }
+    ~SpanGuard() { close(); }
 };
 // The HDR route's breadcrumbs (flat_hdr_crumbs.h): true while a resolver call that belongs to the route is running and the
 // session's crumbs are live. The three entry points set it (CrumbScope) and the helpers below read it, so none of them is
@@ -1337,7 +1340,8 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     // The crumbs' copy step covers the census's timestamps, the constants upload and the copy of H into the private input.
     HdrCrumbSpan copyStep(g_crumbOn,"copy-h","fmt=%s(%u) size=%ux%u",hdrCrumbFormat(static_cast<uint32_t>(colorDesc.Format)),
         static_cast<unsigned>(colorDesc.Format),f.renderWidth,f.renderHeight);
-    SpanGuard span(context);   // the GPU census's timestamp pair: this call's own dispatches and the backend
+    SpanGuard span(context, FlatResolveSpan::Whole);   // the GPU census's timestamp pair: this call's own dispatches and the backend
+    SpanGuard prepSpan(context, FlatResolveSpan::Prep); // and its parts: the copy and prep, the backend, the finish
     context->UpdateSubresource(g.constants.Get(),0,nullptr,&constants,0,0);
     context->CopyResource(g.color.texture.Get(),overlay?cleanColor.Get():color.Get());
     if(overlay) context->CopyResource(g.rawOverlay.texture.Get(),color.Get());
@@ -1383,10 +1387,12 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         g.refusalWrite=(slot+1)%4;
         ++g_refusal.sampled;
     }
+    prepSpan.close();
     HdrCrumbSpan backendStep(g_crumbOn,"backend","mode=%s in=%ux%u out=%ux%u reset=%u",flatMonoResolveModeName(f.mode),
         f.renderWidth,f.renderHeight,evalW,evalH,reset?1u:0u);
     bool ok=true;
     {
+        SpanGuard backendSpan(context, FlatResolveSpan::Backend);
         flatcpu::Scope backendScope(flatcpu::kBackend);   // the backend evaluation: NGX, FSR3, or the TAA dispatch
     if(taa) {
         // t1 is this frame's depth (the prep's output, which an EDVR TAA frame never rescales): the history depth check reads the texels a
@@ -1421,6 +1427,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     backendStep.close();
     if(hdr && ok)++stats.hdrBackend;
     if(!ok) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
+    SpanGuard finishSpan(context, FlatResolveSpan::Finish);
     if(hdr) {
         // The result goes back into the game's HDR target through a pixel-shader draw: per pixel the backend's output,
         // or the raw input where the rejection mask says the history is not to be trusted; for EDVR's TAA (route y) its

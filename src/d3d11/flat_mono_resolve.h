@@ -369,11 +369,15 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(
 // (flatMonoResolveSetIsolation). The caller supplies only jitter that was actually rendered into these inputs.
 bool flatMonoResolve(ID3D11Device*, ID3D11DeviceContext*, const FlatMonoResolveFrame&,
                      ID3D11ShaderResourceView** output, const char** reason);
-// The GPU census's timestamp pair (flat_cpu.h): begin is called just before the resolver's own
-// dispatches and backend call, end when the call returns by any path. Owner thread. Null (the
-// default, and in every rig) times nothing; installing them changes no command the resolver
-// issues except the two queries.
-using FlatMonoResolveSpanFn = void (*)(ID3D11DeviceContext*) noexcept;
+// The GPU census's timestamp pairs (flat_cpu.h): Whole begins just before the resolver's own
+// dispatches and backend call and ends when the call returns by any path; inside it, Prep (the
+// constants upload, the copy of the input and the prep dispatch, plus the refusal census's sample
+// on the frames that take one), Backend (the NGX, FSR3, XeSS or EDVR TAA evaluation) and Finish
+// (the composite back, and what follows it to the return) follow each other without overlap.
+// Owner thread. Null (the default, and in every rig) times nothing; installing them changes no
+// command the resolver issues except the queries.
+enum class FlatResolveSpan : unsigned { Whole = 0, Prep, Backend, Finish };
+using FlatMonoResolveSpanFn = void (*)(ID3D11DeviceContext*, FlatResolveSpan) noexcept;
 void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpanFn end);
 // Recover an already rendered jittered frame after backend refusal. This
 // spatial resolve uses no temporal history or SDK and borrows the same frame

@@ -597,6 +597,11 @@ struct WindowReport {
     // or that expired unread.
     unsigned gpuFrameSamples = 0, gpuResolveSamples = 0;
     double gpuFrameP50 = 0, gpuFrameP95 = 0, gpuResolveP50 = 0, gpuResolveP95 = 0;
+    // The resolver's span in its three parts (flat_mono_resolve.h, FlatResolveSpan): the copy and prep, the backend
+    // (FSR3, NGX, XeSS or EDVR TAA), the finish. Each its own pair, so the parts' medians need not add to the whole's.
+    static constexpr unsigned kResolveParts = 3;
+    unsigned gpuPartSamples[kResolveParts] = {};
+    double gpuPartP50[kResolveParts] = {}, gpuPartP95[kResolveParts] = {};
     uint64_t gpuSkipped = 0, gpuInvalid = 0;
     bool standingDown = false;   // the work is stood down as the window closes
     bool clocksOff = false;      // the census's clocks were off as the window closed (advanced.flat_cpu_timing, the default)
@@ -699,6 +704,10 @@ public:
     }
     void noteGpuFrame(double ms) noexcept { if (gpuFrame_ < kMaxSamples) gpuFrameMs_[gpuFrame_++] = static_cast<float>(ms); }
     void noteGpuResolve(double ms) noexcept { if (gpuResolve_ < kMaxSamples) gpuResolveMs_[gpuResolve_++] = static_cast<float>(ms); }
+    // part: 0 copy and prep, 1 backend, 2 finish.
+    void noteGpuResolvePart(unsigned part, double ms) noexcept {
+        if (part < WindowReport::kResolveParts && gpuPart_[part] < kMaxSamples) gpuPartMs_[part][gpuPart_[part]++] = static_cast<float>(ms);
+    }
     void noteGpuSkipped() noexcept { ++gpuSkipped_; }
     void noteGpuInvalid() noexcept { ++gpuInvalid_; }
     // The offscreen fast path's counts for the frame that just ended, drained with the wrapper's.
@@ -797,6 +806,10 @@ public:
         percentiles(gpuFrameMs_, gpuFrame_, &out.gpuFrameP50, &out.gpuFrameP95);
         out.gpuResolveSamples = gpuResolve_;
         percentiles(gpuResolveMs_, gpuResolve_, &out.gpuResolveP50, &out.gpuResolveP95);
+        for (unsigned p = 0; p < WindowReport::kResolveParts; ++p) {
+            out.gpuPartSamples[p] = gpuPart_[p];
+            percentiles(gpuPartMs_[p], gpuPart_[p], &out.gpuPartP50[p], &out.gpuPartP95[p]);
+        }
         out.gpuSkipped = gpuSkipped_;
         out.gpuInvalid = gpuInvalid_;
         out.standingDown = standingDown;
@@ -844,6 +857,7 @@ private:
         offscreen_ = FlatOffscreenCounts{};
         queries_ = FlatQueryCounts{};
         gpuFrame_ = gpuResolve_ = 0;
+        for (auto& n : gpuPart_) n = 0;
         gpuSkipped_ = gpuInvalid_ = 0;
     }
     bool primed_ = false, samplingOk_ = true, sampledNow_ = false, renderNow_ = false, floorsMeasured_ = false;
@@ -867,6 +881,8 @@ private:
     float interval_[kMaxSamples];
     float gpuFrameMs_[kMaxSamples];
     float gpuResolveMs_[kMaxSamples];
+    unsigned gpuPart_[WindowReport::kResolveParts] = {};
+    float gpuPartMs_[WindowReport::kResolveParts][kMaxSamples];
 };
 
 // ---- the text ------------------------------------------------------------------------------------
@@ -1125,6 +1141,16 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
     tk.add("; ", "GPU frame %s (first game draw to Present; %u timed, %llu skipped, %llu invalid)",
            frameText, r.gpuFrameSamples, static_cast<unsigned long long>(r.gpuSkipped), static_cast<unsigned long long>(r.gpuInvalid));
     tk.add("; ", "GPU resolve %s (%u timed)", resolveText, r.gpuResolveSamples);
+    // Its parts, only once any was timed: a session with no resolve keeps the line it always had.
+    if (r.gpuPartSamples[0] || r.gpuPartSamples[1] || r.gpuPartSamples[2]) {
+        char parts[WindowReport::kResolveParts][48];
+        for (unsigned p = 0; p < WindowReport::kResolveParts; ++p) {
+            if (r.gpuPartSamples[p]) std::snprintf(parts[p], sizeof(parts[p]), "p50 %.2f / p95 %.2f ms", r.gpuPartP50[p], r.gpuPartP95[p]);
+            else std::snprintf(parts[p], sizeof(parts[p]), "-");
+        }
+        tk.add("; ", "GPU resolve parts: copy+prep %s, backend %s, finish %s (%u/%u/%u timed)", parts[0], parts[1], parts[2],
+               r.gpuPartSamples[0], r.gpuPartSamples[1], r.gpuPartSamples[2]);
+    }
     tk.add("; ", "clock floor %.0f ns/scope (records %.0f ns); engine hooks floor %.0f ns plain / %.0f ns paused (records %.0f / %.0f ns)",
            r.floor.costNs, r.floor.recordedNs, r.emFloor.plainCostNs, r.emFloor.pausedCostNs,
            r.emFloor.plainRecordedNs, r.emFloor.pausedRecordedNs);
