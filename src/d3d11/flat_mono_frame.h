@@ -21,7 +21,10 @@ enum class FlatMonoReason {
     // game renders the scene at a size that is not a uniform scale of the output between half and twice (Elite's resolution
     // is not the screen's shape, or the supersampling takes it out of the band): the measured sizes ride the refusal.
     // NoScene: a final copy was found and the frame has no scene at all (startup, a loading screen, a 2D menu).
-    RenderSize, NoScene
+    RenderSize, NoScene,
+    // Engine motion's emit hook is permanently refused in this process (flat_standdown.h, flatEngineMotionVerdict): the
+    // chain was selected, and every treatment then refuses at engine-source-not-ready. Appended the same way.
+    EngineMotionAbsent
 };
 inline const char* flatMonoReasonName(FlatMonoReason reason) {
     switch (reason) {
@@ -50,6 +53,7 @@ inline const char* flatMonoReasonName(FlatMonoReason reason) {
     case FlatMonoReason::HdrExtent: return "hdr-route-needs-render-at-least-output";
     case FlatMonoReason::RenderSize: return "render-size-does-not-fit-output";
     case FlatMonoReason::NoScene: return "no-3d-scene";
+    case FlatMonoReason::EngineMotionAbsent: return "engine-motion-hook-not-installed";
     }
     return "unknown-selector-result";
 }

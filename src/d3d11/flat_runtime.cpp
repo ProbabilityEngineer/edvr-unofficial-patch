@@ -4482,6 +4482,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // The verdict of the frame that just ended, taken before the stand-down clears it: the source spell below reads it (section 104).
     const FlatFrameSeen endedSeen = s.frameSeen;
     const FlatMonoReason endedReason = s.frameReason;
+    // Engine motion refused for the process (flat_standdown.h, flatEngineMotionVerdict): a treatable frame could not
+    // have been treated, so the stand-down counts it as refused for its structure. Watched frames only; the source
+    // spell below keeps the selector's own verdict.
+    if (s.frameLive) flatEngineMotionVerdict(s.frameSeen, s.frameReason, engineVelocityEmitRefused());
     standDownFrame(s, frame);
     syncEngine();
     // The CPU and GPU census (flat_cpu.h): the frame that just ended is cut into its families,

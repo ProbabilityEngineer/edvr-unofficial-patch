@@ -57,7 +57,7 @@ inline int flatStandDownTests() {
             FlatMonoReason::InvalidCamera, FlatMonoReason::NoHdr, FlatMonoReason::ConflictingHdr,
             FlatMonoReason::NoHdrCamera, FlatMonoReason::NoSupportedSource, FlatMonoReason::AmbiguousSource,
             FlatMonoReason::InvalidSource, FlatMonoReason::NoHdrConsumer, FlatMonoReason::HdrExtent,
-            FlatMonoReason::RenderSize, FlatMonoReason::NoScene};
+            FlatMonoReason::RenderSize, FlatMonoReason::NoScene, FlatMonoReason::EngineMotionAbsent};
         bool table = true;
         unsigned structural = 0;
         for (FlatMonoReason r : all) {
@@ -65,13 +65,14 @@ inline int flatStandDownTests() {
                 r == FlatMonoReason::InvalidTonePass || r == FlatMonoReason::NoOutputCopy ||
                 r == FlatMonoReason::AmbiguousOutputCopy || r == FlatMonoReason::InvalidOutputCopy ||
                 r == FlatMonoReason::BrokenLineage || r == FlatMonoReason::WrongOrder ||
-                r == FlatMonoReason::NoHdrConsumer || r == FlatMonoReason::RenderSize || r == FlatMonoReason::NoScene;
+                r == FlatMonoReason::NoHdrConsumer || r == FlatMonoReason::RenderSize || r == FlatMonoReason::NoScene ||
+                r == FlatMonoReason::EngineMotionAbsent;
             if (flatMonoReasonStructural(r) != want) table = false;
             structural += flatMonoReasonStructural(r) ? 1u : 0u;
         }
-        expect(table && structural == 11 && sizeof(all) / sizeof(all[0]) == 25,
+        expect(table && structural == 12 && sizeof(all) / sizeof(all[0]) == 26,
                "the structural reasons are exactly the eleven chain-shape ones (the eight, no-hdr-consumer, "
-               "render-size-does-not-fit-output and no-3d-scene), of all 25");
+               "render-size-does-not-fit-output and no-3d-scene) and engine-motion-hook-not-installed, of all 26");
         expect(!flatMonoReasonStructural(FlatMonoReason::HdrExtent) &&
                flatFrameSeenFor(false, FlatMonoReason::HdrExtent) == FlatFrameSeen::Transient &&
                flatFrameSeenFor(false, FlatMonoReason::NoHdrConsumer) == FlatFrameSeen::Structural,
@@ -135,6 +136,57 @@ inline int flatStandDownTests() {
         expect(!ever && sim.machine.entries == 0 && sim.machine.probes == 0,
                "a session whose frames are selected stays in Full for good");
     }
+    // ---- engine motion refused for the process (flatEngineMotionVerdict) -------------
+    {
+        FlatFrameSeen seen = FlatFrameSeen::Treatable; FlatMonoReason reason = FlatMonoReason::Selected;
+        flatEngineMotionVerdict(seen, reason, false);
+        const bool liveKeeps = seen == FlatFrameSeen::Treatable && reason == FlatMonoReason::Selected;
+        flatEngineMotionVerdict(seen, reason, true);
+        const bool refusedTurns = seen == FlatFrameSeen::Structural && reason == FlatMonoReason::EngineMotionAbsent;
+        FlatFrameSeen transient = FlatFrameSeen::Transient; FlatMonoReason truncated = FlatMonoReason::Truncated;
+        flatEngineMotionVerdict(transient, truncated, true);
+        FlatFrameSeen structural = FlatFrameSeen::Structural; FlatMonoReason noScene = FlatMonoReason::NoScene;
+        flatEngineMotionVerdict(structural, noScene, true);
+        FlatFrameSeen none = FlatFrameSeen::None; FlatMonoReason noCopy = FlatMonoReason::NoOutputCopy;
+        flatEngineMotionVerdict(none, noCopy, true);
+        expect(liveKeeps && refusedTurns && transient == FlatFrameSeen::Transient && truncated == FlatMonoReason::Truncated &&
+               structural == FlatFrameSeen::Structural && noScene == FlatMonoReason::NoScene &&
+               none == FlatFrameSeen::None && noCopy == FlatMonoReason::NoOutputCopy,
+               "the engine-motion verdict turns only a treatable frame, and only while the emit hook is refused");
+    }
+    {   // Session 183041: every frame selected, the emit hook refused. The work stands down after 5 s, stays down
+        // through its probes while the hook stays refused, and resumes at the first probe after it is installed.
+        Sim sim;
+        bool refused = true;
+        auto selected = [&]() {
+            FlatFrameSeen seen = FlatFrameSeen::Treatable; FlatMonoReason reason = FlatMonoReason::Selected;
+            flatEngineMotionVerdict(seen, reason, refused);
+            return sim.frame(seen, reason);
+        };
+        uint64_t enteredAt = 0, first = sim.now + 16;
+        for (int i = 0; i < 1000 && !enteredAt; ++i)
+            if (selected() == FlatStandDownEvent::Entered) enteredAt = sim.now;
+        expect(enteredAt && enteredAt - first >= kFlatStandDownTriggerMs && enteredAt - first < kFlatStandDownTriggerMs + 32 &&
+               sim.work == FlatWork::Paused && sim.machine.enteredReason == FlatMonoReason::EngineMotionAbsent &&
+               !sim.machine.warningActive(),
+               "selected frames with the emit hook refused stand the work down after 5 s, for engine-motion-hook-not-installed, "
+               "with no settings warning");
+        bool resumedEarly = false;
+        const uint64_t watchedAtEntry = sim.watched;
+        for (int i = 0; i < 60 * 60; ++i) if (selected() != FlatStandDownEvent::None) resumedEarly = true;
+        const uint64_t probesWhileRefused = sim.machine.probes;
+        expect(!resumedEarly && sim.machine.standing && probesWhileRefused >= 35 &&
+               sim.machine.probeReason == FlatMonoReason::EngineMotionAbsent && sim.watched - watchedAtEntry == probesWhileRefused,
+               "a minute later it is still stood down: every probe still finds the hook refused, and almost nothing was watched");
+        refused = false;
+        const uint64_t installedAt = sim.now;
+        uint64_t resumedAt = 0;
+        for (int i = 0; i < 200 && !resumedAt; ++i)
+            if (selected() == FlatStandDownEvent::Resumed) resumedAt = sim.now;
+        expect(resumedAt && resumedAt - installedAt <= kFlatStandDownProbeMs + 32 && sim.work == FlatWork::Full,
+               "once the hook is installed the next probe frame resumes the work");
+    }
+
     {   // Frames nothing watched neither start nor break a run.
         Sim sim;
         for (int i = 0; i < 100; ++i) sim.frame(FlatFrameSeen::Structural);
@@ -283,7 +335,7 @@ inline int flatStandDownTests() {
             FlatMonoReason::InvalidCamera, FlatMonoReason::NoHdr, FlatMonoReason::ConflictingHdr,
             FlatMonoReason::NoHdrCamera, FlatMonoReason::NoSupportedSource, FlatMonoReason::AmbiguousSource,
             FlatMonoReason::InvalidSource, FlatMonoReason::NoHdrConsumer, FlatMonoReason::HdrExtent,
-            FlatMonoReason::RenderSize, FlatMonoReason::NoScene};
+            FlatMonoReason::RenderSize, FlatMonoReason::NoScene, FlatMonoReason::EngineMotionAbsent};
         bool table = true;
         unsigned warns = 0;
         for (FlatMonoReason r : all) {
@@ -298,6 +350,7 @@ inline int flatStandDownTests() {
         expect(table && warns == 9 && !flatMonoReasonWarrantsWarning(FlatMonoReason::NoOutputCopy) &&
                flatMonoReasonStructural(FlatMonoReason::NoOutputCopy) &&
                !flatMonoReasonWarrantsWarning(FlatMonoReason::NoScene) && flatMonoReasonStructural(FlatMonoReason::NoScene) &&
+               !flatMonoReasonWarrantsWarning(FlatMonoReason::EngineMotionAbsent) &&
                flatMonoReasonWarrantsWarning(FlatMonoReason::RenderSize),
                "nine reasons warn: every chain-shape refusal that found an output copy, the HDR route's no-hdr-consumer "
                "and the render size that does not fit; no-known-output-copy and no-3d-scene are structural (the work stands "
@@ -354,8 +407,9 @@ inline int flatStandDownTests() {
                 ++stoodDown;
                 agrees = agrees && sim.machine.warningActive() == flatMonoReasonWarrantsWarning(r);
             }
-            expect(agrees && stoodDown == 11,
-                   "all eleven structural reasons stand the work down (no-hdr-consumer, the render size and no scene among them); the warning follows the nine");
+            expect(agrees && stoodDown == 12,
+                   "all twelve structural reasons stand the work down (no-hdr-consumer, the render size, no scene and the "
+                   "engine-motion hook among them); the warning follows the nine");
         }
 
         // A run that never stands down shows nothing, whatever its length under five seconds: the
