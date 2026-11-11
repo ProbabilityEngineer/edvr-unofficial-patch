@@ -16,6 +16,7 @@
 #include "../common/timing.h"
 #include "../common/vtable_hook.h"
 #include "binding_shadow.h"
+#include "flat_om_generation.h"
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"  // drawCensusDispatch: the census records compute
 #include "exposure_chain.h"  // the engine path: which of the second eye's dispatches are not forwarded (pure half)
@@ -651,6 +652,7 @@ void STDMETHODCALLTYPE hookedCSSetUAVs(ID3D11DeviceContext* self, UINT start, UI
 // them and the next unseen compute shader ran the shape probe over freed
 // memory. vscreen.cpp hit the same thing and hooks this for the same reason.
 void STDMETHODCALLTYPE hookedClearState(ID3D11DeviceContext* self) {
+    flatOmSetNote();   // flat_om_generation.h, whichever ClearState hook runs first
     // The VR world route's resolver isolates the context (SwapDeviceContextState, ClearState) around its own work: the game's
     // bindings are not forgotten by that (vscreen's hook on this slot steps aside for the same scope, and this one must not
     // run first and wipe the shadow).

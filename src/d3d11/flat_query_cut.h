@@ -32,6 +32,8 @@ enum class FlatQuery : uint8_t {
     GameBlend,           // the game's blend state, factor and mask, when engine motion derives its own
     GameTargets,         // the game's render-target set engine motion adds MRT6 to
     TargetsKept,         // the read-back that says the runtime took the set with MRT6 in it
+    ForwardTargets,      // the forward-light watch's written targets: render targets, OM UAVs and blend (flat_om_generation.h)
+    ForwardDepth,        // the forward-light domain's depth view and depth-stencil state
     Count
 };
 constexpr unsigned kFlatQueryCount = static_cast<unsigned>(FlatQuery::Count);
@@ -43,6 +45,8 @@ inline const char* flatQueryName(FlatQuery q) {
     case FlatQuery::GameBlend: return "game blend state";
     case FlatQuery::GameTargets: return "game render targets";
     case FlatQuery::TargetsKept: return "MRT6 read-back";
+    case FlatQuery::ForwardTargets: return "forward-light targets";
+    case FlatQuery::ForwardDepth: return "forward-light depth";
     default: return "?";
     }
 }

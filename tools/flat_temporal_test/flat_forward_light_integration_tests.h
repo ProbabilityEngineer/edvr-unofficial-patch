@@ -165,7 +165,12 @@ inline unsigned run() {
         runtime.find("forwardMutation(s,reinterpret_cast<uintptr_t>(res))")!=std::string::npos&&
         runtime.find("forwardMutation(s,reinterpret_cast<uintptr_t>(u.Get()))")!=std::string::npos,"work/resize/API writes/dispatches expire lineage");
     expect(adapter.find("OMGetRenderTargetsAndUnorderedAccessViews")!=std::string::npos&&adapter.find("RenderTargetWriteMask")!=std::string::npos&&
-        adapter.find("forwardMutation(s,reinterpret_cast<uintptr_t>(resource.Get()),false)")!=std::string::npos,"all writable MRT identities invalidate conversion");
+        adapter.find("fresh[freshCount++]={reinterpret_cast<uintptr_t>(resource.Get()),false};")!=std::string::npos&&
+        adapter.find("fresh[freshCount++]={reinterpret_cast<uintptr_t>(resource.Get()),true};")!=std::string::npos&&
+        adapter.find("for(unsigned i=0;i<count;++i)forwardMutation(s,writes[i].resource,writes[i].uav);")!=std::string::npos&&
+        adapter.find("if(plan==FlatQueryPlan::Shortcut){forwardApplyWrites(s,f.writes,f.writeCount);return;}")!=std::string::npos&&
+        adapter.find("flatQueryCut().compared(FlatQuery::ForwardTargets,agree)")!=std::string::npos&&
+        adapter.find("forwardApplyWrites(s,fresh,freshCount);")!=std::string::npos,"all writable MRT identities invalidate conversion, held or freshly read");
     expect(adapter.find("forwardRefusal(s,Reason::Abandoned,reinterpret_cast<void*>(issue.color))")!=std::string::npos&&
         adapter.find("flatTraceMark(s.traceRing,kFlatTraceEventMarkUncertain,nullptr)")!=std::string::npos,"abandoned typed light marks replay uncertain");
     expect(adapter.find("stage&&consumer==3?784:752")!=std::string::npos&&adapter.find("consumer==3?1:0")!=std::string::npos&&

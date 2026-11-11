@@ -105,8 +105,10 @@ inline unsigned run() {
     expect(srv.find("PSGetShaderResources(slot,1,&view)")!=std::string::npos&&srv.find("view->GetResource(&resource)")!=std::string::npos&&
         srv.find("view->GetDesc(&v)")!=std::string::npos&&srv.find("if(!resource)return false;")!=std::string::npos,
         "SRV still reads actual nullable binding, resource and immutable view descriptor");
-    expect(dsv.find("OMGetRenderTargets(0,nullptr,&current)")!=std::string::npos&&dsv.find("dsv->GetResource(&value.resource)")!=std::string::npos&&
-        dsv.find("dsv->GetDesc(&value.view)")!=std::string::npos&&dsv.find("OMGetDepthStencilState(&state,&ref)")!=std::string::npos&&
+    const auto om=region("void forwardOmDepth(","forward_light::Surface forwardTexture(");
+    expect(dsv.find("forwardOmDepth(s,dsv,state,counts)")!=std::string::npos&&om.find("OMGetRenderTargets(0,nullptr,&dsv)")!=std::string::npos&&
+        dsv.find("dsv->GetResource(&value.resource)")!=std::string::npos&&
+        dsv.find("dsv->GetDesc(&value.view)")!=std::string::npos&&om.find("OMGetDepthStencilState(&state,&ref)")!=std::string::npos&&
         dsv.find("state->GetDesc(&value)")!=std::string::npos&&dsv.find("D3D11_DSV_READ_ONLY_DEPTH")!=std::string::npos,
         "DSV still queries actual view and depth state, describing on cache miss with read-only handling");
     std::printf("texture description: %u checks, %u oracle cases, %u failure(s)\n",checks,cases,failures);return failures;

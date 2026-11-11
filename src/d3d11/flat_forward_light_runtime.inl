@@ -31,6 +31,7 @@ void forwardReset(State& s,uint64_t frame=0,bool captureLifecycle=true) {
     geometryCertClear();
     auto& f=s.forwardLight;forwardRevoke(s,0,forward_light::Reason::Ownership);f.ledger.reset(frame);
     f.dsvDescription.clear();f.depthDescription.clear();
+    f.writesKey={};f.depthKey={};f.writeCount=0;f.depthView.Reset();f.depthState.Reset();
     for(auto& observed:f.phaseObservedDonor)observed={};
     for(auto& a:f.authority)a={};for(auto& h:f.authorityHdr)h.Reset();
     for(auto& h:f.domainHolds)h={};for(auto& h:f.publicationHolds)h={};
@@ -40,6 +41,31 @@ void forwardFrame(State& s) {
     if(f.ledger.frame!=s.prefix.frame||!f.ownerKnown||f.upstream!=upstream)forwardReset(s,s.prefix.frame,f.ownerKnown&&f.upstream!=upstream);
     f.phaseReceipt.phase(s.prefix.frame,s.phase.currentX,s.phase.currentY,s.phaseWidth,s.phaseHeight);
     f.ownerKnown=true;f.upstream=upstream;
+}
+ForwardOmKey forwardOmKey(const State& s) {
+    return {flatOmSetGeneration(),bindingGeneration(BindSlot::Rtv0),bindingGeneration(BindSlot::Dsv0),s.prefix.frame,true};
+}
+void forwardShortcutWrong(FlatQuery q,const char* detail) {
+    char line[400];flatQueryFallbackLine(line,sizeof(line),q,detail);Log::get().note("%s",line);
+}
+// The bound depth view and depth-stencil state: asked of the context once per output-merger binding
+// (flat_om_generation.h), then the held answer, checked against the context one frame in 64.
+void forwardOmDepth(State& s,Ptr<ID3D11DepthStencilView>& dsv,Ptr<ID3D11DepthStencilState>& state,flatcpu::CopyCounter& counts) {
+    auto& f=s.forwardLight;
+    const bool cacheable=flatOmSetTracked();
+    const ForwardOmKey key=forwardOmKey(s);
+    FlatQueryPlan plan=FlatQueryPlan::Ask;
+    if(cacheable&&f.depthKey==key) {
+        plan=flatQueryCut().plan(FlatQuery::ForwardDepth);
+        if(plan==FlatQueryPlan::Shortcut){dsv=f.depthView;state=f.depthState;return;}
+    }
+    counts.add(flatcpu::kCopyRawDsvGet);
+    s.context->OMGetRenderTargets(0,nullptr,&dsv);
+    if(dsv){counts.add(flatcpu::kCopyRawDepthGet);UINT ref=0;s.context->OMGetDepthStencilState(&state,&ref);}
+    if(plan==FlatQueryPlan::Sample&&
+       flatQueryCut().compared(FlatQuery::ForwardDepth,dsv.Get()==f.depthView.Get()&&state.Get()==f.depthState.Get()))
+        forwardShortcutWrong(FlatQuery::ForwardDepth,"the depth view or depth-stencil state it held was not the bound one");
+    if(cacheable){f.depthKey=key;f.depthView=dsv;f.depthState=state;}else{f.depthKey={};f.depthView.Reset();f.depthState.Reset();}
 }
 forward_light::Surface forwardTexture(ID3D11Resource* resource,unsigned mip,unsigned slice,unsigned slices,uint32_t* format=nullptr) {
     const auto observed=forward_light::describeTexture(reinterpret_cast<uintptr_t>(resource),mip,slice,slices,
@@ -64,14 +90,13 @@ bool forwardSrv(State& s,unsigned slot,bool raw,forward_light::Surface& out,
 }
 bool forwardDsvActual(State& s,const FlatContractObservation& k,forward_light::Surface& out,
                       Ptr<ID3D11DepthStencilView>& dsv,Ptr<ID3D11Resource>& resource,bool& writes) {
-    // Actual mutable bindings are queried on every draw. The one-entry caches
-    // retain COM identities only for descriptions that cannot change while a
-    // view/state is alive; a different binding immediately takes the miss path.
+    // The bindings come from forwardOmDepth: asked once per output-merger binding, not per draw. The one-entry
+    // caches retain COM identities only for descriptions that cannot change while a view/state is alive; a
+    // different binding immediately takes the miss path.
     flatcpu::CopyCounter counts;
-    counts.add(flatcpu::kCopyRawDsvGet);
-    return forward_light::observeCurrentDsv(dsv,[&](auto& current) {
-        s.context->OMGetRenderTargets(0,nullptr,&current);
-    },[&](const auto&) {
+    Ptr<ID3D11DepthStencilState> state;
+    forwardOmDepth(s,dsv,state,counts);
+    return forward_light::observeCurrentDsv(dsv,[](auto&) {},[&](const auto&) {
     auto& cache=s.forwardLight.dsvDescription;
     ForwardDsvDescription fresh{};
     bool dsvHit=false;
@@ -86,9 +111,6 @@ bool forwardDsvActual(State& s,const FlatContractObservation& k,forward_light::S
     resource=actual.resource;out=actual.surface;
     const auto& v=actual.view;
     const uint32_t format=actual.format;
-    Ptr<ID3D11DepthStencilState> state;UINT ref=0;
-    counts.add(flatcpu::kCopyRawDepthGet);
-    s.context->OMGetDepthStencilState(&state,&ref);
     D3D11_DEPTH_STENCIL_DESC z{};z.DepthEnable=TRUE;z.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;
     if(state) {
         auto& depthCache=s.forwardLight.depthDescription;
@@ -215,6 +237,10 @@ forward_light::Issue forwardObserveDomain(State& s,const FlatRuntimeDraw& d) {
     if(f.ledger.overflow)forwardRevoke(s,0,Reason::Overflow);
     return issue;
 }
+// The watched draw's writes, in slot order: render targets keep their sources, OM UAVs forget them.
+void forwardApplyWrites(State& s,const ForwardOmWrite* writes,unsigned count) {
+    for(unsigned i=0;i<count;++i)forwardMutation(s,writes[i].resource,writes[i].uav);
+}
 // Every actual bound target can mutate a retained raw/linear identity, not
 // just RT0. The existing dispatch and explicit-write seams cover other writes.
 void forwardDrawWrites(State& s,ID3D11DeviceContext* actualDrawContext) {
@@ -240,6 +266,17 @@ void forwardDrawWrites(State& s,ID3D11DeviceContext* actualDrawContext) {
     }
     counts.add(flatcpu::kCopyGuardFallback);
     FlatComputeInternalScope internal;
+    // The written set changes only with an output-merger set (flat_om_generation.h): asked of the context once
+    // per binding, then the held set, checked against the context one frame in 64.
+    auto& f=s.forwardLight;
+    const bool cacheable=flatOmSetTracked()&&actualDrawContext&&actualDrawContext==s.context.Get();
+    const ForwardOmKey key=forwardOmKey(s);
+    FlatQueryPlan plan=FlatQueryPlan::Ask;
+    if(cacheable&&f.writesKey==key) {
+        plan=flatQueryCut().plan(FlatQuery::ForwardTargets);
+        if(plan==FlatQueryPlan::Shortcut){forwardApplyWrites(s,f.writes,f.writeCount);return;}
+    }
+    ForwardOmWrite fresh[kForwardOmWrites];unsigned freshCount=0;
     ID3D11RenderTargetView* targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     ID3D11UnorderedAccessView* uavs[D3D11_1_UAV_SLOT_COUNT]{};
     const UINT n=s.device&&s.device->GetFeatureLevel()>=D3D_FEATURE_LEVEL_11_1?D3D11_1_UAV_SLOT_COUNT:D3D11_PS_CS_UAV_REGISTER_COUNT;
@@ -253,10 +290,20 @@ void forwardDrawWrites(State& s,ID3D11DeviceContext* actualDrawContext) {
         Ptr<ID3D11RenderTargetView> view;view.Attach(targets[i]);
         const auto slot=desc.IndependentBlendEnable?i:0;
         if(!blend||desc.RenderTarget[slot].RenderTargetWriteMask){counts.add(flatcpu::kCopyGetResource);Ptr<ID3D11Resource> resource;view->GetResource(&resource);
-            forwardMutation(s,reinterpret_cast<uintptr_t>(resource.Get()),false);}
+            fresh[freshCount++]={reinterpret_cast<uintptr_t>(resource.Get()),false};}
     }
     for(unsigned i=0;i<n;++i)if(uavs[i]){counts.add(flatcpu::kCopyUavBound);Ptr<ID3D11UnorderedAccessView> view;view.Attach(uavs[i]);
-        counts.add(flatcpu::kCopyGetResource);Ptr<ID3D11Resource> resource;view->GetResource(&resource);forwardMutation(s,reinterpret_cast<uintptr_t>(resource.Get()));}
+        counts.add(flatcpu::kCopyGetResource);Ptr<ID3D11Resource> resource;view->GetResource(&resource);
+        fresh[freshCount++]={reinterpret_cast<uintptr_t>(resource.Get()),true};}
+    if(plan==FlatQueryPlan::Sample) {
+        bool agree=freshCount==f.writeCount;
+        for(unsigned i=0;i<freshCount&&agree;++i)agree=fresh[i]==f.writes[i];
+        if(flatQueryCut().compared(FlatQuery::ForwardTargets,agree))
+            forwardShortcutWrong(FlatQuery::ForwardTargets,"the render targets, UAVs or blend it held were not the bound ones");
+    }
+    if(cacheable){f.writesKey=key;f.writeCount=freshCount;for(unsigned i=0;i<freshCount;++i)f.writes[i]=fresh[i];}
+    else{f.writesKey={};f.writeCount=0;}
+    forwardApplyWrites(s,fresh,freshCount);
 }
 bool forwardConverterState(State& s,unsigned width,unsigned height) {
     forward_light::ConverterRaster raster;raster.width=width;raster.height=height;
