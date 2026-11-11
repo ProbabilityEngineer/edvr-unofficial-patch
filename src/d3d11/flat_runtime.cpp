@@ -56,6 +56,7 @@
 #include "flat_witness_bound.h"
 #include "flat_cpu.h"
 #include "flat_issue_epoch.h"
+#include "flat_om_generation.h"
 #include "flat_pair_facts.h"   // what a draw's shader pair alone says, remembered per pair
 #include "flat_offscreen_fast.h"   // the offscreen fast path: a repeat of a verified class-4 draw skips the draw scope's constructor
 #include "flat_camera_table.h"
@@ -239,6 +240,18 @@ struct ForwardDsvDescription {
     forward_light::Surface surface{};
     uint32_t format=0;
 };
+// The forward-light watch's output-merger answers are reused while this key holds: no output-merger set
+// (flat_om_generation.h), no render-target or depth rebind or forget-all, the same frame.
+struct ForwardOmKey {
+    uint32_t om=0,rtv=0,dsv=0;uint64_t frame=0;bool valid=false;
+    bool operator==(const ForwardOmKey& o) const {return valid&&o.valid&&om==o.om&&rtv==o.rtv&&dsv==o.dsv&&frame==o.frame;}
+};
+// One written resource of the watched draw: a render target with colour writes on, or an OM UAV.
+struct ForwardOmWrite {
+    uintptr_t resource=0;bool uav=false;
+    bool operator==(const ForwardOmWrite& o) const {return resource==o.resource&&uav==o.uav;}
+};
+constexpr unsigned kForwardOmWrites=D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT+D3D11_1_UAV_SLOT_COUNT;
 struct ForwardRuntime {
     phase_failure::Collector phaseReceipt;
     forward_light::ConstantIdentity phaseObservedDonor[forward_light::kDomains];
@@ -256,6 +269,10 @@ struct ForwardRuntime {
     uint64_t converters=0,checks=0,qualified=0,accepted=0,refused=0,lastLog=0;
     uint64_t reasons[static_cast<unsigned>(forward_light::Reason::Count)]{};
     forward_light::Reason last=forward_light::Reason::Never;
+    // The last answers to the output-merger questions (forwardDrawWrites, forwardOmDepth). Cleared at every reset.
+    ForwardOmKey writesKey,depthKey;
+    ForwardOmWrite writes[kForwardOmWrites];unsigned writeCount=0;
+    Ptr<ID3D11DepthStencilView> depthView;Ptr<ID3D11DepthStencilState> depthState;
 };
 // The last continued producer draw this frame. The next draw with the same
 // bindings, camera and arguments reuses it instead of rebuilding the record.

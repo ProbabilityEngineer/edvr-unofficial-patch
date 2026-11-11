@@ -81,20 +81,69 @@ inline int run() {
 
     // The pure cache cannot prove that the production adapter asks D3D for
     // current mutable state. Pin that independent boundary at the call site.
+    // Since 2026-11-11 the actual DSV and depth state are asked once per
+    // output-merger binding (forwardOmDepth, flat_om_generation.h): the held
+    // answer is keyed on the setter generation, the render-target and depth
+    // generations and the frame, and checked against the context one frame in 64.
     std::ifstream input("src/d3d11/flat_forward_light_runtime.inl",std::ios::binary);
     const std::string source((std::istreambuf_iterator<char>(input)),{});
+    const auto omBegin=source.find("void forwardOmDepth(State& s,");
+    const auto omEnd=source.find("forward_light::Surface forwardTexture(",omBegin);
+    const std::string om=omBegin!=std::string::npos&&omEnd!=std::string::npos?source.substr(omBegin,omEnd-omBegin):std::string{};
+    const auto keyBegin=source.find("ForwardOmKey forwardOmKey(const State& s)");
+    const std::string key=keyBegin!=std::string::npos?source.substr(keyBegin,300):std::string{};
+    const auto inOrderIn=[](const std::string& t,const char* a,const char* b){const auto x=t.find(a),y=t.find(b);return x!=std::string::npos&&y!=std::string::npos&&x<y;};
+    expect(key.find("flatOmSetGeneration()")!=std::string::npos&&key.find("bindingGeneration(BindSlot::Rtv0)")!=std::string::npos&&
+           key.find("bindingGeneration(BindSlot::Dsv0)")!=std::string::npos&&key.find("s.prefix.frame")!=std::string::npos,
+           "the held output-merger answers are keyed on the setter, render-target and depth generations and the frame");
+    expect(inOrderIn(om,"const bool cacheable=flatOmSetTracked();","f.depthKey==key")&&
+           inOrderIn(om,"f.depthKey==key","flatQueryCut().plan(FlatQuery::ForwardDepth)")&&
+           inOrderIn(om,"FlatQueryPlan::Shortcut","OMGetRenderTargets(0,nullptr,&dsv)")&&
+           inOrderIn(om,"OMGetRenderTargets(0,nullptr,&dsv)","OMGetDepthStencilState(&state,&ref)")&&
+           inOrderIn(om,"OMGetDepthStencilState(&state,&ref)","flatQueryCut().compared(FlatQuery::ForwardDepth,")&&
+           om.find("else{f.depthKey={};f.depthView.Reset();f.depthState.Reset();}")!=std::string::npos,
+           "the depth view and state are asked whenever the key moved, untracked hooks always ask, and a sampled check compares");
+    // The held answers are only as good as the generation: every path that can change output-merger state must
+    // move it before the real call. Each real call of such a setter in the two files that make them must sit in a
+    // function that called flatOmSetNote() first (a function starts at the last column-0 line before the call).
+    unsigned setterCalls=0,unnoted=0;std::string firstUnnoted;
+    for(const char* file:{"src/d3d11/vscreen.cpp","src/d3d11/exposure_fix.cpp"}) {
+        std::ifstream in(file,std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)),{});
+        for(const char* setter:{"realOMSetRenderTargets(","realOMSetRtvAndUav(","realOMSetBlendState(","realOMSetDepthStencilState(",
+                                "realClearState(","realExecuteCommandList(","realSwapDeviceContextState("}) {
+            for(auto at=text.find(setter);at!=std::string::npos;at=text.find(setter,at+1)) {
+                size_t line=text.rfind('\n',at);size_t head=std::string::npos;
+                while(line!=std::string::npos&&line>0) {
+                    const char c=text[line+1];
+                    if(c!=' '&&c!='\t'&&c!='}'&&c!='#'&&c!='/'&&c!='\r'&&c!='\n'&&c!='{'){head=line+1;break;}
+                    line=text.rfind('\n',line-1);
+                }
+                ++setterCalls;
+                if(head==std::string::npos||text.substr(head,at-head).find("flatOmSetNote();")==std::string::npos) {
+                    ++unnoted;if(firstUnnoted.empty())firstUnnoted=std::string(file)+": "+text.substr(head==std::string::npos?at:head,80);
+                }
+            }
+        }
+    }
+    if(unnoted)std::printf("  forward cache: first setter call without flatOmSetNote: %s\n",firstUnnoted.c_str());
+    expect(setterCalls>=15&&unnoted==0,"every real output-merger, ClearState, command-list and context-swap call moves the generation first");
+    std::ifstream vsIn("src/d3d11/vscreen.cpp",std::ios::binary);
+    const std::string vs((std::istreambuf_iterator<char>(vsIn)),{});
+    expect(vs.find("flatOmSetHooksComplete(depthHook && swapHook);")!=std::string::npos,
+           "without the depth-state or context-swap hook the held answers are never used");
     const auto begin=source.find("bool forwardDsvActual(State& s,");
     const auto end=source.find("bool forwardDsv(State& s,",begin);
     const std::string body=begin!=std::string::npos&&end!=std::string::npos?source.substr(begin,end-begin):std::string{};
     const auto inOrder=[&](const char* a,const char* b){const auto x=body.find(a),y=body.find(b);return x!=std::string::npos&&y!=std::string::npos&&x<y;};
-    expect(inOrder("OMGetRenderTargets(0,nullptr,&current)","cache.describe(dsv,fresh,dsvHit")&&
+    expect(inOrder("forwardOmDepth(s,dsv,state,counts)","cache.describe(dsv,fresh,dsvHit")&&
            inOrder("cache.describe(dsv,fresh,dsvHit","dsv->GetResource(&value.resource)")&&
            body.find("return value.resource&&value.surface.known;")!=std::string::npos,
            "actual OM DSV query precedes production helper and failed metadata is not retained");
-    expect(inOrder("OMGetDepthStencilState(&state,&ref)","depthCache.describe(state,freshDepth,depthHit")&&
+    expect(inOrder("forwardOmDepth(s,dsv,state,counts)","depthCache.describe(state,freshDepth,depthHit")&&
            body.find("else {counts.add(flatcpu::kCopyRawDepthDefault);s.forwardLight.depthDescription.clear();}")!=std::string::npos&&
            body.find("dsvObservationMatches(actualProof,expected,writes)")!=std::string::npos,
-           "actual depth state is queried each draw; null/default and read-only write proof remain live");
+           "actual depth state is read per output-merger binding; null/default and read-only write proof remain live");
     const auto wrapperEnd=source.find("bool forwardViewport(",end);
     const std::string wrapper=end!=std::string::npos&&wrapperEnd!=std::string::npos?source.substr(end,wrapperEnd-end):std::string{};
     expect(wrapper.find("forwardDsvActual(s,k,out,dsv,resource,writes)&&dsv.Get()==k.dsv")!=std::string::npos,
@@ -105,14 +154,14 @@ inline int run() {
     const auto count=[&](const std::string& haystack,const char* needle){
         unsigned n=0;for(auto at=haystack.find(needle);at!=std::string::npos;at=haystack.find(needle,at+1))++n;return n;
     };
-    expect(count(body,"OMGetRenderTargets(0,nullptr,&current)")==1&&
+    expect(count(body,"forwardOmDepth(s,dsv,state,counts)")==1&&count(om,"OMGetRenderTargets(0,nullptr,&dsv)")==1&&
            count(body,"observeCurrentDsv(dsv,")==1&&
            count(issue,"forwardDsvActual(s,key,observed,dsv,depth,writes)")==2&&
            count(issue,"OMGetRenderTargets(0,nullptr,&dsv)")==0&&
            issue.find("!owner()||s.prefix.uncertain||foreignWork.load")!=std::string::npos&&
            count(issue,"!plane(observed,issue.raw)")==2&&
            count(issue,"issue.phaseX!=s.phase.currentX||issue.phaseY!=s.phase.currentY")==2,
-           "both issue paths keep owner, foreign, plane, phase and one fresh actual DSV query in their shared core");
+           "both issue paths keep owner, foreign, plane, phase and one actual DSV read in their shared core");
     expect(source.find("forwardIssueValid(s,issue)",issueEnd)!=std::string::npos&&
            count(source,"forwardIssueValid(s,issue)")>=2&&
            count(issue,"kCopyIssueGeometryDsvGet")==1&&count(issue,"kCopyIssueLightDsvGet")==1,
