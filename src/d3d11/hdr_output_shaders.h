@@ -214,6 +214,10 @@ cbuffer           cb2 : register(b2) { float4 cb2[16]; };
 
 #define FP16_HEADROOM 64500.0
 
+)HLSL"
+// MSVC caps one string literal at 16380 bytes (C2026), so the source is split
+// into adjacent literals here; the compiler joins them into one string.
+R"HLSL(
 // RenoDX auto-exposure scalar, tokens 116-267. The v0.z guard is ours: the
 // original has none, but it feeds log2() and a divide, so a zero would poison
 // the frame. Clamped far outside any plausible engine value.

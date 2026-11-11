@@ -260,6 +260,32 @@ void theWidenList() {
           "the flat gate's \"off\" would widen nothing (so the key must be named)");
 }
 
+// MSVC refuses a string literal over 16380 bytes (C2026), and clang does not,
+// so a shader that grows past it builds on the Mac and fails only in Windows CI.
+// Every raw-literal piece of the HDR shader header must stay under the limit.
+void theShaderLiteralsFitMsvc() {
+    std::FILE* f = std::fopen("src/d3d11/hdr_output_shaders.h", "rb");
+    check(f != nullptr, "the HDR shader header can be read from the repo root");
+    if (!f) return;
+    std::string text;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    size_t pieces = 0, largest = 0, pos = 0;
+    const std::string open = "R\"HLSL(", close = ")HLSL\"";
+    while ((pos = text.find(open, pos)) != std::string::npos) {
+        const size_t start = pos + open.size();
+        const size_t end = text.find(close, start);
+        if (end == std::string::npos) break;
+        ++pieces;
+        if (end - start > largest) largest = end - start;
+        pos = end + close.size();
+    }
+    check(pieces >= 5 && largest < 16000,
+          "every HDR shader string-literal piece is under MSVC's 16380-byte limit");
+}
+
 void shaderIdentities() {
     using namespace edvr;
     const auto hello = hdrShaderIdentity("hello", 5);
@@ -316,6 +342,7 @@ int main(int argc, char** argv) {
     theFlatProfileReadsTheHdrKeys();
     theBrightnessRule();
     theWidenList();
+    theShaderLiteralsFitMsvc();
     shaderIdentities();
 #ifdef _WIN32
     hdr_shader_tests::run(check, hardware);
