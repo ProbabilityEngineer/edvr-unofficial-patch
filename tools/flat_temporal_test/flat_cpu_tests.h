@@ -332,6 +332,7 @@ inline int flatCpuTests() {
         expect(has(text, "EDVR per frame total 0.000 ms"), "and the total is zero");
         expect(has(text, "GPU frame - (") && has(text, "GPU resolve - ("), "a GPU span nobody timed prints a dash, not 0.00");
         expect(!has(text, "GPU hdr output"), "and the HDR output span is absent without fix.hdr");
+        expect(!has(text, "GPU resolve parts"), "and the resolver's parts are absent while none was timed");
         expect(!has(text, "GPU frame p50") && !has(text, "GPU resolve p50"), "and no percentile");
         expect(has(text, "engine motion wrapper D3D calls 0/frame over 0.0 substituted draws/frame"),
                "the draw wrapper's calls print as zero");
@@ -489,6 +490,9 @@ inline int flatCpuTests() {
         for (double ms : {1.0, 2.0, 3.0, 4.0, 5.0}) run.census->noteGpuFrame(ms);
         for (double ms : {0.5, 0.7, 0.9}) run.census->noteGpuResolve(ms);
         for (double ms : {0.2, 0.3, 0.4, 0.6}) run.census->noteGpuHdr(ms);
+        for (double ms : {0.1, 0.2, 0.3}) run.census->noteGpuResolvePart(0, ms);
+        for (double ms : {0.4, 0.5, 0.6}) run.census->noteGpuResolvePart(1, ms);
+        run.census->noteGpuResolvePart(5, 9.0);   // no such part: dropped
         run.census->noteGpuSkipped();
         run.census->noteGpuSkipped();
         run.census->noteGpuSkipped();
@@ -506,6 +510,8 @@ inline int flatCpuTests() {
                "the whole-frame GPU span prints its median, p95 and what could not be timed");
         expect(has(text, "GPU resolve p50 0.70 / p95 0.90 ms (3 timed)"), "the resolver's GPU span prints its median and p95");
         expect(has(text, "GPU hdr output p50 ") && has(text, " ms (4 timed)"), "fix.hdr's output transform prints its own GPU span");
+        expect(has(text, "GPU resolve parts: copy+prep p50 0.20 / p95 0.30 ms, backend p50 0.50 / p95 0.60 ms, finish - (3/3/0 timed)"),
+               "the resolver's parts print each median and p95, a dash for a part nobody timed, and drop an unknown part");
         // The next window starts empty.
         for (int i = 0; i < 300; ++i) run.frame(16667, false, {});
         flatcpu::WindowReport next;

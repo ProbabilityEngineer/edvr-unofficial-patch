@@ -423,11 +423,13 @@ inline int flatHdrCrumbWiringTests() {
     const std::string solve = body(resolve, "bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& f,");
     ordered(solve, {"CrumbScope crumbs(f.hdr);", "initialize(device,context,reason)", "initializeHdr(device,reason)", "resources(f,reason)",
                     "hdrTargetView(color.Get(),reason)", "Isolate isolated(", "backendAvailable(f.mode,device,reason)", "HdrCrumbSpan copyStep(",
-                    "SpanGuard span(context);", "context->CopyResource(g.color.texture.Get(),overlay?cleanColor.Get():color.Get());",
+                    "SpanGuard span(context, FlatResolveSpan::Whole);", "SpanGuard prepSpan(context, FlatResolveSpan::Prep);",
+                    "context->CopyResource(g.color.texture.Get(),overlay?cleanColor.Get():color.Get());",
                     "if(overlay) context->CopyResource(g.rawOverlay.texture.Get(),color.Get());", "copyStep.close();",
                     "HdrCrumbSpan prepStep(", "context->Dispatch((f.renderWidth+7)/8,(f.renderHeight+7)/8,1);", "prepStep.close();",
-                    "HdrCrumbSpan backendStep(", "ok=fsr3Evaluate(", "ok=dlaaEvaluate(", "backendStep.close();",
-                    "drawHdrTarget(context,g.finishHdr.Get(),f.renderWidth,f.renderHeight,views,overlay?17:8);"},
+                    "prepSpan.close();", "HdrCrumbSpan backendStep(", "SpanGuard backendSpan(context, FlatResolveSpan::Backend);",
+                    "ok=fsr3Evaluate(", "ok=dlaaEvaluate(", "backendStep.close();",
+                    "SpanGuard finishSpan(context, FlatResolveSpan::Finish);", "drawHdrTarget(context,g.finishHdr.Get(),f.renderWidth,f.renderHeight,views,overlay?17:8);"},
             "the resolve writes capture, copy, prep, backend and finish in the order it runs them, each crumb before its call");
     const std::string spatial = body(resolve, "bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& f,");
     // The recovery copies into its own input image or the temporal set's when that fits (spatialImages, 2026-10-29), never through resources().

@@ -761,6 +761,11 @@ struct State {
     GpuTimer gpuHdrTimer[kGpuHdrTimers];
     bool gpuHdrBusy[kGpuHdrTimers] = {};
     int gpuHdrOpen = -1;
+    // The resolver's three parts (FlatResolveSpan Prep, Backend, Finish), two timers each like the whole.
+    static constexpr int kGpuParts = 3;
+    GpuTimer gpuPartTimer[kGpuParts][kGpuResolveTimers];
+    bool gpuPartBusy[kGpuParts][kGpuResolveTimers] = {};
+    int gpuPartOpen[kGpuParts] = {-1, -1, -1};
     bool gpuFrameBusy[kGpuFrameTimers] = {}, gpuResolveBusy[kGpuResolveTimers] = {};
     int gpuFrameOpen = -1, gpuResolveOpen = -1;   // the timer holding this frame's open span
     bool gpuFrameTried = false;                   // this frame already tried to open its span
@@ -3337,6 +3342,15 @@ void gpuPoll(State& s) {
         case GpuTimerPoll::Pending: break;
         }
     }
+    for (int p = 0; p < State::kGpuParts; ++p)
+        for (int i = 0; i < State::kGpuResolveTimers; ++i) {
+            if (!s.gpuPartBusy[p][i] || i == s.gpuPartOpen[p]) continue;
+            switch (s.gpuPartTimer[p][i].poll(ctx, ms)) {
+            case GpuTimerPoll::Ready: s.census.noteGpuResolvePart(static_cast<unsigned>(p), ms); s.gpuPartBusy[p][i] = false; break;
+            case GpuTimerPoll::Invalid: s.census.noteGpuInvalid(); s.gpuPartBusy[p][i] = false; break;
+            case GpuTimerPoll::Pending: break;
+            }
+        }
 }
 // A reset drops the spans: only on the verified owner thread, where a span still open can be
 // cancelled cleanly (a timer with an open span released from anywhere else would switch the
@@ -3351,23 +3365,39 @@ void gpuReset(State& s) {
     for (auto& b : s.gpuResolveBusy) b = false;
     for (auto& b : s.gpuHdrBusy) b = false;
     s.gpuFrameOpen = s.gpuResolveOpen = s.gpuHdrOpen = -1;
+    for (int p = 0; p < State::kGpuParts; ++p) {
+        for (auto& t : s.gpuPartTimer[p]) t.reset(ctx);
+        for (auto& b : s.gpuPartBusy[p]) b = false;
+        s.gpuPartOpen[p] = -1;
+    }
 }
 // The resolver's hooks (flat_mono_resolve.h): a timestamp pair around its own dispatches and
-// backend call. Called on the thread that resolves, inside the treatment scope.
-void resolveSpanBegin(ID3D11DeviceContext* ctx) noexcept {
+// backend call (Whole), and one around each of its three parts. Called on the thread that
+// resolves, inside the treatment scope.
+void resolveSpanBegin(ID3D11DeviceContext* ctx, FlatResolveSpan part) noexcept {
     auto& s = state();
-    if (s.gpuResolveOpen >= 0) return;
+    const bool whole = part == FlatResolveSpan::Whole;
+    const int p = static_cast<int>(part) - 1;
+    if (!whole && (p < 0 || p >= State::kGpuParts)) return;
+    int& open = whole ? s.gpuResolveOpen : s.gpuPartOpen[p];
+    if (open >= 0) return;
     for (int i = 0; i < State::kGpuResolveTimers; ++i) {
-        if (s.gpuResolveBusy[i]) continue;
-        if (s.gpuResolveTimer[i].begin(s.device.Get(), ctx)) { s.gpuResolveBusy[i] = true; s.gpuResolveOpen = i; }
+        bool& busy = whole ? s.gpuResolveBusy[i] : s.gpuPartBusy[p][i];
+        if (busy) continue;
+        GpuTimer& timer = whole ? s.gpuResolveTimer[i] : s.gpuPartTimer[p][i];
+        if (timer.begin(s.device.Get(), ctx)) { busy = true; open = i; }
         return;
     }
 }
-void resolveSpanEnd(ID3D11DeviceContext* ctx) noexcept {
+void resolveSpanEnd(ID3D11DeviceContext* ctx, FlatResolveSpan part) noexcept {
     auto& s = state();
-    if (s.gpuResolveOpen < 0) return;
-    s.gpuResolveTimer[s.gpuResolveOpen].end(ctx);
-    s.gpuResolveOpen = -1;
+    const bool whole = part == FlatResolveSpan::Whole;
+    const int p = static_cast<int>(part) - 1;
+    if (!whole && (p < 0 || p >= State::kGpuParts)) return;
+    int& open = whole ? s.gpuResolveOpen : s.gpuPartOpen[p];
+    if (open < 0) return;
+    (whole ? s.gpuResolveTimer[open] : s.gpuPartTimer[p][open]).end(ctx);
+    open = -1;
 }
 
 // The refusal state for the F8 panel's settings warning, published for any thread:

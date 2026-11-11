@@ -598,6 +598,11 @@ struct WindowReport {
     // And fix.hdr's output transform (hdr_output.cpp), after the frame span closes and before the real Present.
     unsigned gpuFrameSamples = 0, gpuResolveSamples = 0, gpuHdrSamples = 0;
     double gpuFrameP50 = 0, gpuFrameP95 = 0, gpuResolveP50 = 0, gpuResolveP95 = 0, gpuHdrP50 = 0, gpuHdrP95 = 0;
+    // The resolver's span in its three parts (flat_mono_resolve.h, FlatResolveSpan): the copy and prep, the backend
+    // (FSR3, NGX, XeSS or EDVR TAA), the finish. Each its own pair, so the parts' medians need not add to the whole's.
+    static constexpr unsigned kResolveParts = 3;
+    unsigned gpuPartSamples[kResolveParts] = {};
+    double gpuPartP50[kResolveParts] = {}, gpuPartP95[kResolveParts] = {};
     uint64_t gpuSkipped = 0, gpuInvalid = 0;
     bool standingDown = false;   // the work is stood down as the window closes
     bool clocksOff = false;      // the census's clocks were off as the window closed (advanced.flat_cpu_timing, the default)
@@ -701,6 +706,10 @@ public:
     void noteGpuFrame(double ms) noexcept { if (gpuFrame_ < kMaxSamples) gpuFrameMs_[gpuFrame_++] = static_cast<float>(ms); }
     void noteGpuResolve(double ms) noexcept { if (gpuResolve_ < kMaxSamples) gpuResolveMs_[gpuResolve_++] = static_cast<float>(ms); }
     void noteGpuHdr(double ms) noexcept { if (gpuHdr_ < kMaxSamples) gpuHdrMs_[gpuHdr_++] = static_cast<float>(ms); }
+    // part: 0 copy and prep, 1 backend, 2 finish.
+    void noteGpuResolvePart(unsigned part, double ms) noexcept {
+        if (part < WindowReport::kResolveParts && gpuPart_[part] < kMaxSamples) gpuPartMs_[part][gpuPart_[part]++] = static_cast<float>(ms);
+    }
     void noteGpuSkipped() noexcept { ++gpuSkipped_; }
     void noteGpuInvalid() noexcept { ++gpuInvalid_; }
     // The offscreen fast path's counts for the frame that just ended, drained with the wrapper's.
@@ -801,6 +810,10 @@ public:
         percentiles(gpuResolveMs_, gpuResolve_, &out.gpuResolveP50, &out.gpuResolveP95);
         out.gpuHdrSamples = gpuHdr_;
         percentiles(gpuHdrMs_, gpuHdr_, &out.gpuHdrP50, &out.gpuHdrP95);
+        for (unsigned p = 0; p < WindowReport::kResolveParts; ++p) {
+            out.gpuPartSamples[p] = gpuPart_[p];
+            percentiles(gpuPartMs_[p], gpuPart_[p], &out.gpuPartP50[p], &out.gpuPartP95[p]);
+        }
         out.gpuSkipped = gpuSkipped_;
         out.gpuInvalid = gpuInvalid_;
         out.standingDown = standingDown;
@@ -848,6 +861,7 @@ private:
         offscreen_ = FlatOffscreenCounts{};
         queries_ = FlatQueryCounts{};
         gpuFrame_ = gpuResolve_ = gpuHdr_ = 0;
+        for (auto& n : gpuPart_) n = 0;
         gpuSkipped_ = gpuInvalid_ = 0;
     }
     bool primed_ = false, samplingOk_ = true, sampledNow_ = false, renderNow_ = false, floorsMeasured_ = false;
@@ -872,6 +886,8 @@ private:
     float gpuFrameMs_[kMaxSamples];
     float gpuResolveMs_[kMaxSamples];
     float gpuHdrMs_[kMaxSamples];
+    unsigned gpuPart_[WindowReport::kResolveParts] = {};
+    float gpuPartMs_[WindowReport::kResolveParts][kMaxSamples];
 };
 
 // ---- the text ------------------------------------------------------------------------------------
@@ -1130,6 +1146,16 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
     tk.add("; ", "GPU frame %s (first game draw to Present; %u timed, %llu skipped, %llu invalid)",
            frameText, r.gpuFrameSamples, static_cast<unsigned long long>(r.gpuSkipped), static_cast<unsigned long long>(r.gpuInvalid));
     tk.add("; ", "GPU resolve %s (%u timed)", resolveText, r.gpuResolveSamples);
+    // Its parts, only once any was timed: a session with no resolve keeps the line it always had.
+    if (r.gpuPartSamples[0] || r.gpuPartSamples[1] || r.gpuPartSamples[2]) {
+        char parts[WindowReport::kResolveParts][48];
+        for (unsigned p = 0; p < WindowReport::kResolveParts; ++p) {
+            if (r.gpuPartSamples[p]) std::snprintf(parts[p], sizeof(parts[p]), "p50 %.2f / p95 %.2f ms", r.gpuPartP50[p], r.gpuPartP95[p]);
+            else std::snprintf(parts[p], sizeof(parts[p]), "-");
+        }
+        tk.add("; ", "GPU resolve parts: copy+prep %s, backend %s, finish %s (%u/%u/%u timed)", parts[0], parts[1], parts[2],
+               r.gpuPartSamples[0], r.gpuPartSamples[1], r.gpuPartSamples[2]);
+    }
     // Only with fix.hdr on: a session without it keeps the line it always had.
     if (r.gpuHdrSamples) {
         std::snprintf(hdrText, sizeof(hdrText), "p50 %.2f / p95 %.2f ms", r.gpuHdrP50, r.gpuHdrP95);
