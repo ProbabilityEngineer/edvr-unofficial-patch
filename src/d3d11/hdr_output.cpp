@@ -24,6 +24,8 @@
 #include "binding_shadow.h"
 #include "hdr_shader_identity.h"
 #include "hdr_output_shaders.h"
+#include "flat_runtime.h"   // the census span around the transform
+#include "../common/runtime_profile.h"
 
 namespace edvr {
 namespace {
@@ -1129,8 +1131,12 @@ void hdrOutputBeforePresent(IDXGISwapChain* swapChain, ID3D11DeviceContext* cont
     if (!g.on || g.encodeFailed || g.shadersFailed || !swapChain || !context) return;
     prepareDomain(swapChain);
     if (!ensureBackBuffer(swapChain) || !g.backWidth || !g.backHeight) return;
+    // Timed for the flat census (flat_cpu.h "GPU hdr output"); a no-op off the flat runtime's owner thread.
+    if (runtimeFlatProfile()) flatRuntimeHdrSpanBegin();
     const bool inPlace = encodeInPlace(context);
-    if (!inPlace && !encodeByDraw(context)) {
+    const bool encoded = inPlace || encodeByDraw(context);
+    if (runtimeFlatProfile()) flatRuntimeHdrSpanEnd();
+    if (!encoded) {
         g.encodeFailed = true;
         Log::get().note("hdr: neither output path could run (%ux%u); the frame is presented "
                         "as drawn and this is said once", g.backWidth, g.backHeight);

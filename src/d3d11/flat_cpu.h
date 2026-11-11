@@ -595,8 +595,9 @@ struct WindowReport {
     // flat resolver's dispatches plus backend call. skipped: frames nothing could be timed for
     // (no free timer, or the frame was not watched); invalid: a sample the driver marked disjoint
     // or that expired unread.
-    unsigned gpuFrameSamples = 0, gpuResolveSamples = 0;
-    double gpuFrameP50 = 0, gpuFrameP95 = 0, gpuResolveP50 = 0, gpuResolveP95 = 0;
+    // And fix.hdr's output transform (hdr_output.cpp), after the frame span closes and before the real Present.
+    unsigned gpuFrameSamples = 0, gpuResolveSamples = 0, gpuHdrSamples = 0;
+    double gpuFrameP50 = 0, gpuFrameP95 = 0, gpuResolveP50 = 0, gpuResolveP95 = 0, gpuHdrP50 = 0, gpuHdrP95 = 0;
     uint64_t gpuSkipped = 0, gpuInvalid = 0;
     bool standingDown = false;   // the work is stood down as the window closes
     bool clocksOff = false;      // the census's clocks were off as the window closed (advanced.flat_cpu_timing, the default)
@@ -699,6 +700,7 @@ public:
     }
     void noteGpuFrame(double ms) noexcept { if (gpuFrame_ < kMaxSamples) gpuFrameMs_[gpuFrame_++] = static_cast<float>(ms); }
     void noteGpuResolve(double ms) noexcept { if (gpuResolve_ < kMaxSamples) gpuResolveMs_[gpuResolve_++] = static_cast<float>(ms); }
+    void noteGpuHdr(double ms) noexcept { if (gpuHdr_ < kMaxSamples) gpuHdrMs_[gpuHdr_++] = static_cast<float>(ms); }
     void noteGpuSkipped() noexcept { ++gpuSkipped_; }
     void noteGpuInvalid() noexcept { ++gpuInvalid_; }
     // The offscreen fast path's counts for the frame that just ended, drained with the wrapper's.
@@ -797,6 +799,8 @@ public:
         percentiles(gpuFrameMs_, gpuFrame_, &out.gpuFrameP50, &out.gpuFrameP95);
         out.gpuResolveSamples = gpuResolve_;
         percentiles(gpuResolveMs_, gpuResolve_, &out.gpuResolveP50, &out.gpuResolveP95);
+        out.gpuHdrSamples = gpuHdr_;
+        percentiles(gpuHdrMs_, gpuHdr_, &out.gpuHdrP50, &out.gpuHdrP95);
         out.gpuSkipped = gpuSkipped_;
         out.gpuInvalid = gpuInvalid_;
         out.standingDown = standingDown;
@@ -843,7 +847,7 @@ private:
         stateCalls_ = substitutedDraws_ = 0;
         offscreen_ = FlatOffscreenCounts{};
         queries_ = FlatQueryCounts{};
-        gpuFrame_ = gpuResolve_ = 0;
+        gpuFrame_ = gpuResolve_ = gpuHdr_ = 0;
         gpuSkipped_ = gpuInvalid_ = 0;
     }
     bool primed_ = false, samplingOk_ = true, sampledNow_ = false, renderNow_ = false, floorsMeasured_ = false;
@@ -854,7 +858,7 @@ private:
     Floor floor_;
     emcpu::Floor emFloor_;
     ClockSchedule schedule_;
-    unsigned frames_ = 0, paused_ = 0, sampled_ = 0, renderClocked_ = 0, gpuFrame_ = 0, gpuResolve_ = 0;
+    unsigned frames_ = 0, paused_ = 0, sampled_ = 0, renderClocked_ = 0, gpuFrame_ = 0, gpuResolve_ = 0, gpuHdr_ = 0;
     uint64_t renderTicks_[kFamilies] = {}, renderCalls_[kFamilies] = {};
     uint64_t otherTicks_[kFamilies] = {}, otherCalls_[kFamilies] = {};
     uint64_t copy_[kCopyCounts] = {};
@@ -867,6 +871,7 @@ private:
     float interval_[kMaxSamples];
     float gpuFrameMs_[kMaxSamples];
     float gpuResolveMs_[kMaxSamples];
+    float gpuHdrMs_[kMaxSamples];
 };
 
 // ---- the text ------------------------------------------------------------------------------------
@@ -1119,12 +1124,17 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
     }
     // The GPU spans, read back without waiting. No sample prints "-", never 0.00: a span that
     // was not timed is not a fast one.
-    char frameText[64] = "-", resolveText[64] = "-";
+    char frameText[64] = "-", resolveText[64] = "-", hdrText[64] = "-";
     if (r.gpuFrameSamples) std::snprintf(frameText, sizeof(frameText), "p50 %.2f / p95 %.2f ms", r.gpuFrameP50, r.gpuFrameP95);
     if (r.gpuResolveSamples) std::snprintf(resolveText, sizeof(resolveText), "p50 %.2f / p95 %.2f ms", r.gpuResolveP50, r.gpuResolveP95);
     tk.add("; ", "GPU frame %s (first game draw to Present; %u timed, %llu skipped, %llu invalid)",
            frameText, r.gpuFrameSamples, static_cast<unsigned long long>(r.gpuSkipped), static_cast<unsigned long long>(r.gpuInvalid));
     tk.add("; ", "GPU resolve %s (%u timed)", resolveText, r.gpuResolveSamples);
+    // Only with fix.hdr on: a session without it keeps the line it always had.
+    if (r.gpuHdrSamples) {
+        std::snprintf(hdrText, sizeof(hdrText), "p50 %.2f / p95 %.2f ms", r.gpuHdrP50, r.gpuHdrP95);
+        tk.add("; ", "GPU hdr output %s (%u timed)", hdrText, r.gpuHdrSamples);
+    }
     tk.add("; ", "clock floor %.0f ns/scope (records %.0f ns); engine hooks floor %.0f ns plain / %.0f ns paused (records %.0f / %.0f ns)",
            r.floor.costNs, r.floor.recordedNs, r.emFloor.plainCostNs, r.emFloor.pausedCostNs,
            r.emFloor.plainRecordedNs, r.emFloor.pausedRecordedNs);
