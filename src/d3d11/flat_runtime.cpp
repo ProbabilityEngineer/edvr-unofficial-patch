@@ -752,9 +752,11 @@ struct State {
     // backend call. A timer is owned until its sample is read; with none free the
     // frame is skipped and counted.
     flatcpu::Census census{flatcpu::kRenderPeriod, false};   // off until advanced.flat_cpu_timing (or EDVR_FLAT_CPU_CLOCKS=1) says otherwise
+    flatcpu::OffWindow offWindow;                 // the present interval while no temporal mode runs (F7), owner thread
     FlatPairFactsMemo pairFacts;                  // what a draw's shader pair alone says (flat_pair_facts.h), owner thread
     FlatOffscreenMemo offscreen;                  // the previous verified class-4 draw of the frame (flat_offscreen_fast.h), owner thread
     FlatOffscreenCounts offscreenCounts;          // what the fast path did since the last Present drained it, owner thread
+    FlatOffscreenRecent offscreenRecent;          // the class-4 keys recorded earlier this frame (the slow path's token), owner thread
     static constexpr int kGpuFrameTimers = 4, kGpuResolveTimers = 2;
     GpuTimer gpuFrameTimer[kGpuFrameTimers];
     GpuTimer gpuResolveTimer[kGpuResolveTimers];
@@ -4433,6 +4435,13 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // No temporal mode selected: the census stops (its gates close, a scope costs a load and a compare).
     if (!enabled) {
         s.census.idle();if(s.device || s.output || s.cameras.count())flatRuntimeResize();
+        {   // The census is silent while off: keep the present interval, so an F7 window has a figure (flat_cpu.h, OffWindow).
+            static const int64_t offFreq = flatcpu::qpcFrequency();
+            const int64_t offNow = flatcpu::qpcNow();
+            s.offWindow.onPresent(offNow, offFreq);
+            char offLine[320];
+            if (s.offWindow.take(offNow, offLine, sizeof offLine)) Log::get().note("%s", offLine);
+        }
         const auto request=projectionAuditRequested.take();
         const bool manual=flatCaptureBulk(request);
         if(manual)Log::get().note("flat light camera audit: event=arm-refused reason=AA-off-no-watched-camera-shadows pending=0 drained=1");
@@ -4455,6 +4464,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             traceWindow(s);flatTraceBeginFrame(s.traceRing,frame+1,s.drawPacketOutput.Get(),d.Width,d.Height,d.Format);}
         return;
     }
+    s.offWindow.reset();
     static bool bounceModeSet=false;
     if (!bounceModeSet) {
         bounceModeSet=true;
@@ -5988,7 +5998,13 @@ bool flatOffscreenTry(State& s, ID3D11DeviceContext* context, const FlatOffscree
     if (!memo.valid() || memo.frame() != s.prefix.frame || flatOffscreenFullscreenTriangle(a)) return false;   // not a repeat: not counted
     FlatOffscreenKey now;
     const FlatCameraRows* rows = nullptr;
-    if (!flatOffscreenKeyNow(s, memo.key(), now, rows) || memo.lookup(s.prefix.frame, now) != FlatOffscreenNo::None) return false;
+    if (!flatOffscreenKeyNow(s, memo.key(), now, rows)) return false;
+    if (memo.lookup(s.prefix.frame, now) != FlatOffscreenNo::None) {   // not a repeat: the slow path's token says which inputs differed
+        ++s.offscreenCounts.keyDiffDraws;
+        const uint32_t differs = memo.key().differs(now);
+        for (unsigned i = 0; i < kFlatOffscreenKeyInputs; ++i) if (differs & (1u << i)) ++s.offscreenCounts.keyDiff[i];
+        return false;
+    }
     const FlatOffscreenNo no = flatOffscreenLiveVerdict(flatOffscreenLiveOf(s, auditing, memo.held().key));
     if (no != FlatOffscreenNo::None) { ++s.offscreenCounts.declined[static_cast<unsigned>(no)]; return false; }
     ++s.offscreenCounts.fast;
@@ -6023,11 +6039,15 @@ bool flatOffscreenTry(State& s, ID3D11DeviceContext* context, const FlatOffscree
 // After the slow path's last skipped block: remember the draw if it was a class-4 draw that did nothing more than the fast path does.
 void flatOffscreenRecord(State& s, const FlatRuntimeDraw& d, const FlatPairFacts& pair, const FlatOffscreenArgs& a, bool auditing, bool plain,
                          uint32_t oldTargets, bool uncertainBefore) {
-    if (!plain || s.prefix.targetsUsed != oldTargets || s.prefix.uncertain != uncertainBefore) return;
+    // Each return below is counted once, by why (the slow path's token, flat_offscreen_counts.h).
+    if (!plain || s.prefix.targetsUsed != oldTargets || s.prefix.uncertain != uncertainBefore) { ++s.offscreenCounts.notPlain; return; }
     const auto& k = d.key;
-    if (flatOffscreenShapeVerdict(k, pair, s.prefix.width, s.prefix.height, s.prefix.output, a) != FlatOffscreenNo::None) return;
-    if (flatOffscreenLiveVerdict(flatOffscreenLiveOf(s, auditing, k)) != FlatOffscreenNo::None) return;
+    const FlatOffscreenNo shape = flatOffscreenShapeVerdict(k, pair, s.prefix.width, s.prefix.height, s.prefix.output, a);
+    if (shape != FlatOffscreenNo::None) { ++s.offscreenCounts.slowNo[static_cast<unsigned>(shape)]; return; }
+    const FlatOffscreenNo live = flatOffscreenLiveVerdict(flatOffscreenLiveOf(s, auditing, k));
+    if (live != FlatOffscreenNo::None) { ++s.offscreenCounts.slowNo[static_cast<unsigned>(live)]; return; }
     const FlatOffscreenKey key = flatOffscreenKeyOf(k, bindingGeneration(BindSlot::Rtv0), bindingGeneration(BindSlot::Dsv0));
+    if (s.offscreenRecent.seenThenAdd(s.prefix.frame, key)) ++s.offscreenCounts.class4Earlier; else ++s.offscreenCounts.class4New;
     if (s.offscreen.valid() && s.offscreen.frame() == s.prefix.frame && s.offscreen.key().same(key)) return;   // already held
     s.offscreen.record(s.prefix.frame, key, d);
     ++s.offscreenCounts.recorded;
@@ -6250,6 +6270,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     // call on the scope and the destructor return at once, as on a Paused frame (flat_offscreen_fast.h).
     const FlatOffscreenArgs offscreenArgs = {kind, count, instances, startInstance};
     if (flatOffscreenTry(s, context, offscreenArgs, auditing)) return;
+    ++s.offscreenCounts.slow;
     const uint32_t offscreenTargetsBefore = s.prefix.targetsUsed;
     const bool offscreenUncertainBefore = s.prefix.uncertain;
     if (flatProducerContinueEarly(s, context, offscreenArgs, auditing, offscreenTargetsBefore, offscreenUncertainBefore,

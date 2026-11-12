@@ -130,6 +130,45 @@ struct FlatOffscreenKey {
         if (in(14) && dsvGen != o.dsvGen) return false;
         return true;
     }
+    // Which inputs differ, one bit per input in same()'s order (a diagnostic: the slow path's token names them). Field by field, as same().
+    uint32_t differs(const FlatOffscreenKey& o) const noexcept {
+        uint32_t m = 0;
+        m |= (vs != o.vs) ? 1u << 0 : 0u;
+        m |= (ps != o.ps) ? 1u << 1 : 0u;
+        m |= (color != o.color) ? 1u << 2 : 0u;
+        m |= (depth != o.depth) ? 1u << 3 : 0u;
+        m |= (rtv != o.rtv) ? 1u << 4 : 0u;
+        m |= (dsv != o.dsv) ? 1u << 5 : 0u;
+        m |= (b1 != o.b1) ? 1u << 6 : 0u;
+        m |= (cameraHash != o.cameraHash) ? 1u << 7 : 0u;
+        m |= (writeEpoch != o.writeEpoch) ? 1u << 8 : 0u;
+        m |= (writeSeq != o.writeSeq) ? 1u << 9 : 0u;
+        m |= (hasCamera != o.hasCamera) ? 1u << 10 : 0u;
+        m |= (width != o.width || height != o.height || format != o.format || depthWidth != o.depthWidth || depthHeight != o.depthHeight ||
+              depthFormat != o.depthFormat) ? 1u << 11 : 0u;
+        m |= (viewportCount != o.viewportCount || std::memcmp(viewport, o.viewport, sizeof(viewport)) != 0) ? 1u << 12 : 0u;
+        m |= (rtvGen != o.rtvGen) ? 1u << 13 : 0u;
+        m |= (dsvGen != o.dsvGen) ? 1u << 14 : 0u;
+        return m;
+    }
+};
+static_assert(FlatOffscreenKey::kInputs == kFlatOffscreenKeyInputs, "the token's input names follow the key's inputs");
+// The class-4 keys recorded earlier in the frame (a diagnostic): whether a memo of more than the one previous draw would have served a draw.
+class FlatOffscreenRecent {
+public:
+    static constexpr unsigned kSize = 16;
+    // True when the key was recorded earlier this frame; then remembers it (oldest out).
+    bool seenThenAdd(uint64_t frame, const FlatOffscreenKey& key) noexcept {
+        if (frame != frame_) { frame_ = frame; n_ = 0; next_ = 0; }
+        for (unsigned i = 0; i < n_; ++i) if (keys_[i].same(key)) return true;
+        keys_[next_] = key; next_ = (next_ + 1) % kSize; if (n_ < kSize) ++n_;
+        return false;
+    }
+
+private:
+    uint64_t frame_ = ~uint64_t(0);
+    unsigned n_ = 0, next_ = 0;
+    FlatOffscreenKey keys_[kSize];
 };
 // The key of a draw's observation (the runtime fills the observation from the same fields before the reducer sees it).
 inline FlatOffscreenKey flatOffscreenKeyOf(const FlatContractObservation& k, uint32_t rtvGen, uint32_t dsvGen) noexcept {
