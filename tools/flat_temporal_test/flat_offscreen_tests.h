@@ -70,7 +70,17 @@ inline bool sameDrawRecord(const FlatRuntimeDraw& a, const FlatRuntimeDraw& b) {
     x.instances = y.instances = 0; x.key.camera = y.key.camera = nullptr; x.key.sequence = y.key.sequence = 0;
     for (uint32_t s = 0; s < kFlatProjectionSlots; ++s) x.key.projection[s].bytes = y.key.projection[s].bytes = nullptr;
     if (static_cast<bool>(a.key.camera) != static_cast<bool>(b.key.camera)) return false;
-    return std::memcmp(&x, &y, sizeof(FlatRuntimeDraw)) == 0;
+    // The members' bytes only: a memcmp of the whole struct also compared its padding, which no copy is bound to carry (it flipped this
+    // check when unrelated code changed, 2026-11-12: byte 479 of 480, after the last bool). Two runs of members, then nothing but padding.
+    constexpr size_t headEnd = offsetof(FlatRuntimeDraw, effectiveStencilWrite) + sizeof(bool);
+    constexpr size_t tailBegin = offsetof(FlatRuntimeDraw, firstPersonCohort), tailEnd = offsetof(FlatRuntimeDraw, poolFamilyVs) + sizeof(bool);
+    static_assert(offsetof(FlatRuntimeDraw, instances) >= headEnd && offsetof(FlatRuntimeDraw, instances) - headEnd < alignof(uint32_t),
+                  "only padding between the head's last member and instances");
+    static_assert(tailBegin == offsetof(FlatRuntimeDraw, instances) + sizeof(uint32_t), "the tail starts right after instances");
+    static_assert(sizeof(FlatRuntimeDraw) - tailEnd < alignof(FlatRuntimeDraw), "nothing but padding after poolFamilyVs: a new member must be compared here");
+    const unsigned char* px = reinterpret_cast<const unsigned char*>(&x);
+    const unsigned char* py = reinterpret_cast<const unsigned char*>(&y);
+    return std::memcmp(px, py, headEnd) == 0 && x.instances == y.instances && std::memcmp(px + tailBegin, py + tailBegin, tailEnd - tailBegin) == 0;
 }
 inline bool replayMarker(FlatRuntimePrefix& prefix, const FlatTraceEvent& e) {
     if (e.kind == kFlatTraceEventOverlayFailed) { flatRuntimeOverlayFailed(prefix, e.key.color); return true; }
@@ -377,6 +387,53 @@ inline int flatOffscreenTests() {
         expect(std::strstr(text, "0.0 draws a frame") != nullptr, "O6: a window with no frames prints zeros, not a division");
     }
 
+    // ---- O7: why the slow path's draws were not served (the diagnostic of 2026-11-12) -------------------------------------------------
+    {
+        const FlatOffscreenKey k = baseKey();
+        expect(k.differs(k) == 0, "O7: a key differs from itself in nothing");
+        bool each = true;
+        for (unsigned i = 0; i < FlatOffscreenKey::kInputs; ++i) if (k.differs(changed(k, i)) != (1u << i)) each = false;
+        expect(each, "O7: each input changed alone is the one bit differs() sets, in same()'s order");
+        auto recent = std::make_unique<FlatOffscreenRecent>();
+        expect(!recent->seenThenAdd(1, k) && recent->seenThenAdd(1, k), "O7: a key is new the first time in a frame and earlier the second");
+        expect(!recent->seenThenAdd(2, k), "O7: a new frame forgets the last one's keys");
+        FlatOffscreenKey filler = k;   // k is in the ring for frame 2; kSize other keys push it out
+        for (unsigned i = 0; i < FlatOffscreenRecent::kSize; ++i) { filler.vs = 0x7000 + i; recent->seenThenAdd(2, filler); }
+        expect(!recent->seenThenAdd(2, k), "O7: the ring keeps the latest keys; the oldest goes out");
+
+        FlatOffscreenCounts c;
+        char text[320];
+        flatOffscreenSlowFormat(text, sizeof(text), c, 10.0, 0);
+        expect(std::string(text) == "offscreen slow path: 0.0 draws a frame (acted or not plain 0.0; class-4 new 0.0, repeating an earlier draw of the frame 0.0; "
+                                    "not class-4: none)",
+               "O7: the zero form of the first token");
+        flatOffscreenSlowFormat(text, sizeof(text), c, 10.0, 1);
+        expect(std::string(text) == "offscreen slow path: not a repeat of the verified draw (0.0 a frame, differing in: none)", "O7: the zero form of the second");
+        c.slow = 22500; c.notPlain = 9000; c.class4New = 3000; c.class4Earlier = 2000;
+        c.slowNo[static_cast<unsigned>(FlatOffscreenNo::Pair)] = 5000; c.slowNo[static_cast<unsigned>(FlatOffscreenNo::Format)] = 2000;
+        c.keyDiffDraws = 12000; c.keyDiff[6] = 8000; c.keyDiff[0] = 6000; c.keyDiff[9] = 5000; c.keyDiff[12] = 10;
+        flatOffscreenSlowFormat(text, sizeof(text), c, 10.0, 0);
+        expect(std::string(text) == "offscreen slow path: 2250.0 draws a frame (acted or not plain 900.0; class-4 new 300.0, repeating an earlier draw of the frame 200.0; "
+                                    "not class-4: pair 500.0, format 200.0)",
+               "O7: the draws a frame, what they were, and the class-4 refusals largest first");
+        flatOffscreenSlowFormat(text, sizeof(text), c, 10.0, 1);
+        expect(std::string(text) == "offscreen slow path: not a repeat of the verified draw (1200.0 a frame, differing in: b1 800.0, vs 600.0, camera sequence 500.0, and 1 more)",
+               "O7: the key inputs that differed, largest first, three named");
+        FlatOffscreenCounts sum; sum.add(c); sum.add(c);
+        expect(sum.slow == 45000 && sum.notPlain == 18000 && sum.class4Earlier == 4000 && sum.keyDiff[6] == 16000 &&
+                   sum.slowNo[static_cast<unsigned>(FlatOffscreenNo::Pair)] == 10000 && sum.keyDiffDraws == 24000,
+               "O7: a window adds every new count");
+        for (unsigned i = 0; i < kFlatOffscreenReasons; ++i) c.slowNo[i] = 100000000000ull * (i + 1);
+        for (unsigned i = 0; i < kFlatOffscreenKeyInputs; ++i) c.keyDiff[i] = 100000000000ull * (i + 1);
+        c.slow = c.notPlain = c.class4New = c.class4Earlier = c.keyDiffDraws = 99999999999999ull;
+        bool fits = true;
+        for (unsigned part = 0; part < 2; ++part) {
+            flatOffscreenSlowFormat(text, sizeof(text), c, 1.0, part);
+            fits = fits && std::strlen(text) < sizeof(text) - 1 && text[std::strlen(text) - 1] == ')';
+        }
+        expect(fits, "O7: at absurd counts both tokens still fit the census's 320 characters whole");
+    }
+
     // ---- O5: the wiring ----------------------------------------------------------------------------------------------------------------
     {
         const std::string runtime = slurp("src/d3d11/flat_runtime.cpp");
@@ -432,9 +489,11 @@ inline int flatOffscreenTests() {
                 {&tryBody, "memo.lookup(s.prefix.frame, now) != FlatOffscreenNo::None", 1, "the memo is asked with the frame"},
                 {&tryBody, "flatOffscreenFullscreenTriangle(a)", 1, "a fullscreen triangle never takes the path"},
                 // The record.
-                {&recordBody, "flatOffscreenShapeVerdict(k, pair, s.prefix.width, s.prefix.height, s.prefix.output, a) != FlatOffscreenNo::None", 1, "only a draw the shape verdict serves is remembered"},
-                {&recordBody, "flatOffscreenLiveVerdict(flatOffscreenLiveOf(s, auditing, k)) != FlatOffscreenNo::None", 1, "and only under the live conditions"},
-                {&recordBody, "if (!plain || s.prefix.targetsUsed != oldTargets || s.prefix.uncertain != uncertainBefore) return;", 1, "and only a draw that was plain and changed no target or certainty"},
+                {&recordBody, "const FlatOffscreenNo shape = flatOffscreenShapeVerdict(k, pair, s.prefix.width, s.prefix.height, s.prefix.output, a);", 1, "only a draw the shape verdict serves is remembered"},
+                {&recordBody, "if (shape != FlatOffscreenNo::None) { ++s.offscreenCounts.slowNo[static_cast<unsigned>(shape)]; return; }", 1, "a draw it refuses is counted and left"},
+                {&recordBody, "const FlatOffscreenNo live = flatOffscreenLiveVerdict(flatOffscreenLiveOf(s, auditing, k));", 1, "and only under the live conditions"},
+                {&recordBody, "if (live != FlatOffscreenNo::None) { ++s.offscreenCounts.slowNo[static_cast<unsigned>(live)]; return; }", 1, "a live refusal is counted and left"},
+                {&recordBody, "if (!plain || s.prefix.targetsUsed != oldTargets || s.prefix.uncertain != uncertainBefore) { ++s.offscreenCounts.notPlain; return; }", 1, "and only a draw that was plain and changed no target or certainty"},
                 {&recordBody, "flatOffscreenKeyOf(k, bindingGeneration(BindSlot::Rtv0), bindingGeneration(BindSlot::Dsv0))", 1, "with the generations of the bindings"},
                 // The constructor.
                 {&ctor, "if (flatOffscreenTry(s, context, offscreenArgs, auditing)) return;", 1, "the constructor asks the fast path once"},

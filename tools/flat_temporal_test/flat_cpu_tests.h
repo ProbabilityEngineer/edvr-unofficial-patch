@@ -1248,6 +1248,24 @@ inline int flatCpuTests() {
                flatcpu::t_drawSplit.phase == flatcpu::DrawSplitState::Idle,
                "an unclocked shell adds nothing and leaves the split disarmed");
     }
+    // ---- the present interval while the flat runtime is off (F7) -----------------------------
+    {
+        flatcpu::OffWindow off;
+        char line[320] = {};
+        const int64_t f = 1000;   // a tick is a millisecond
+        off.onPresent(0, f);      // the first Present after a stretch on only starts the clock
+        expect(!off.take(0, line, sizeof line), "an off window that has just started prints nothing");
+        int64_t t = 0;
+        for (int i = 0; i < 100; ++i) { t += 20; off.onPresent(t, f); }   // 2 s of 20 ms frames
+        for (int i = 0; i < 100; ++i) { t += 30; off.onPresent(t, f); }   // 3 s of 30 ms frames
+        expect(off.take(t, line, sizeof line) && has(line, "frames=200 present p50 30.00 ms (p95 30.00)") &&
+                   has(line, "temporal AA off (F7"),
+               "an off window prints its frames and present percentiles after 5 s");
+        expect(!off.take(t + 1, line, sizeof line), "and starts a fresh window");
+        off.reset();
+        off.onPresent(t + 6000, f);
+        expect(!off.take(t + 6000, line, sizeof line), "a reset drops the part window, and the next off stretch starts its own clock");
+    }
     fake(0);
     t_fake = false;
     return failures;

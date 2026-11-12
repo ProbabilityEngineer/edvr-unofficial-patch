@@ -1186,9 +1186,57 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
         char offscreenText[320];
         flatOffscreenFormat(offscreenText, sizeof(offscreenText), r.offscreen, frames);
         tk.add("; ", "%s", offscreenText);
+        for (unsigned part = 0; part < 2; ++part) {
+            char slowText[320];
+            flatOffscreenSlowFormat(slowText, sizeof(slowText), r.offscreen, frames, part);
+            tk.add("; ", "%s", slowText);
+        }
     }
     packLines(tk, out);
 }
+
+// While no temporal mode runs (F7's comparison, or fix.temporal_aa off) the flat runtime returns before the census and before every
+// per-draw block, so the census is silent and an F7 window left no figure (session 2026-11-12, 19:47:29-19:48:54). This keeps the one
+// figure that still means something then, the present interval, so the frames with EDVR's flat work off can be set against the frames
+// with it on. Its own line, never the census's: nothing else in it would be true while off.
+class OffWindow {
+public:
+    static constexpr unsigned kMaxSamples = 2048;
+    // Once per Present while off. The first call after a stretch on only starts the clock.
+    void onPresent(int64_t nowTicks, int64_t freq) noexcept {
+        if (!primed_ || freq != freq_) {
+            primed_ = true; freq_ = freq; last_ = start_ = nowTicks; frames_ = 0;
+            return;
+        }
+        const double ms = freq_ > 0 ? static_cast<double>(nowTicks - last_) * 1000.0 / static_cast<double>(freq_) : 0.0;
+        last_ = nowTicks;
+        if (frames_ < kMaxSamples) interval_[frames_] = static_cast<float>(ms);
+        ++frames_;
+    }
+    // The runtime is on again: a later off stretch starts afresh, and a part window is dropped (it would mix in the switch's frame).
+    void reset() noexcept { primed_ = false; frames_ = 0; }
+    // The line, every kWindowMs while off. False before that, or with no frame in the window.
+    bool take(int64_t nowTicks, char* out, size_t cap) noexcept {
+        if (!primed_ || freq_ <= 0 || nowTicks - start_ < freq_ * kWindowMs / 1000) return false;
+        const unsigned n = (std::min)(frames_, kMaxSamples);
+        const bool any = n > 0;
+        if (any && cap) {
+            double p50 = 0, p95 = 0;
+            percentiles(interval_, n, &p50, &p95);
+            std::snprintf(out, cap, "flat cpu 5s: temporal AA off (F7 or no mode selected): frames=%u present p50 %.2f ms (p95 %.2f); "
+                                    "the flat runtime does no per-draw work while off, so this is the game without EDVR's flat CPU and GPU work",
+                          frames_, p50, p95);
+        }
+        start_ = nowTicks; frames_ = 0;
+        return any && cap;
+    }
+
+private:
+    bool primed_ = false;
+    int64_t freq_ = 0, last_ = 0, start_ = 0;
+    unsigned frames_ = 0;
+    float interval_[kMaxSamples];
+};
 
 }  // namespace flatcpu
 }  // namespace edvr
