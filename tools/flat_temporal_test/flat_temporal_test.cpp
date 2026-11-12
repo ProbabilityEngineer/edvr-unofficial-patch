@@ -2885,6 +2885,16 @@ void testFlatCpuWiring() {
         for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
         return n;
     };
+    // The GPU spans follow the timing switch (2026-11-12): each timestamp ends a Metal pass and marks a commit under DXMT.
+    const std::string gpuTimingCpp = slurp("src/d3d11/gpu_timing.cpp");
+    check(count(runtimeCpp, "gpuTimingSetQuiet(!timingWanted);") == 1 &&
+              runtimeCpp.find("gpuTimingSetQuiet(!timingWanted);") > runtimeCpp.find("const bool timingWanted = flatcpu::clocksPolicy(timingKey, timingEnv);"),
+          "the flat runtime quiets every GPU timer while advanced.flat_cpu_timing is off, from the same decision as the CPU clocks");
+    check(gpuTimingCpp.find("if (gpuTimingQuiet()) return false;") != std::string::npos &&
+              gpuTimingCpp.find("if (gpuTimingQuiet()) return false;") < gpuTimingCpp.find("if (!gpuTimingBind(dev, ctx)) return false;"),
+          "a quiet clock refuses a timer's lease before it binds or issues anything");
+    check(count(runtimeCpp, "if (gpuTimingQuiet()) return;   // the timing is off: not a skipped frame, an untimed one") == 1,
+          "an untimed frame is not counted as a skipped one");
     const auto scanStart=forwardCpp.find("void forwardDrawWrites(State& s,"),scanEnd=forwardCpp.find("bool forwardConverterState",scanStart);
     const auto scan=forwardCpp.substr(scanStart,scanEnd-scanStart);
     check(scan.find("if(!watching){counts.add(flatcpu::kCopyWatchSkip);return;}")<scan.find("flatcpu::Scope outputCost")&&
