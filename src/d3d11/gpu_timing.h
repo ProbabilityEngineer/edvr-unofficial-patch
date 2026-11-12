@@ -70,6 +70,13 @@ void gpuTimingSetYield(bool on) noexcept;
 bool gpuTimingYielding() noexcept;
 uint64_t gpuTimingTakeYieldRefusals() noexcept;
 
+// Quiet (2026-11-12): while set, every timer refuses NEW leases, silently and without a count, so no timestamp is issued. Each timestamp
+// costs more than its query under DXMT: ending one ends the Metal pass and marks the command buffer to be committed at the next pass end
+// (DXMT's pass census, 2026-11-12: about 20 timestamps and 8 extra command buffers a frame in a hangar). The flat runtime sets it while
+// advanced.flat_cpu_timing is off, so the GPU spans are priced only when the timing is asked for; the VR profile never sets it.
+void gpuTimingSetQuiet(bool on) noexcept;
+bool gpuTimingQuiet() noexcept;
+
 // The GPU census's own frequency scope (2026-10-14). Every census span (a GpuTimer pair) borrows a scope that is already open; with none open,
 // each span opens a TIMESTAMP_DISJOINT of its own, takes one of the clock's eight records, and holds it until its result is polled four or more
 // frames later. The application-frame clock (advanced.app_gpu_timing) kept one scope open across the render, so every census span borrowed it; with

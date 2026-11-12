@@ -141,6 +141,9 @@ void noteYieldRefusal() noexcept { g_yieldRefusals.fetch_add(1, std::memory_orde
 void gpuTimingSetYield(bool on) noexcept { g_yieldOn.store(on, std::memory_order_release); }
 bool gpuTimingYielding() noexcept { return g_yieldOn.load(std::memory_order_acquire); }
 uint64_t gpuTimingTakeYieldRefusals() noexcept { return g_yieldRefusals.exchange(0, std::memory_order_acq_rel); }
+std::atomic<bool> g_quietOn{false};
+void gpuTimingSetQuiet(bool on) noexcept { g_quietOn.store(on, std::memory_order_release); }
+bool gpuTimingQuiet() noexcept { return g_quietOn.load(std::memory_order_acquire); }
 
 bool gpuTimingCensusScopeOpen() noexcept { return static_cast<bool>(g_censusLease); }
 bool gpuTimingCensusScopeEnsure(ID3D11DeviceContext* ctx, uint64_t now) noexcept {
@@ -269,6 +272,7 @@ bool GpuTimer::beginImpl(ID3D11Device* dev, ID3D11DeviceContext* ctx,
         noteYieldRefusal();
         return false;
     }
+    if (gpuTimingQuiet()) return false;   // the flat timing is off: no timestamp at all (gpu_timing.h, gpuTimingSetQuiet)
     if (!gpuTimingBind(dev, ctx)) return false;
     const auto d = current();
     if (!d || !d->accepts(ctx) || d->device() != dev) return false;

@@ -3336,6 +3336,7 @@ bool depthView(ID3D11Texture2D* depth) {
 // span costs one timestamp pair.
 void gpuFrameOpen(State& s, ID3D11DeviceContext* ctx) {
     s.gpuFrameTried = true;
+    if (gpuTimingQuiet()) return;   // the timing is off: not a skipped frame, an untimed one
     for (int i = 0; i < State::kGpuFrameTimers; ++i) {
         if (s.gpuFrameBusy[i]) continue;
         if (s.gpuFrameTimer[i].begin(s.device.Get(), ctx)) { s.gpuFrameBusy[i] = true; s.gpuFrameOpen = i; return; }
@@ -4624,6 +4625,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             const char* timingEnv = flatcpu::clocksEnv();
             const bool timingWanted = flatcpu::clocksPolicy(timingKey, timingEnv);
             const bool timingChanged = s.census.setClocks(timingWanted, censusNow);
+            gpuTimingSetQuiet(!timingWanted);   // the GPU spans too: each timestamp costs a pass end and a commit under DXMT
             if (timingChanged || !s.cpuTimingRead) {
                 s.cpuTimingRead = true;
                 Log::get().note("flat runtime: CPU timing in the log %s (advanced.flat_cpu_timing = %s%s)", timingWanted ? "on" : "off",
