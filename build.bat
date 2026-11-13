@@ -297,6 +297,7 @@ python tools\run_jobs.py ^
     --gate "tools\focus_watch.py --self-test" ^
     --gate "tools\check_config_contract.py --self-test" ^
     --gate "tools\check_config_contract.py" ^
+    --gate "tools\check_metal_fx_backend.py --self-test" ^
     --gate "tools\gen_fsr_hlsl.py --self-test" ^
     --gate "tools\gen_smaa_hlsl.py --self-test" ^
     --gate "tools\gen_settings_schema.py --self-test" ^
@@ -758,6 +759,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\terrain_cull_cover_hook.cpp" ^
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
+    "src\d3d11\metal_fx_engine.cpp" ^
     "src\d3d11\sharpen_pass.cpp" ^
     "src\d3d11\flat_sharpen.cpp" "src\d3d11\flat_ui_layer.cpp" "src\d3d11\flat_star_glow.cpp" "src\d3d11\flat_dof_blur.cpp" ^
     "src\d3d11\hdr_output.cpp" ^
@@ -1756,6 +1758,10 @@ if not exist "%OBJ%\flat_mono_resolve_test" mkdir "%OBJ%\flat_mono_resolve_test"
     "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\map_easu.cpp" "src\d3d11\map_smaa.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
     "src\common\iniedit.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib
+REM src\d3d11\metal_fx_engine.cpp is deliberately NOT here: like dlaa.cpp and
+REM fsr3_engine.cpp, the rig stubs its entry points (mfxAvailable,
+REM mfxEvaluate) so it can see what the resolver hands the backend. Linking the
+REM real one as well would be a duplicate symbol.
 if errorlevel 1 ( echo [edvr] ERROR: flat mono resolve test build failed & exit /b 1 )
 "%BUILD%\flat_mono_resolve_test.exe" --dry-run || exit /b 1
 "%BUILD%\flat_mono_resolve_test.exe" --list-shards 5 || exit /b 1
