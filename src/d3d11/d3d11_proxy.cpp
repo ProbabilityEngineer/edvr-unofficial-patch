@@ -19,6 +19,7 @@
 #include <intrin.h>  // _ReturnAddress: the caller of the executable's LoadLibraryW
 #include <string>
 
+#include "../common/code_hook.h"
 #include "../common/config.h"
 #include "../common/runtime_profile.h"
 #include "../common/d3d11_device_identity.h"
@@ -915,6 +916,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         case DLL_PROCESS_ATTACH:
             g_selfModule = module;
             DisableThreadLibraryCalls(module);
+            // CodeHook's near-trampoline pool (code_hook.h): two regions within reach of the game's image, reserved before
+            // anything else has a chance to map memory there. Reserve only -- nothing committed, logged or configured.
+            edvr::codeHookReserveNear(GetModuleHandleW(nullptr));
+            edvr::codeHookReserveNear(GetModuleHandleW(nullptr));
             // Native routing is a build capability, available before Elite's
             // first VR probe. No configuration or logging under loader lock.
             // A route that cannot be installed leaves Elite's own loading untouched; the gfx log says why.

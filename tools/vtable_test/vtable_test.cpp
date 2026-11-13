@@ -1115,6 +1115,96 @@ int main() {
         }
     }
 
+    // THE TRAMPOLINE POOL (2026-11-12, step 4). A trampoline needs to be near only when a moved instruction is
+    // rip-relative; those take a page of the near pool (sixteen to a 64 KB region, not one), every other trampoline goes
+    // anywhere. Synthetic functions in an executable region near this module, so both shapes are known exactly:
+    //   plain: sub rsp,28h; add rsp,28h; mov eax,7; ret        (no rip-relative instruction)
+    //   rip:   inc dword [rip+d]; mov eax,9; ret                (d addresses a counter in the same region)
+    {
+        auto reserveNearSelf = [](size_t bytes) -> uint8_t* {
+            const uintptr_t at = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            for (uintptr_t delta = 0x10000; delta < 0x40000000; delta += 0x10000)
+                for (int dir = 0; dir < 2; ++dir) {
+                    const uintptr_t c = dir ? at + delta : at - delta;
+                    if (void* got = VirtualAlloc(reinterpret_cast<void*>(c), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+                        return static_cast<uint8_t*>(got);
+                }
+            return nullptr;
+        };
+        constexpr int kRipFns = 20;
+        uint8_t* region = reserveNearSelf(0x10000);
+        check(region != nullptr, "the pool cells have a code region near the test module", "no region could be placed near the test module");
+        if (region) {
+            uint8_t* const counter = region + 0x8000;   // the rip-relative functions' shared counter
+            uint8_t* const plain = region;
+            const uint8_t plainBytes[] = {0x48, 0x83, 0xEC, 0x28, 0x48, 0x83, 0xC4, 0x28, 0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3};
+            memcpy(plain, plainBytes, sizeof(plainBytes));
+            uint8_t* rip[kRipFns];
+            for (int i = 0; i < kRipFns; ++i) {
+                rip[i] = region + 0x100 + i * 0x40;
+                const int32_t d = static_cast<int32_t>(counter - (rip[i] + 6));
+                uint8_t b[12] = {0xFF, 0x05, 0, 0, 0, 0, 0xB8, 0x09, 0x00, 0x00, 0x00, 0xC3};
+                memcpy(b + 2, &d, 4);
+                memcpy(rip[i], b, sizeof(b));
+            }
+            DWORD old = 0;
+            VirtualProtect(region, 0x8000, PAGE_EXECUTE_READ, &old);
+            FlushInstructionCache(GetCurrentProcess(), region, 0x8000);
+            using Fn = int (*)();
+            auto replacement = +[]() -> int { return 100; };
+            volatile uint32_t* const count = reinterpret_cast<volatile uint32_t*>(counter);
+            auto pageProtect = [](const void* p) { MEMORY_BASIC_INFORMATION m{}; VirtualQuery(p, &m, sizeof(m)); return m.Protect; };
+
+            const CodeHookPoolStats before = codeHookPoolStats();
+            {
+                CodeHook hook;
+                Fn orig = nullptr;
+                const bool got = hook.install(plain, reinterpret_cast<void*>(replacement), reinterpret_cast<void**>(&orig), "pool-plain");
+                check(got && reinterpret_cast<Fn>(plain)() == 100 && orig && orig() == 7,
+                      "a prologue with no rip-relative instruction is hooked, and its trampoline still runs the original",
+                      "the plain synthetic function was not hooked, or its trampoline does not run the original");
+                check(got && !codeHookInPool(reinterpret_cast<void*>(orig)) && codeHookPoolStats().used == before.used,
+                      "...with its trampoline outside the near pool: it needs to be near nothing",
+                      "a trampoline with no rip-relative instruction took a page of the scarce near pool");
+                check(got && pageProtect(reinterpret_cast<void*>(orig)) == PAGE_EXECUTE_READ,
+                      "...and its trampoline page is execute-read, never writable", "the plain trampoline page is writable or not executable");
+                hook.uninstall();
+                check(reinterpret_cast<Fn>(plain)() == 7, "...and uninstall restores it", "the plain function did not survive being unhooked");
+            }
+            {
+                CodeHook hooks[kRipFns];
+                Fn origs[kRipFns] = {};
+                bool all = true, inPool = true, runs = true, protect = true;
+                for (int i = 0; i < kRipFns; ++i) {
+                    char name[32];
+                    std::snprintf(name, sizeof(name), "pool-rip-%d", i);
+                    all = hooks[i].install(rip[i], reinterpret_cast<void*>(replacement), reinterpret_cast<void**>(&origs[i]), name) && all;
+                }
+                for (int i = 0; i < kRipFns && all; ++i) {
+                    inPool = inPool && codeHookInPool(reinterpret_cast<void*>(origs[i]));
+                    protect = protect && pageProtect(reinterpret_cast<void*>(origs[i])) == PAGE_EXECUTE_READ;
+                    const uint32_t c = *count;
+                    runs = runs && reinterpret_cast<Fn>(rip[i])() == 100 && origs[i]() == 9 && *count == c + 1;
+                }
+                const CodeHookPoolStats during = codeHookPoolStats();
+                check(all, "twenty rip-relative prologues are all hooked", "a rip-relative synthetic function was refused");
+                check(all && inPool, "...each trampoline a page of the near pool", "a rip-relative trampoline was placed outside the pool");
+                check(all && runs, "...and each trampoline's rewritten displacement still increments the right counter",
+                      "a pooled trampoline's rip-relative operand no longer addresses its data");
+                check(all && protect, "...and every pooled page is execute-read, never writable", "a pooled trampoline page is writable or not executable");
+                check(all && during.used == before.used + kRipFns && during.regions <= before.regions + 2,
+                      "...twenty trampolines in at most two new regions, not twenty",
+                      "the pool did not share regions between trampolines");
+                for (auto& h : hooks) h.uninstall();
+                check(codeHookPoolStats().used == before.used, "uninstall gives every page back to the pool", "pool pages leaked on uninstall");
+                runs = true;
+                for (int i = 0; i < kRipFns; ++i) runs = runs && reinterpret_cast<Fn>(rip[i])() == 9;
+                check(runs, "...and every rip-relative function is restored", "a rip-relative function did not survive being unhooked");
+            }
+            VirtualFree(region, 0, MEM_RELEASE);
+        }
+    }
+
     // A relay must have a usable forward before the entry becomes reachable.
     // Exercise the new preparation contract without relying on origOut being
     // assigned after publication, and prove a refusal leaves the target alone.
