@@ -145,4 +145,15 @@ private:
 size_t codeInstructionLength(const uint8_t* code, size_t available,
                              size_t* ripDispOffset);
 
+// The near-trampoline pool (code_hook.cpp, "WHERE A TRAMPOLINE GOES"). codeHookReserveNear reserves one more region of
+// it within reach of `anchor` -- the main module, at DLL load, before the space near it fills -- without committing,
+// logging or taking anything but the pool's own lock, so it is safe under the loader lock. The stats and the membership
+// test are for the log and the unit cells.
+struct CodeHookPoolStats {
+    unsigned regions = 0, pages = 0, used = 0;
+};
+void codeHookReserveNear(void* anchor);
+CodeHookPoolStats codeHookPoolStats();
+bool codeHookInPool(const void* p);
+
 }  // namespace edvr

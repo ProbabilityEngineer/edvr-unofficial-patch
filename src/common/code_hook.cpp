@@ -185,41 +185,165 @@ size_t codeInstructionLength(const uint8_t* code, size_t available,
 
 namespace {
 
-// Reserve memory within +/-2GB of `near`, so a 5-byte relative jump can reach
-// it. Walks outward from the target a page at a time; MEM_RESERVE fails
-// harmlessly on anything already taken. Committed read-write, not
-// read-write-execute: the trampoline is built into it after allocation, and
-// CodeHook::install makes it executable only once that write is finished, so
-// a trampoline page is never writable and executable at the same time. (The
-// target's own page is the deliberate exception: the patch is written while
-// other threads may be running it, so that page keeps execute during the
-// store.)
-uint8_t* allocateNear(void* anchor, size_t bytes) {
+// Two gigabytes minus a margin, because a displacement is measured from the END of the instruction that holds it and the
+// trampoline's own length has to fit inside the window too.
+constexpr uintptr_t kReach = 0x7FF00000;
+
+// WHERE A TRAMPOLINE GOES (2026-11-12, step 4 of the flat performance work).
+//
+// The patch at the target jumps straight to the REPLACEMENT; the trampoline is only ever reached through the pointer
+// install() hands back, and it leaves by an absolute jump. So the trampoline itself has to be within reach of nothing --
+// except when a moved instruction is rip-relative: its displacement is rewritten to address the same data from the
+// trampoline, and that only fits in 32 bits if the trampoline is within two gigabytes of the data. Until now every
+// trampoline was placed within two gigabytes of its target, and each took a whole allocation (64 KB of address space
+// for a few dozen bytes). Near Elite's image that space is scarce under Wine and FEX: on 2026-11-12 three launches in a
+// row ran out after four of the nine engine-motion hooks, and the temporal AA stood down.
+//
+// Now: a trampoline with no rip-relative instruction is allocated anywhere. One that needs to be near takes a PAGE
+// from a pool of regions reserved near the main module -- the first at DLL load, before the game, Wine and FEX have
+// filled the space (codeHookReserveNear) -- so a region of 64 KB holds sixteen trampolines, not one. Each trampoline
+// still has a page of its own, so the old rule stands: a trampoline page is never writable and executable at once,
+// and building one never touches a page another thread may be executing.
+uintptr_t allocationGranularity() {
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
-    const uintptr_t granularity =
-        si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
-    // `near` would have been the obvious name and is a windows.h macro.
-    const uintptr_t at = reinterpret_cast<uintptr_t>(anchor);
-    // Two gigabytes minus a margin, because the jump displacement is measured
-    // from the END of the patched instruction and the trampoline's own length
-    // has to fit inside the window too.
-    constexpr uintptr_t kReach = 0x7FF00000;
+    return si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
+}
+uintptr_t pageSize() {
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    return si.dwPageSize ? si.dwPageSize : 0x1000;
+}
 
-    for (uintptr_t delta = granularity; delta < kReach; delta += granularity) {
+// Reserve (not commit) one region within reach of `anchor`, walking outward from it a region at a time; MEM_RESERVE
+// fails harmlessly on anything already taken.
+uint8_t* reserveNear(uintptr_t at, size_t bytes) {
+    const uintptr_t granularity = allocationGranularity();
+    for (uintptr_t delta = granularity; delta < kReach - bytes; delta += granularity) {
         for (int direction = 0; direction < 2; ++direction) {
             const uintptr_t candidate = direction ? (at + delta) : (at - delta);
             if (direction == 0 && delta > at) continue;   // would wrap below zero
-            void* const got = VirtualAlloc(
-                reinterpret_cast<void*>(candidate & ~(granularity - 1)), bytes,
-                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            void* const got = VirtualAlloc(reinterpret_cast<void*>(candidate & ~(granularity - 1)), bytes, MEM_RESERVE,
+                                           PAGE_NOACCESS);
             if (got) return static_cast<uint8_t*>(got);
         }
     }
     return nullptr;
 }
 
+struct NearRegion {
+    uint8_t* base = nullptr;
+    unsigned pages = 0;
+    uint64_t used = 0;   // one bit a page
+};
+constexpr unsigned kMaxRegions = 32;
+SRWLOCK g_poolLock = SRWLOCK_INIT;
+NearRegion g_regions[kMaxRegions];
+unsigned g_regionCount = 0;
+
+bool within(uintptr_t a, uintptr_t b, uintptr_t span) {
+    const uintptr_t d = a > b ? a - b : b - a;
+    return d + span < kReach;
+}
+
+// Under g_poolLock. A new region near `at`, or null.
+NearRegion* addRegion(uintptr_t at) {
+    if (g_regionCount == kMaxRegions) return nullptr;
+    const uintptr_t region = allocationGranularity();
+    const uintptr_t page = pageSize();
+    uint8_t* const base = reserveNear(at, region);
+    if (!base) return nullptr;
+    NearRegion& r = g_regions[g_regionCount++];
+    r.base = base;
+    r.pages = static_cast<unsigned>(region / page < 64 ? region / page : 64);
+    r.used = 0;
+    return &r;
+}
+
+// A committed read-write page within reach of `at` (from the pool, reserving a region if none has room), or null.
+uint8_t* poolTake(uintptr_t at) {
+    const uintptr_t page = pageSize();
+    AcquireSRWLockExclusive(&g_poolLock);
+    uint8_t* got = nullptr;
+    auto takeFrom = [&](NearRegion& r) {
+        if (!within(reinterpret_cast<uintptr_t>(r.base), at, r.pages * page)) return false;
+        for (unsigned i = 0; i < r.pages; ++i) {
+            if (r.used & (uint64_t(1) << i)) continue;
+            void* const p = VirtualAlloc(r.base + i * page, page, MEM_COMMIT, PAGE_READWRITE);
+            if (!p) return false;
+            r.used |= uint64_t(1) << i;
+            got = static_cast<uint8_t*>(p);
+            return true;
+        }
+        return false;
+    };
+    for (unsigned i = 0; i < g_regionCount && !got; ++i) takeFrom(g_regions[i]);
+    if (!got) {
+        if (NearRegion* r = addRegion(at)) takeFrom(*r);
+    }
+    ReleaseSRWLockExclusive(&g_poolLock);
+    return got;
+}
+
+// True when `p` was a pool page: decommitted (so nothing is left executable there) and free for the next trampoline.
+bool poolGive(uint8_t* p) {
+    const uintptr_t page = pageSize();
+    bool mine = false;
+    AcquireSRWLockExclusive(&g_poolLock);
+    for (unsigned i = 0; i < g_regionCount && !mine; ++i) {
+        NearRegion& r = g_regions[i];
+        if (p < r.base || p >= r.base + r.pages * page) continue;
+        const unsigned index = static_cast<unsigned>((p - r.base) / page);
+        VirtualFree(r.base + index * page, page, MEM_DECOMMIT);
+        r.used &= ~(uint64_t(1) << index);
+        mine = true;
+    }
+    ReleaseSRWLockExclusive(&g_poolLock);
+    return mine;
+}
+
+// A trampoline's memory, committed read-write: near `anchor` (a pool page) when a moved instruction is rip-relative,
+// anywhere otherwise.
+uint8_t* allocateTrampoline(bool needNear, void* anchor, size_t bytes) {
+    if (bytes > pageSize()) return nullptr;
+    if (needNear) return poolTake(reinterpret_cast<uintptr_t>(anchor));
+    return static_cast<uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+}
+void freeTrampoline(uint8_t* p) {
+    if (!p) return;
+    if (!poolGive(p)) VirtualFree(p, 0, MEM_RELEASE);
+}
+
 }  // namespace
+
+void codeHookReserveNear(void* anchor) {
+    if (!anchor) return;
+    AcquireSRWLockExclusive(&g_poolLock);
+    addRegion(reinterpret_cast<uintptr_t>(anchor));
+    ReleaseSRWLockExclusive(&g_poolLock);
+}
+
+CodeHookPoolStats codeHookPoolStats() {
+    CodeHookPoolStats out;
+    AcquireSRWLockShared(&g_poolLock);
+    out.regions = g_regionCount;
+    for (unsigned i = 0; i < g_regionCount; ++i) {
+        out.pages += g_regions[i].pages;
+        for (uint64_t u = g_regions[i].used; u; u &= u - 1) ++out.used;
+    }
+    ReleaseSRWLockShared(&g_poolLock);
+    return out;
+}
+
+bool codeHookInPool(const void* p) {
+    const uintptr_t page = pageSize();
+    bool in = false;
+    AcquireSRWLockShared(&g_poolLock);
+    for (unsigned i = 0; i < g_regionCount && !in; ++i)
+        in = p >= g_regions[i].base && p < g_regions[i].base + g_regions[i].pages * page;
+    ReleaseSRWLockShared(&g_poolLock);
+    return in;
+}
 
 void CodeHook::refusedf(const char* fmt, ...) {
     va_list args;
@@ -302,12 +426,14 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
     // does not have to be within reach of the trampoline once both have been
     // placed by the allocator.
     const size_t trampolineBytes = stolen + 14;
-    uint8_t* const tramp = allocateNear(target, trampolineBytes);
+    bool needNear = false;
+    for (size_t p = 0; p < pieceCount; ++p) needNear |= pieces[p].ripDisp != 0;
+    uint8_t* const tramp = allocateTrampoline(needNear, target, trampolineBytes);
     if (!tramp) {
         refusedf(
             "CodeHook %s: no executable memory could be reserved within reach "
-            "of %p, so a five-byte jump cannot get to a trampoline. Not hooked.",
-            label, target);
+            "of %p for the trampoline of its rip-relative prologue (pool: %u region(s), %u of %u page(s) in use). Not hooked.",
+            label, target, codeHookPoolStats().regions, codeHookPoolStats().used, codeHookPoolStats().pages);
         return false;
     }
 
@@ -360,7 +486,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
         if (!built) {
             refusedf("CodeHook %s: the trampoline for the prologue at %p could not be written. Not hooked.", label, target);
         }
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        freeTrampoline(tramp);
         return false;
     }
 
@@ -374,7 +500,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
             "CodeHook %s: could not make the trampoline at %p executable (err "
             "%lu). Not hooked.",
             label, tramp, GetLastError());
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        freeTrampoline(tramp);
         return false;
     }
     FlushInstructionCache(GetCurrentProcess(), tramp, trampolineBytes);
@@ -390,7 +516,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
             "CodeHook %s: %p is more than two gigabytes from the replacement, "
             "which a five-byte jump cannot reach. Not hooked.",
             label, target);
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        freeTrampoline(tramp);
         return false;
     }
 
@@ -412,7 +538,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
             prepared = prepare(tramp, prepareContext);
         }) || !prepared)) {
         refusedf("CodeHook %s: replacement preparation refused; target unchanged.", label);
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        freeTrampoline(tramp);
         return false;
     }
 
@@ -420,7 +546,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
     if (!VirtualProtect(code, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         refusedf("CodeHook %s: could not make %p writable (err %lu). Not "
                         "hooked.", label, target, GetLastError());
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        freeTrampoline(tramp);
         return false;
     }
     // ONE aligned store. Every other thread sees either the old eight bytes or
@@ -431,7 +557,7 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
     DWORD ignored = 0;
     VirtualProtect(code, 8, oldProtect, &ignored);
     if (!wrote) {
-        VirtualFree(tramp, 0, MEM_RELEASE);
+        freeTrampoline(tramp);
         return false;
     }
     FlushInstructionCache(GetCurrentProcess(), code, 8);
@@ -445,11 +571,12 @@ bool CodeHook::install(void* target, void* replacement, void** origOut,
 
     Log::get().note(
         "CodeHook %s: hooked the function at %p itself, moving %zu byte(s) of "
-        "its prologue to a trampoline at %p. Whatever is written into the "
+        "its prologue to a trampoline at %p (%s). Whatever is written into the "
         "vtable slot that names this function, calls to it now arrive here -- "
         "which is the point: the table can be restored as often as its owner "
         "likes and there is nothing left to lose a race with.",
-        label, target, stolen, static_cast<void*>(tramp));
+        label, target, stolen, static_cast<void*>(tramp),
+        needNear ? "near: a page of the pool, the prologue is rip-relative" : "anywhere: no rip-relative instruction moved");
     return true;
 }
 
@@ -502,7 +629,7 @@ void CodeHook::uninstall() {
     }
 
     // Freed only when the patch was still ours; see above.
-    if (ours && m_trampoline) VirtualFree(m_trampoline, 0, MEM_RELEASE);
+    if (ours && m_trampoline) freeTrampoline(m_trampoline);
     m_trampoline = nullptr;
     m_target = nullptr;
     m_replacement = nullptr;
