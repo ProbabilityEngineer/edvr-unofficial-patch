@@ -19467,5 +19467,37 @@ and split into dark (displayed luma under 48/255 in either frame) and lit.
 
 **Reading it.** Input changing, raw steady, final changing: the finish. Input and raw changing alike in dark pixels: the
 reconstruction does not settle what the jitter changes there. Input steady where raw changes: the reconstruction's own
-instability. Use F10 with the camera still and the flickering edge in the middle of the screen (the HDR route captures a central
-window at most 2048x1152), then `python tools/flat_pixels.py <session-directory>`.
+instability. Use **Shift+F10** (plain F10 is the general tier, which does not arm the pixel capture) with the camera still and the
+flickering edge in the middle of the screen (the HDR route captures a central window at most 2048x1152), then
+`python tools/flat_pixels.py <session-directory>`.
+
+## 2026-11-13, flight 02:53 (`a1c55446`): the shaded flicker is Elite's ambient occlusion
+
+**Captures.** Shift+F10 once under FSR and once under TAA, same still view in a station (pipes, panels), supersampling 1.0, HDR
+route, AO at 1 (low). Two adjacent live pairs each, complete.
+
+| per adjacent pair, visible change (>= 4/255) | input | raw | final |
+|---|---|---|---|
+| FSR, all pixels | 16% | 0.30% | 0.31% |
+| FSR, dark / lit | 14% / 16% | 0.52% / 0.26% | 0.51% / 0.27% |
+| TAA, all pixels | 18% | 0.74% | 0.77% |
+
+The finish adds nothing (final within 0.03 points of raw; 24-48 pixels a frame in the rejection footprint). Motion is zero to
+4e-4 px everywhere; rejection covers 0.01-0.3% of the flickering pixels; 2-3% of them are on a depth edge, 93-95% have a changing
+input. The flicker is phase-locked: frames 16 apart (same jitter phase) differ by 0.4-1/255 at those pixels, adjacent frames by
+11-17/255, and 90-96% flicker again in the second pair. There the output passes 30-44% of the input's swing (scene-wide 5-8%): the
+reconstruction shows the current jittered sample, its history clamped away. The pixels lie in bands along the shaded side of pipes,
+in the gaps between them, on perforation rims, vent slats and panel seams: shading, not geometry.
+
+**By eye, supersampling 1.0, FSR.** AO off: the shaded flicker stops. AO medium: worse. AO high: stops. So it is Elite's AO at its
+low and medium tiers, whose sample pattern the jitter moves each frame; high settles it. A fix on our side would feed the AO pass
+unjittered input; not done. Advice: AO off (free) or high (costly) with EDVR's temporal AA. What remains is a little shimmer on
+thin bright lines (also through the menu's blur), handled better by FSR than by EDVR's TAA: TAA's history clamp is a tuning item.
+
+**Frame time in a busy station (not this change).** Cockpit, docked, supersampling 0.65, AO off, FSR: 25-29 ms right after loading,
+then 34-43 ms within a minute as the station's views load (distinct cameras 2 -> 12, camera refresh calls 42 -> 85 a frame). With
+CPU timing on: EDVR's render-thread work about 5 ms a frame (7.1 clocked, about 1.9 of it the clocks), its GPU passes about 2.9 ms
+(resolve 2.3, FSR 2.0 of it; HDR output 0.55); the GPU timeline spans 39 ms while the Metal HUD shows it busy 17-20 ms, so the frame
+waits on the game's render thread (under FEX) and DXMT's encoding. About 1,850 offscreen draws a frame (1,147 slow path, 707 fast).
+EDVR's largest parts there: copy checks 1.1 ms, unclassified 1.3, cb shadows 0.86, resource lookup 0.58, draw-issue residual 0.5:
+the per-draw CPU cuts on the work list.
