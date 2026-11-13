@@ -1482,11 +1482,15 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         context->CSSetShader(g.finish.Get(),nullptr,0);context->Dispatch((evalW+7)/8,(evalH+7)/8,1);
     }
     if(pixels.active()) {
-        if(f.mode!=FlatMonoResolveMode::Dlss && f.mode!=FlatMonoResolveMode::Dlaa)
-            pixels.unsupported("unsupported-route-requires-dlss-or-dlaa");
+        // FSR and EDVR's TAA too (2026-11-13: stationary edges flicker under both, not with AA off, so the capture has to see them).
+        // FSR writes output[0] as DLSS does and the finish reads it. TAA's result is its ping-pong history, output[index]: raw and
+        // final on the copy route (the finish does not run for TAA there), raw on the HDR route, whose finish copies it into H.
+        if(f.mode!=FlatMonoResolveMode::Dlss && f.mode!=FlatMonoResolveMode::Dlaa && f.mode!=FlatMonoResolveMode::Fsr && !taa)
+            pixels.unsupported("unsupported-route-requires-dlss-dlaa-fsr-or-taa");
         else {
+            ID3D11Texture2D* const backendOut=g.output[taa?index:0].texture.Get();
             ID3D11Texture2D* textures[]={g.color.texture.Get(),g.depth[depthIndex].texture.Get(),g.motion.texture.Get(),
-                g.rejection.texture.Get(),g.output[0].texture.Get(),hdr?color.Get():g.output[1].texture.Get()};
+                g.rejection.texture.Get(),backendOut,hdr?color.Get():(taa?backendOut:g.output[1].texture.Get())};
             try { pixels.capture(device,context,f,reset,textures,paintNow); } catch(...) { pixels.cancel(); }
         }
     }

@@ -47,6 +47,14 @@ class FlatPixelCapture {
     std::wstring directory_;
     static constexpr const char* names_[6]={"color","depth","motion","rejection","raw","final"};
     static std::wstring wide(const std::string& s) { return std::wstring(s.begin(),s.end()); }
+    // What the raw image is: the backend's own output, before the finish. NGX and FSR write output0; EDVR's TAA writes its history
+    // (the same texture the copy route then shows, so its raw and final are one image there).
+    static const char* rawProvenance(FlatMonoResolveMode mode,bool hdr,DXGI_FORMAT format) {
+        const bool fp16=format==DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if(mode==FlatMonoResolveMode::Taa)return fp16?"taa-fp16-history":"taa-rgba8-history";
+        if(mode==FlatMonoResolveMode::Fsr)return fp16?"fsr3-fp16-output0":"fsr3-rgba8-output0";
+        return hdr||fp16?"ngx-fp16-output0":"ngx-rgba8-output0";
+    }
     void release() { pending_.clear(); }
     static std::string cameraJson(const float (&camera)[6][4]) {
         for(const auto& row:camera)for(float value:row)if(!std::isfinite(value))return "null";
@@ -154,13 +162,13 @@ public:
         // static_scene: the frame took the 3D main menu's stale-slot policy (FlatMonoResolveFrame::staticScene).
         // vehicle_frame: the frame carried the vehicle frame (FlatMonoResolveFrame::vehicleFrame), so near pixels in the rig root's sphere rode it; the replay cannot redo it.
         std::snprintf(header,sizeof(header),"{\n\"version\":2,\"frame_id\":%llu,\"mode\":\"%s\",\"configured_dlss_preset\":%u,\"reset\":%s,\"refusal_overlay\":%s,\"jitter\":[%.9g,%.9g],\"previous_jitter\":[%.9g,%.9g],\"rows_jitter\":[%.9g,%.9g],\"previous_rows_jitter\":[%.9g,%.9g],\"static_scene\":%s,\"vehicle_frame\":%s,\"route\":\"%s\",\"capture_roi\":{\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u},\"color_provenance\":\"%s\",\"raw_provenance\":\"%s\",\"final_provenance\":\"%s\",\"render_width\":%u,\"render_height\":%u,\"output_width\":%u,\"output_height\":%u,\"display_width\":%u,\"display_height\":%u,\"binary_version\":\"%s\",\"binary_compiled\":\"%s %s\",\"textures\":[\n",
-            static_cast<unsigned long long>(frame_.frame),frame_.mode==FlatMonoResolveMode::Dlaa?"dlaa":"dlss",frame_.configuredDlssPreset,frame_.reset?"true":"false",sample.refusalPainted?"true":"false",
+            static_cast<unsigned long long>(frame_.frame),flatMonoResolveModeName(frame_.mode),frame_.configuredDlssPreset,frame_.reset?"true":"false",sample.refusalPainted?"true":"false",
             frame_.jitterX,frame_.jitterY,frame_.previousJitterX,frame_.previousJitterY,
             frame_.rowsJitterX,frame_.rowsJitterY,frame_.previousRowsJitterX,frame_.previousRowsJitterY,
             frame_.staticScene?"true":"false",frame_.vehicleFrame?"true":"false",frame_.hdr?"hdr":"sdr",sample.roiX,sample.roiY,sample.roiWidth,sample.roiHeight,
             frame_.hdr?"private-copy-of-scene-H-before-resolve":"private-color-copy",
-            frame_.hdr?"ngx-fp16-output0":"ngx-rgba8-output0",
-            frame_.hdr?"scene-H-after-finish-before-tonemap":"private-finish-output1",
+            rawProvenance(frame_.mode,frame_.hdr,items_[4].desc.Format),
+            frame_.hdr?"scene-H-after-finish-before-tonemap":frame_.mode==FlatMonoResolveMode::Taa?"taa-history":"private-finish-output1",
             frame_.renderWidth,frame_.renderHeight,frame_.hdr?frame_.renderWidth:frame_.outputWidth,
             frame_.hdr?frame_.renderHeight:frame_.outputHeight,frame_.outputWidth,frame_.outputHeight,
             EDVR_VERSION_STRING,__DATE__,__TIME__);

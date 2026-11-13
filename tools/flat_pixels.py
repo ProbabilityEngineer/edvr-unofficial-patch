@@ -48,6 +48,22 @@ HDR_PROVENANCE = {
     "raw_provenance": "ngx-fp16-output0",
     "final_provenance": "scene-H-after-finish-before-tonemap",
 }
+# The copy route when the game's final image is fp16 (the flat route below supersampling 1.0, 2026-11-13): every colour image
+# is R16G16B16A16_FLOAT, the input copy included.
+SDR_FP16_TEXTURES = {
+    "color": (10, 8, "render"),
+    "depth": (41, 4, "render"),
+    "motion": (34, 4, "render"),
+    "rejection": (61, 1, "render"),
+    "raw": (10, 8, "output"),
+    "final": (10, 8, "output"),
+}
+# EDVR's TAA on the RGBA8 copy route: its history is R8G8B8A8_TYPELESS and is raw and final at once.
+TAA_TEXTURES = {**TEXTURES, "raw": (27, 4, "output")}
+MODES = ("dlss", "dlaa", "fsr", "taa")
+# What the HDR route's raw image is, per mode (flat_pixel_capture.h rawProvenance).
+HDR_RAW_PROVENANCE = {"dlss": "ngx-fp16-output0", "dlaa": "ngx-fp16-output0",
+                      "fsr": "fsr3-fp16-output0", "taa": "taa-fp16-history"}
 SLOTS = (16, 8, "render")          # DXGI_FORMAT_R32G32_FLOAT
 SLOTS_RGBA = (2, 16, "render")     # DXGI_FORMAT_R32G32B32A32_FLOAT
 MAX_POOL_BYTES = 64 * 1024 * 1024
@@ -136,8 +152,8 @@ def load_manifest(path):
     vehicle_frame = manifest.get("vehicle_frame", False)
     if type(vehicle_frame) is not bool:
         raise CaptureError(f"{path}: vehicle_frame must be a boolean")
-    if manifest.get("mode") not in ("dlss", "dlaa"):
-        raise CaptureError(f"{path}: mode must be dlss or dlaa")
+    if manifest.get("mode") not in MODES:
+        raise CaptureError(f"{path}: mode must be one of {', '.join(MODES)}")
     for field in ("binary_version", "binary_compiled"):
         value = manifest.get(field)
         if value is not None and (not isinstance(value, str) or len(value) > 256):
@@ -152,12 +168,20 @@ def load_manifest(path):
     route = manifest.get("route", "sdr")
     if route not in ("sdr", "hdr") or (route == "hdr" and version != 2):
         raise CaptureError(f"{path}: unsupported capture route")
-    layout = HDR_TEXTURES if route == "hdr" else TEXTURES
+    records = manifest.get("textures")
+    color_format = next((r.get("dxgi_format") for r in records if isinstance(r, dict) and r.get("name") == "color"),
+                        None) if isinstance(records, list) else None
+    if route == "hdr":
+        layout = HDR_TEXTURES
+    elif color_format == SDR_FP16_TEXTURES["color"][0]:
+        layout = SDR_FP16_TEXTURES
+    else:
+        layout = TAA_TEXTURES if manifest["mode"] == "taa" else TEXTURES
     roi = None
     if route == "hdr":
         if (ow, oh) != (rw, rh):
             raise CaptureError(f"{path}: HDR output grid must equal render grid")
-        for key, expected in HDR_PROVENANCE.items():
+        for key, expected in {**HDR_PROVENANCE, "raw_provenance": HDR_RAW_PROVENANCE[manifest["mode"]]}.items():
             if manifest.get(key) != expected:
                 raise CaptureError(f"{path}: unsupported HDR {key}")
         display = (_integer(manifest.get("display_width"), "display_width", 1, rw),
@@ -173,7 +197,6 @@ def load_manifest(path):
             raise CaptureError(f"{path}: HDR refusal_overlay must be a boolean")
     else:
         display = (ow, oh)
-    records = manifest.get("textures")
     if not isinstance(records, list) or len(records) not in ((6,) if version == 1 else (6, 7)):
         raise CaptureError(f"{path}: expected six textures and optional slots")
     found = {}
@@ -286,6 +309,9 @@ def load_manifest(path):
         "render_width": rw, "render_height": rh,
         "output_width": ow, "output_height": oh, "display_width": display[0], "display_height": display[1],
         "route": route, "capture_roi": roi, "layout": layout, "textures": found,
+        "float_color": layout is not TEXTURES and layout is not TAA_TEXTURES,
+        "color_provenance": manifest.get("color_provenance"), "raw_provenance": manifest.get("raw_provenance"),
+        "final_provenance": manifest.get("final_provenance"),
         "slots_components": next((4 if r["dxgi_format"] == 2 else 2 for r in records if r["name"] == "slots"), 0),
         "refusal_overlay": manifest.get("refusal_overlay", False),
         "total_bytes": total_size, "buffers": buffers, "engine": engine,
@@ -331,9 +357,13 @@ def _mask_row(rejection, geometry, y):
 
 
 def _hdr_rgb(meta, name):
+    """Linear RGB as float32, decoded by the texture's own format: R16G16B16A16_FLOAT, R11G11B10_FLOAT, or RGBA8 (0..1)."""
     pixels = _open_texture(meta, name)
-    if name == "raw":
+    fmt = meta["layout"][name][0]
+    if fmt == 10:
         return pixels.view("<f2").reshape((*pixels.shape[:2], 4))[:, :, :3].astype(np.float32)
+    if fmt in (27, 28):
+        return pixels[:, :, :3].astype(np.float32) / 255
     packed = pixels.view("<u4").reshape(pixels.shape[:2])
     def channel(shift, mantissa_bits):
         bits = (packed >> shift) & ((1 << (mantissa_bits + 5)) - 1)
@@ -399,9 +429,9 @@ def _analyze_hdr(meta, rois=None, unjitter=True, static_scene=None):
             "route": "hdr", "reset": meta["reset"], "capture_roi": meta["capture_roi"],
             "render_size": [meta["render_width"], meta["render_height"]],
             "display_size": [meta["display_width"], meta["display_height"]],
-            "color_provenance": HDR_PROVENANCE["color_provenance"],
-            "raw_provenance": HDR_PROVENANCE["raw_provenance"],
-            "final_provenance": HDR_PROVENANCE["final_provenance"],
+            "color_provenance": meta["color_provenance"],
+            "raw_provenance": meta["raw_provenance"],
+            "final_provenance": meta["final_provenance"],
             "binary_version": meta["binary_version"], "binary_compiled": meta["binary_compiled"],
             "configured_dlss_preset": meta["configured_dlss_preset"],
             "jitter": meta["jitter"], "previous_jitter": meta["previous_jitter"],
@@ -427,9 +457,11 @@ def analyze(meta, rois=None, unjitter=True, static_scene=None):
     if meta["route"] == "hdr":
         return _analyze_hdr(meta, rois, unjitter, static_scene)
     rejection = _open_texture(meta, "rejection")
+    geometry = _mask_geometry(meta)
+    if meta["float_color"]:
+        return _analyze_float_copy(meta, rejection, geometry, rois, unjitter, static_scene)
     raw = _open_texture(meta, "raw")
     final = _open_texture(meta, "final")
-    geometry = _mask_geometry(meta)
     groups = {label: {"pixels": 0, "different_pixels": 0,
                       "max_channel_difference": 0, "sum_channel_difference": 0}
               for label in ("rejected", "accepted")}
@@ -477,8 +509,86 @@ def analyze(meta, rois=None, unjitter=True, static_scene=None):
     return result
 
 
+def _analyze_float_copy(meta, rejection, geometry, rois, unjitter, static_scene):
+    """The copy route with an fp16 final image (2026-11-13): analyze()'s statistics in linear radiance."""
+    raw, final = _hdr_rgb(meta, "raw"), _hdr_rgb(meta, "final")
+    groups = {label: {"pixels": 0, "different_pixels": 0, "max_channel_difference": 0.0, "sum_channel_difference": 0.0}
+              for label in ("rejected", "accepted")}
+    for y in range(meta["output_height"]):
+        mask = _mask_row(rejection, geometry, y)
+        diff = np.abs(raw[y] - final[y])
+        for label, selector in (("rejected", mask), ("accepted", ~mask)):
+            count = int(np.count_nonzero(selector))
+            group = groups[label]
+            group["pixels"] += count
+            if count:
+                selected = diff[selector]
+                group["different_pixels"] += int(np.count_nonzero(np.any(selected != 0, axis=1)))
+                group["max_channel_difference"] = max(group["max_channel_difference"], float(np.nanmax(selected)))
+                group["sum_channel_difference"] += float(np.nansum(selected, dtype=np.float64))
+    for group in groups.values():
+        total = group.pop("sum_channel_difference")
+        group["mean_channel_difference"] = total / (group["pixels"] * 3) if group["pixels"] else None
+    rejected = groups["rejected"]["pixels"]
+    result = {
+        "manifest": str(meta["path"]), "frame_id": meta["frame_id"], "mode": meta["mode"], "reset": meta["reset"],
+        "route": "sdr", "binary_version": meta["binary_version"], "binary_compiled": meta["binary_compiled"],
+        "raw_provenance": meta["raw_provenance"], "final_provenance": meta["final_provenance"],
+        "jitter": meta["jitter"], "previous_jitter": meta["previous_jitter"],
+        "render_size": [meta["render_width"], meta["render_height"]],
+        "output_size": [meta["output_width"], meta["output_height"]],
+        "input_rejection_pixels": int(np.count_nonzero(rejection)),
+        "input_rejection_percent": 100 * int(np.count_nonzero(rejection)) / rejection.size,
+        "output_rejection_pixels": rejected,
+        "output_rejection_percent": 100 * rejected / (meta["output_width"] * meta["output_height"]),
+        "difference_channels": "fp16 linear RGB, absolute decoded float difference",
+        "rejected": groups["rejected"], "accepted": groups["accepted"],
+    }
+    if meta["version"] == 2:
+        from flat_pixels_engine import analyze as analyze_engine
+        requested = rois if rois else [("full", (0, 0, meta["render_width"], meta["render_height"]))]
+        try:
+            result["engine_analysis"] = analyze_engine(meta, requested, unjitter, static_scene)
+        except ValueError as exc:
+            raise CaptureError(str(exc)) from exc
+    return result
+
+
 STABILITY_MAX_GAP = 8      # frames between the two live samples of a pair
 STABILITY_VISIBLE = 4      # a change of 4/255 or more in any colour channel is a visible change
+STABILITY_DARK = 48        # a pixel whose displayed luma is below 48/255 in either frame counts as dark (2026-11-13: "edges in shadow")
+
+
+def _display_row(meta, name, image, y):
+    """Row y of an image as displayed 8-bit RGB: RGBA8 as stored, a float format through _preview_hdr."""
+    if meta["float_color"]:
+        return _preview_hdr(image[y])
+    return np.asarray(image[y][:, :3])
+
+
+def _image_stability(earlier, later, name):
+    """How much one image (the input copy, the backend's raw output or the final image) changes between two live
+    frames, over all its pixels and split into dark and lit ones. The input changes with the jitter wherever detail is
+    finer than a pixel, by design; a steady image after the reconstruction is what anti-aliasing is for, so comparing the
+    three says where a flicker enters."""
+    decode = (lambda m: _hdr_rgb(m, name)) if earlier["float_color"] else (lambda m: _open_texture(m, name))
+    first, second = decode(earlier), decode(later)
+    weights = np.array([.2126, .7152, .0722], dtype=np.float32)
+    totals = {label: [0, 0, 0] for label in ("all", "dark", "lit")}   # pixels, sum of change, visible pixels
+    for y in range(first.shape[0]):
+        a, b = _display_row(earlier, name, first, y), _display_row(later, name, second, y)
+        change = np.abs(a.astype(np.int16) - b.astype(np.int16)).max(axis=1)
+        dark = np.minimum(a.astype(np.float32) @ weights, b.astype(np.float32) @ weights) < STABILITY_DARK
+        for label, selector in (("all", np.ones_like(dark)), ("dark", dark), ("lit", ~dark)):
+            count = int(np.count_nonzero(selector))
+            if count:
+                selected = change[selector]
+                totals[label][0] += count
+                totals[label][1] += int(selected.sum(dtype=np.int64))
+                totals[label][2] += int(np.count_nonzero(selected >= STABILITY_VISIBLE))
+    return {label: {"pixels": t[0], "mean_change_of_255": t[1] / t[0] if t[0] else None,
+                    "visible_change_percent": 100 * t[2] / t[0] if t[0] else None}
+            for label, t in totals.items()}
 
 
 def _preview_hdr(rgb):
@@ -492,7 +602,8 @@ def _stability_pair(earlier, later):
     """Change between the FINAL images of two live frames, split by the later frame's
     rejection footprint (the pixels the resolver shows as the raw jittered colour)."""
     hdr = later["route"] == "hdr"
-    first, second = ((_hdr_rgb(earlier, "final"), _hdr_rgb(later, "final")) if hdr else
+    floating = later["float_color"]
+    first, second = ((_hdr_rgb(earlier, "final"), _hdr_rgb(later, "final")) if floating else
                      (_open_texture(earlier, "final"), _open_texture(later, "final")))
     rejection = _open_texture(later, "rejection")
     geometry = None if hdr else _mask_geometry(later)
@@ -501,9 +612,9 @@ def _stability_pair(earlier, later):
     height = later["capture_roi"]["height"] if hdr else later["output_height"]
     for y in range(height):
         mask, valid = _hdr_mask_row(later, rejection, y) if hdr else (_mask_row(rejection, geometry, y), None)
-        a, b = (_preview_hdr(first[y]), _preview_hdr(second[y])) if hdr else (first[y], second[y])
+        a, b = (_preview_hdr(first[y]), _preview_hdr(second[y])) if floating else (first[y], second[y])
         change = np.abs(a[:, :3].astype(np.int16) - b[:, :3].astype(np.int16)).max(axis=1)
-        radiance_change = np.abs(first[y] - second[y]).max(axis=1) if hdr else None
+        radiance_change = np.abs(first[y] - second[y]).max(axis=1) if floating else None
         for label, selector in (("rejected", mask), ("accepted", ~mask)):
             if valid is not None:
                 selector = selector & valid
@@ -514,26 +625,28 @@ def _stability_pair(earlier, later):
                 group[0] += count
                 group[1] += int(selected.sum(dtype=np.int64))
                 group[2] += int(np.count_nonzero(selected >= STABILITY_VISIBLE))
-                if hdr:
+                if floating:
                     changes = radiance_change[selector]
                     linear_change[label][0] += float(np.nansum(changes, dtype=np.float64))
                     linear_change[label][1] = max(linear_change[label][1], float(np.nanmax(changes)))
     total = [sum(group[i] for group in groups.values()) for i in range(3)]
     report = {"frames": [earlier["frame_id"], later["frame_id"]],
               "frame_gap": later["frame_id"] - earlier["frame_id"],
-              "route": later["route"]}
+              "route": later["route"], "mode": later["mode"]}
     for label, group in (("rejected", groups["rejected"]), ("accepted", groups["accepted"]), ("all", total)):
         report[label] = {"pixels": group[0],
                          "mean_change_of_255": group[1] / group[0] if group[0] else None,
                          "visible_change_percent": 100 * group[2] / group[0] if group[0] else None}
-        if hdr:
+        if floating:
             rad = ([sum(linear_change[k][0] for k in ("rejected", "accepted")),
                     max(linear_change[k][1] for k in ("rejected", "accepted"))] if label == "all"
                    else linear_change[label])
             report[label]["mean_linear_radiance_change"] = rad[0] / group[0] if group[0] else None
             report[label]["max_linear_radiance_change"] = rad[1]
-    if hdr:
+    if floating:
         report["preview_metric"] = "Reinhard tone map then gamma 1/2.2, RGB 0..255; linear radiance change also reported"
+    # Where a flicker enters: the input, the backend's raw output, the final image (2026-11-13).
+    report["images"] = {name: _image_stability(earlier, later, name) for name in ("color", "raw", "final")}
     return report
 
 
@@ -558,7 +671,8 @@ def stability(manifests):
             gap = later["frame_id"] - earlier["frame_id"]
             same_grids = all(earlier[k] == later[k] for k in
                              ("render_width", "render_height", "output_width", "output_height"))
-            same_grids = same_grids and earlier["route"] == later["route"] and earlier["capture_roi"] == later["capture_roi"]
+            same_grids = (same_grids and earlier["route"] == later["route"] and earlier["capture_roi"] == later["capture_roi"]
+                          and earlier["layout"] is later["layout"] and earlier["mode"] == later["mode"])
             if 0 < gap <= STABILITY_MAX_GAP and same_grids:
                 report["pairs"].append(_stability_pair(earlier, later))
     if not report["pairs"]:
@@ -596,6 +710,34 @@ def write_png(path, width, height, rows):
         _png_chunk(handle, b"IEND", b"")
 
 
+def _write_float_copy_previews(meta, directory):
+    """The fp16 copy route: the HDR route's previews (Reinhard/gamma), on the copy route's grids and footprint."""
+    rejection = _open_texture(meta, "rejection")
+    geometry = _mask_geometry(meta)
+    decoded = {name: _hdr_rgb(meta, name) for name in ("color", "raw", "final")}
+    def rows(image):
+        for y in range(image.shape[0]):
+            row = np.empty((image.shape[1], 4), dtype=np.uint8)
+            row[:, :3] = _preview_hdr(image[y])
+            row[:, 3] = 255
+            yield row.tobytes()
+    for name, image in decoded.items():
+        write_png(directory / f"{name}.png", image.shape[1], image.shape[0], rows(image))
+    width, height = meta["output_width"], meta["output_height"]
+    def overlay_rows():
+        for y in range(height):
+            row = np.empty((width, 4), dtype=np.uint8)
+            row[:, :3] = _preview_hdr(decoded["final"][y])
+            mask = _mask_row(rejection, geometry, y)
+            row[mask, 0] = ((row[mask, 0].astype(np.uint16) + 255) // 2).astype(np.uint8)
+            row[mask, 1:3] //= 2
+            row[:, 3] = 255
+            yield row.tobytes()
+    write_png(directory / "rejection_overlay.png", width, height, overlay_rows())
+    write_png(directory / "raw_final_diff_x8.png", width, height,
+              rows(np.abs(decoded["raw"] - decoded["final"]) * 8))
+
+
 def write_previews(meta, directory):
     if meta["route"] == "hdr":
         rejection = _open_texture(meta, "rejection")
@@ -628,6 +770,9 @@ def write_previews(meta, directory):
                 yield row.tobytes()
         write_png(directory / "rejection_overlay.png", width, height, overlay_rows())
         write_png(directory / "raw_final_diff_x8.png", width, height, difference_rows())
+        return
+    if meta["float_color"]:
+        _write_float_copy_previews(meta, directory)
         return
     rejection = _open_texture(meta, "rejection")
     raw = _open_texture(meta, "raw")
@@ -1131,28 +1276,32 @@ def self_test():
         _self_test_rows_jitter(root)
         _self_test_stability(root)
         _self_test_hdr(root)
+        _self_test_modes(root)
     print("flat_pixels self-test passed")
 
 
 def _synthetic_capture(session, frame, rw, rh, ow, oh, *, reset=False, jitter=(0, 0), previous=(0, 0),
-                       final=None, rejection=None, depth=None, camera=None, previous_camera=None, extra=None):
-    """A small version-2 capture with no engine inputs, written under `session`."""
+                       final=None, rejection=None, depth=None, camera=None, previous_camera=None, extra=None,
+                       layout=None, mode="dlss", color=None, raw=None):
+    """A small version-2 capture with no engine inputs, written under `session`; `layout` and `mode` default to DLSS's RGBA8 copy route."""
+    layout = layout or TEXTURES
     session.mkdir(parents=True, exist_ok=True)
+    cbpp, obpp = layout["color"][1], layout["raw"][1]
     contents = {
-        "color": bytes(rw * rh * 4), "motion": bytes(rw * rh * 4),
+        "color": bytes(rw * rh * cbpp) if color is None else color, "motion": bytes(rw * rh * 4),
         "depth": (np.full((rh, rw), .0008 if depth is None else depth, dtype="<f4")).tobytes(),
         "rejection": bytes(rw * rh) if rejection is None else rejection,
-        "raw": bytes(ow * oh * 4), "final": bytes(ow * oh * 4) if final is None else final,
+        "raw": bytes(ow * oh * obpp) if raw is None else raw, "final": bytes(ow * oh * obpp) if final is None else final,
     }
     records = []
-    for name, (fmt, bpp, grid) in TEXTURES.items():
+    for name, (fmt, bpp, grid) in layout.items():
         w, h = (rw, rh) if grid == "render" else (ow, oh)
         filename = f"frame_{frame}_{name}.bin"
         (session / filename).write_bytes(contents[name])
         records.append({"name": name, "filename": filename, "dxgi_format": fmt, "width": w, "height": h,
                         "row_stride": w * bpp, "byte_size": w * h * bpp})
     still = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, .025, 0], [0, 0, 1, 0], [1, 0, 0, 0]]
-    manifest = {"version": 2, "frame_id": frame, "mode": "dlss", "reset": reset,
+    manifest = {"version": 2, "frame_id": frame, "mode": mode, "reset": reset,
                 "jitter": list(jitter), "previous_jitter": list(previous),
                 "render_width": rw, "render_height": rh, "output_width": ow, "output_height": oh,
                 "textures": records, "camera": camera or still, "previous_camera": previous_camera or camera or still,
@@ -1274,6 +1423,56 @@ def _self_test_rows_jitter(root):
         raise AssertionError("a capture declaring only one rows phase was accepted")
     except CaptureError:
         pass
+
+
+def _self_test_modes(root):
+    """FSR and EDVR's TAA captures (2026-11-13), the fp16 copy route, and the per-image stability split that says where a
+    flicker enters (input, raw, final) and whether it is in dark or lit pixels."""
+    rw, rh = 4, 2
+    def rejects(path, why):
+        try:
+            load_manifest(path)
+        except CaptureError:
+            return
+        raise AssertionError(why)
+    # FSR on the RGBA8 copy route reads like DLSS: raw is R8G8B8A8_UNORM.
+    meta = load_manifest(_synthetic_capture(root / "mode_fsr", 3, rw, rh, rw, rh, mode="fsr"))
+    assert meta["mode"] == "fsr" and analyze(meta)["mode"] == "fsr" and not meta["float_color"]
+    # TAA's raw is its TYPELESS history; the UNORM layout is refused for it, and an unknown mode is refused.
+    meta = load_manifest(_synthetic_capture(root / "mode_taa", 3, rw, rh, rw, rh, mode="taa", layout=TAA_TEXTURES))
+    assert meta["layout"]["raw"][0] == 27 and analyze(meta)["mode"] == "taa"
+    rejects(_synthetic_capture(root / "mode_taa_unorm", 3, rw, rh, rw, rh, mode="taa"), "TAA raw accepted as UNORM")
+    rejects(_synthetic_capture(root / "mode_xess", 3, rw, rh, rw, rh, mode="xess"), "an unsupported mode was accepted")
+    # The fp16 copy route: every colour image fp16; a dark pixel that flickers in raw and final, a lit one steady everywhere,
+    # and the input changing in both (the jitter's own change). Pixel 0 is dark, pixel 1 lit; the rest steady and dark.
+    def half(values):
+        return struct.pack(f"<{len(values) * 4}e", *[c for v in values for c in (v, v, v, 1)])
+    n = rw * rh
+    steady_dark = [.01] * (n - 2)
+    frames = {30: ([.01, 1.0] + steady_dark, [.01, 1.0] + steady_dark),
+              31: ([.03, 3.0] + steady_dark, [.03, 1.0] + steady_dark)}
+    for frame, (color, out) in frames.items():
+        _synthetic_capture(root / "mode_fp16", frame, rw, rh, rw, rh, mode="fsr", layout=SDR_FP16_TEXTURES,
+                           color=half(color), raw=half(out), final=half(out))
+    metas = [load_manifest(p) for p in _manifest_paths(root / "mode_fp16")]
+    assert all(m["float_color"] and m["layout"] is SDR_FP16_TEXTURES for m in metas)
+    result = analyze(metas[0])
+    assert result["difference_channels"].startswith("fp16") and result["accepted"]["different_pixels"] == 0
+    pair = stability(metas)["pairs"][0]
+    assert pair["frames"] == [30, 31] and pair["mode"] == "fsr" and pair["all"]["mean_linear_radiance_change"] > 0
+    images = pair["images"]
+    for name in ("raw", "final"):
+        # One dark pixel of seven dark ones changed visibly; the lit pixel did not.
+        assert images[name]["dark"]["pixels"] == n - 1 and images[name]["lit"]["pixels"] == 1, images[name]
+        assert abs(images[name]["dark"]["visible_change_percent"] - 100 / (n - 1)) < 1e-9, images[name]
+        assert images[name]["lit"]["visible_change_percent"] == 0, images[name]
+    assert images["color"]["lit"]["visible_change_percent"] == 100, images["color"]
+    run(root / "mode_fp16", root / "mode_fp16_previews")
+    assert (root / "mode_fp16_previews" / "mode_fp16" / "frame_30" / "raw_final_diff_x8.png").is_file()
+    # A pair never spans two modes.
+    _synthetic_capture(root / "mode_mixed", 40, rw, rh, rw, rh, mode="dlss")
+    _synthetic_capture(root / "mode_mixed", 41, rw, rh, rw, rh, mode="fsr")
+    assert stability([load_manifest(p) for p in _manifest_paths(root / "mode_mixed")])["pairs"] == []
 
 
 def _self_test_stability(root):

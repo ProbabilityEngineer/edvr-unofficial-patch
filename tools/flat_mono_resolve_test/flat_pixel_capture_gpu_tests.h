@@ -265,6 +265,34 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
                   "HDR manifest identifies ROI, final target provenance and retained engine evidence");
         }
         hcap.cancel();
+        // FSR and EDVR's TAA (2026-11-13): the manifest names the mode and what the raw image is, on the HDR route (raw is fp16
+        // there for both) and on the copy route (TAA: its RGBA8 history is raw and final at once).
+        auto modeManifest=[&](edvr::FlatMonoResolveMode mode,bool hdr,uint64_t number) {
+            edvr::FlatPixelCapture one;one.arm(number-1);const fs::path dir=one.directory();
+            edvr::FlatMonoResolveFrame f=hdr?hf1:frame;f.mode=mode;f.frame=number;
+            if(hdr)one.capture(device,context,f,false,hs,false,cw,ch); else one.capture(device,context,f,false,sources);
+            context->Flush();
+            const auto path=dir/(L"frame_"+std::to_wstring(number)+L".json");
+            for(unsigned attempt=0;attempt<240 && !fs::exists(path);++attempt){one.poll(context,number+1);Sleep(1);}
+            std::ifstream mf(path,std::ios::binary);
+            std::string body((std::istreambuf_iterator<char>(mf)),std::istreambuf_iterator<char>());
+            one.cancel();return body;
+        };
+        const std::string fsrHdr=modeManifest(edvr::FlatMonoResolveMode::Fsr,true,110);
+        check(fsrHdr.find("\"mode\":\"fsr\"")!=std::string::npos && fsrHdr.find("\"raw_provenance\":\"fsr3-fp16-output0\"")!=std::string::npos &&
+              fsrHdr.find("\"final_provenance\":\"scene-H-after-finish-before-tonemap\"")!=std::string::npos,
+              "an FSR frame on the HDR route is captured and named as FSR's fp16 output");
+        const std::string taaHdr=modeManifest(edvr::FlatMonoResolveMode::Taa,true,120);
+        check(taaHdr.find("\"mode\":\"taa\"")!=std::string::npos && taaHdr.find("\"raw_provenance\":\"taa-fp16-history\"")!=std::string::npos,
+              "a TAA frame on the HDR route is captured and names TAA's history as raw");
+        const std::string taaCopy=modeManifest(edvr::FlatMonoResolveMode::Taa,false,130);
+        check(taaCopy.find("\"mode\":\"taa\"")!=std::string::npos && taaCopy.find("\"raw_provenance\":\"taa-rgba8-history\"")!=std::string::npos &&
+              taaCopy.find("\"final_provenance\":\"taa-history\"")!=std::string::npos,
+              "a TAA frame on the copy route names its history as both raw and final");
+        const std::string dlssCopy=modeManifest(edvr::FlatMonoResolveMode::Dlss,false,140);
+        check(dlssCopy.find("\"mode\":\"dlss\"")!=std::string::npos && dlssCopy.find("\"raw_provenance\":\"ngx-rgba8-output0\"")!=std::string::npos &&
+              dlssCopy.find("\"final_provenance\":\"private-finish-output1\"")!=std::string::npos,
+              "a DLSS copy-route manifest is unchanged");
     }
     const auto after=edvr::flatMonoResolveStats();
     check(before.acceptedResets==after.acceptedResets && before.acceptedContinues==after.acceptedContinues &&

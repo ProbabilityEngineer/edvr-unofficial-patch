@@ -19439,3 +19439,33 @@ ruled out: a missing world source, because the trace holds 9,538 EB5234 world dr
 **What the log will say.** `flat deferred HDR camera:` gains `pool-cameras=N pool-pick=one|several-hold|none-holds|unqualified|not-selectable pool-picks=one:N,several:N,none:N,unqualified:N`. The flight to ask for: on foot at render at or above the output, a tool out over terrain and buildings, then a weapon. Expected: `pool-picks=one:` climbs through the tool spells, `flat jitter failure reason` shows no `deferred-inverse-unproven`, and `flat hdr route 5s` reads `treated` near `frames`. If the new code never ran, `pool-picks` stays at 0 while the failure lines go on. `none:` climbing means the world camera does not hold against CB2, which is another defect (compare the failure's `original bytes` with the world record). The likeliest next refusal, if one appears, is the tool's record judged as an alternate on jittered frames (`ambiguous-source` in `flat hdr route 5s`), which the zero-phase frames never tested.
 
 **Validation.** The real case: the reporter's frame 42357, with CB2 rows 10 to 16 and the phase bits from their log's failure lines and the two camera blocks from their trace, generated into `flat_deferred_pool_pair_captures.h` rather than typed. The world's camera is `inverse-mismatch` and the missing-phase repair holds it; the tool's camera is `forward-mismatch` and holds by no relation. So the pick names the world, as the pass's own CB2 says. Resolver cases in `flat_deferred_pool_pick_tests.h`: two records unnamed and named (each camera, stranger bytes, empty bytes), one record unchanged by a name, equal bytes behind two b1s, a record in another colour, a stale one, a partial viewport, a pass before a record's last draw, the pass writing its own source, three records, five records (past the four the pick tests), a witness entry beside records, and the model's qualification naming the verified camera. Wiring pins check that the pool pick runs before the pair pick on the same qualified pass, asks every record's camera, names a donor only when exactly one holds, touches no upload and no draw, and that the HDR camera line carries the counts. The pins that counted the resolver's calls (`flat_deferred_witness_tests.h`, `flat_deferred_empty_gbuffer_tests.h`) or marked out the picker's text (`flat_deferred_second_pick_tests.h`) were updated for the third call in the verifier. A full `build.bat --wait-lock` on native Windows passed every gate and wrote the receipt. The first run stopped on those pins alone, and the new cases passed in it. Not flown.
+
+## 2026-11-13, stationary edge flicker under FSR and TAA: what it is not, and the capture for it
+
+**Report.** Flat, a still camera in a hangar, FSR or EDVR's TAA: edges flicker, many of them in shadow, and thin bright lights
+(hull strip lights) flicker until approached. None with AA off (F7). Seen at supersampling 0.65, 0.75, 0.85 and 1.0; less at 1.0.
+
+**Ruled out (one session each, by eye unless stated).** Stock DXMT instead of the write-mask build; EDVR builds `8d9da7dd` and
+`9c85caed`; GPU timing quiet (fix A); `particle_billboard`; `hdr` off; Elite's Bloom and Depth of field (both off in this setup).
+The Motion source view (`advanced.flat_refusal_view`) shows the flickering edges steady blue (camera term, accepted) and no pink
+or white near them, so motion classification does not refuse them. The finish's rejection footprint (section 44's first
+hypothesis) is not the shared cause: on the TAA path the HDR finish is a plain copy of TAA's output and never reads the mask, and
+TAA flickers too. The light grid cache had 0-0.5% hits in the session, so it substituted nothing.
+
+**Seen but probably harmless.** On flat blue surfaces the view shows fine yellow speckle (stale slot kept by the depth check) that
+moves with the camera still: overlapping coplanar draws (decals, labels, detail layers) win a pixel or not with the jitter. Kept
+yellow takes the same camera term as blue, so on a still surface it does not change the motion; it would matter only where the
+depth check refused (pink), and none was seen.
+
+**Open.** The flicker enters in what FSR and TAA share: the jittered input, its depth and motion, or the reconstruction's response
+to them. The F10 pixel capture answers which, so it now runs for FSR and TAA as well as DLSS and DLAA:
+`flat_mono_resolve.cpp` captures TAA's history (`output[index]`) as raw, and as final on the copy route; the manifest names the
+mode and the raw image's provenance (`fsr3-fp16-output0`, `taa-fp16-history`, `taa-rgba8-history`). `tools/flat_pixels.py`
+accepts those modes and the fp16 copy route (the flat route below supersampling 1.0 hands EDVR an fp16 image), and its stability
+report gains `images`: for each adjacent live pair, the change of the input copy, the raw output and the final image, all pixels
+and split into dark (displayed luma under 48/255 in either frame) and lit.
+
+**Reading it.** Input changing, raw steady, final changing: the finish. Input and raw changing alike in dark pixels: the
+reconstruction does not settle what the jitter changes there. Input steady where raw changes: the reconstruction's own
+instability. Use F10 with the camera still and the flickering edge in the middle of the screen (the HDR route captures a central
+window at most 2048x1152), then `python tools/flat_pixels.py <session-directory>`.
