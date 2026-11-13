@@ -107,13 +107,8 @@ bool readMem(uintptr_t at, void* out, size_t n) noexcept {
 // ---- the hooks ---------------------------------------------------------------------------------------------------------------------------------------
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
-    constexpr uintptr_t granularity = 64 * 1024, span = 0x7FFF0000ull;
-    const uintptr_t begin = (target - span) & ~(granularity - 1);
-    for (uintptr_t candidate = target; candidate >= begin; candidate -= granularity) {
-        auto* p = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (p) return p;
-    }
-    return nullptr;
+    // From CodeHook's near pool: a page of a shared 64 KB region, not a region of its own (code_hook.h, codeHookNearPage).
+    return codeHookNearPage(reinterpret_cast<const void*>(target));
 }
 
 bool prepareSite(void* trampoline, void* opaque) noexcept {
@@ -221,7 +216,7 @@ bool tryInstall(State& s, bool& transient) {
         buildCaptureStub(s.cursor.relay, &s.cursorObject);
         if (!s.cursor.hook.install(reinterpret_cast<void*>(cursorAt), s.cursor.relay, nullptr, "galaxy-map-pointer-cursor", &prepareSite, &s.cursor)) {
             s.why = s.cursor.hook.refusal();
-            VirtualFree(s.cursor.relay, 0, MEM_RELEASE);
+            codeHookFreeNearPage(s.cursor.relay);
             s.cursor.relay = nullptr;
             return false;
         }
@@ -232,7 +227,7 @@ bool tryInstall(State& s, bool& transient) {
         buildGateRelay(s.project.relay, &s.gate, reinterpret_cast<const void*>(&projectDetour));
         if (!s.project.hook.install(reinterpret_cast<void*>(projectAt), s.project.relay, nullptr, "galaxy-map-pointer-projector", &prepareSite, &s.project)) {
             s.why = s.project.hook.refusal();
-            VirtualFree(s.project.relay, 0, MEM_RELEASE);
+            codeHookFreeNearPage(s.project.relay);
             s.project.relay = nullptr;
             return false;
         }

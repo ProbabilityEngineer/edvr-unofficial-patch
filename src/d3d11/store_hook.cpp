@@ -50,35 +50,8 @@ Detour g_store;
 std::mutex g_storeInstallMutex; // Present and the station setting can request first installation concurrently.
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
-    SYSTEM_INFO info{};
-    GetSystemInfo(&info);
-    const uintptr_t granularity = info.dwAllocationGranularity;
-    const uintptr_t floor = reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
-    const uintptr_t ceiling = reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
-    const uintptr_t distance = uintptr_t(INT32_MAX) - 0x10000u;
-    uintptr_t at = target > distance ? target - distance : floor;
-    if (at < floor) at = floor;
-    const uintptr_t limit = target > ceiling - distance ? ceiling : target + distance;
-    while (at < limit) {
-        MEMORY_BASIC_INFORMATION region{};
-        if (!VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region))) break;
-        const uintptr_t start = reinterpret_cast<uintptr_t>(region.BaseAddress);
-        if (region.RegionSize > UINTPTR_MAX - start) break;
-        const uintptr_t end = start + region.RegionSize;
-        if (region.State == MEM_FREE) {
-            uintptr_t candidate = at > start ? at : start;
-            if (candidate > UINTPTR_MAX - (granularity - 1)) break;
-            candidate = (candidate + granularity - 1) & ~(granularity - 1);
-            if (candidate < limit && candidate < end && end - candidate >= 4096) {
-                auto* p = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 4096,
-                                                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-                if (p) return p;
-            }
-        }
-        if (end <= at) break;
-        at = end;
-    }
-    return nullptr;
+    // From CodeHook's near pool: a page of a shared 64 KB region, not a region of its own (code_hook.h, codeHookNearPage).
+    return codeHookNearPage(reinterpret_cast<const void*>(target));
 }
 
 void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
@@ -197,7 +170,7 @@ void installLocked() noexcept {
     buildRelay(g_store.relay, &g_storeGate, reinterpret_cast<void*>(&storeObserved));
     if (!g_store.hook.install(reinterpret_cast<void*>(base + storeRva), g_store.relay, nullptr,
                               "admission-store", &prepareRelay, &g_store)) {
-        VirtualFree(g_store.relay, 0, MEM_RELEASE);
+        codeHookFreeNearPage(g_store.relay);
         g_store.relay = nullptr;
         g_store.status.store("CodeHook refused the store (its own line says why)", std::memory_order_release);
         return;
