@@ -156,4 +156,14 @@ void codeHookReserveNear(void* anchor);
 CodeHookPoolStats codeHookPoolStats();
 bool codeHookInPool(const void* p);
 
+// A committed read-write page within rel32 reach of `target`, taken from the same pool, or null. For the relay and data
+// pages the hook sites place next to the game's code: the caller fills it, then calls VirtualProtect on that page alone
+// (PAGE_EXECUTE_READ or PAGE_READONLY). Each such page used to take a whole 64 KB allocation near the image of its own,
+// and two dozen of them filled the space the engine-motion relays needed (2026-11-13, log 010839).
+// Free it only with codeHookFreeNearPage: VirtualFree(MEM_RELEASE) on a pool page would fail, or on a region's first
+// page release the whole region under other live pages.
+uint8_t* codeHookNearPage(const void* target);
+// Returns a codeHookNearPage page to the pool, decommitted; any other pointer is released with VirtualFree(MEM_RELEASE).
+void codeHookFreeNearPage(void* p);
+
 }  // namespace edvr

@@ -93,18 +93,8 @@ uint8_t* previewRelay(uintptr_t target,void* callback) noexcept {
     // Game entries and this DLL can be farther apart than rel32. Keep the
     // atomic five-byte entry patch; an adjacent, immutable indirect jump
     // reaches the ordinary callback without changing registers or the stack.
-    constexpr uintptr_t granularity=64*1024,span=0x7FFE0000;
-    const uintptr_t aligned=target&~(granularity-1);
-    uint8_t* relay=nullptr;
-    for(uintptr_t distance=granularity;distance<=span&&!relay;distance+=granularity) {
-        const uintptr_t candidates[]={aligned>=distance?aligned-distance:0,
-            aligned<=UINTPTR_MAX-distance?aligned+distance:0};
-        for(auto candidate:candidates)if(candidate) {
-            relay=static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate),4096,
-                MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
-            if(relay)break;
-        }
-    }
+    // A page from CodeHook's near pool, not a 64 KB region of its own (code_hook.h, codeHookNearPage).
+    uint8_t* relay=codeHookNearPage(reinterpret_cast<const void*>(target));
     if(!relay)return nullptr;
     const uint8_t jump[]={0xFF,0x25,0,0,0,0};
     const uintptr_t destination=reinterpret_cast<uintptr_t>(callback);
@@ -112,7 +102,7 @@ uint8_t* previewRelay(uintptr_t target,void* callback) noexcept {
     DWORD oldProtect=0;
     if(!VirtualProtect(relay,4096,PAGE_EXECUTE_READ,&oldProtect)||
        !FlushInstructionCache(GetCurrentProcess(),relay,14)) {
-        VirtualFree(relay,0,MEM_RELEASE);return nullptr;
+        codeHookFreeNearPage(relay);return nullptr;
     }
     return relay;
 }
@@ -286,18 +276,8 @@ void eyeApply(uintptr_t pose) noexcept {
 // jumped to; only the pose memory rdx points at may change.
 constexpr unsigned kEyeApplyImm=59,kEyeTrampImm=120,kEyeStubBytes=130;
 uint8_t* eyeStub(uintptr_t target) noexcept {
-    uint8_t* page=nullptr;
-    constexpr uintptr_t granularity=64*1024,span=0x7FFE0000;
-    const uintptr_t aligned=target&~(granularity-1);
-    for(uintptr_t distance=granularity;distance<=span&&!page;distance+=granularity) {
-        const uintptr_t candidates[]={aligned>=distance?aligned-distance:0,
-            aligned<=UINTPTR_MAX-distance?aligned+distance:0};
-        for(auto candidate:candidates)if(candidate) {
-            page=static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate),4096,
-                MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
-            if(page)break;
-        }
-    }
+    // A page from CodeHook's near pool, not a 64 KB region of its own (code_hook.h, codeHookNearPage).
+    uint8_t* page=codeHookNearPage(reinterpret_cast<const void*>(target));
     if(!page)return nullptr;
     const uint8_t code[]={
         0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x9C,
@@ -348,7 +328,7 @@ void installHeadlook(uintptr_t base) {
         Log::get().note("native preview camera (F233): HeadlookCamera producer hook stood down: near relay allocation/seal failed; weapon previews (purchase, loadout) are not handled");return;
     }
     if(!g_headlookHook.install(reinterpret_cast<void*>(target),g_headlookRelay,nullptr,"native-preview-headlook",previewPrepare,&g_headlookOriginal)) {
-        VirtualFree(g_headlookRelay,0,MEM_RELEASE);g_headlookRelay=nullptr;g_headlookOriginal.store(nullptr,std::memory_order_release);
+        codeHookFreeNearPage(g_headlookRelay);g_headlookRelay=nullptr;g_headlookOriginal.store(nullptr,std::memory_order_release);
         Log::get().note("native preview camera (F233): HeadlookCamera producer hook stood down: install refused (%s); weapon previews (purchase, loadout) are not handled",g_headlookHook.refusal());return;
     }
     g_previewGame.headlookIface.store(base+gameRva(hl::kIfaceRva),std::memory_order_release);
@@ -392,7 +372,7 @@ bool previewInstall() {
                                      eye?eyePrepare:previewPrepare,eye?nullptr:&g_previewOriginal[i])) {
             // This entry was not published. Previous successful entries and
             // their relays remain process-lifetime passive forwarders.
-            VirtualFree(g_previewRelays[i],0,MEM_RELEASE);g_previewRelays[i]=nullptr;
+            codeHookFreeNearPage(g_previewRelays[i]);g_previewRelays[i]=nullptr;
             g_previewOriginal[i].store(nullptr,std::memory_order_release);
             // Already-installed forwarders remain passive. Never tear down a
             // trampoline while a scheduler thread may still be inside it.

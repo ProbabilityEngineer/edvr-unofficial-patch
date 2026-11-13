@@ -64,33 +64,8 @@ std::atomic<HookState*> publishedState{nullptr};
 std::mutex installMutex;
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
-    SYSTEM_INFO info{};GetSystemInfo(&info);
-    const uintptr_t granularity=info.dwAllocationGranularity;
-    const uintptr_t floor=reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
-    const uintptr_t ceiling=reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
-    const uintptr_t distance=uintptr_t(INT32_MAX)-0x10000u;
-    uintptr_t at=target>distance?target-distance:floor;
-    if(at<floor)at=floor;
-    const uintptr_t limit=target>ceiling-distance?ceiling:target+distance;
-    while(at<limit) {
-        MEMORY_BASIC_INFORMATION region{};
-        if(!VirtualQuery(reinterpret_cast<void*>(at),&region,sizeof(region)))break;
-        const uintptr_t start=reinterpret_cast<uintptr_t>(region.BaseAddress);
-        if(region.RegionSize>UINTPTR_MAX-start)break;
-        const uintptr_t end=start+region.RegionSize;
-        if(region.State==MEM_FREE) {
-            uintptr_t candidate=at>start?at:start;
-            if(candidate>UINTPTR_MAX-(granularity-1))break;
-            candidate=(candidate+granularity-1)&~(granularity-1);
-            if(candidate<limit && candidate<end && end-candidate>=4096) {
-                auto* p=static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate),4096,
-                                                         MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
-                if(p)return p;
-            }
-        }
-        if(end<=at)break;at=end;
-    }
-    return nullptr;
+    // From CodeHook's near pool: a page of a shared 64 KB region, not a region of its own (code_hook.h, codeHookNearPage).
+    return codeHookNearPage(reinterpret_cast<const void*>(target));
 }
 
 void buildRelay(uint8_t* code,const void* gate,void* callback) noexcept {
@@ -154,7 +129,7 @@ const char* attachObjectRecordWriterHook(ObjectRecordWriterProbe* probe) noexcep
             if(!state->hook.install(reinterpret_cast<void*>(state->target),state->relay.bytes,nullptr,
                                     "record-writer-lookup",&prepareRelay,&state->relay)) {
                 original.store(nullptr,std::memory_order_release);
-                VirtualFree(state->relay.bytes,0,MEM_RELEASE);delete state;return "install_failed";
+                codeHookFreeNearPage(state->relay.bytes);delete state;return "install_failed";
             }
             state->ready.store(true,std::memory_order_release);
             publishedState.store(state,std::memory_order_release);
@@ -200,7 +175,7 @@ unsigned objectRecordWriterHookSelfTest() noexcept {
         gate.store(0);if(call(10,23)!=33)++failures;
         hook.uninstall();if(call(10,23)!=33 || std::memcmp(target,body,sizeof(body)))++failures;
     }
-    testOriginal.store(nullptr);VirtualFree(relay.bytes,0,MEM_RELEASE);VirtualFree(target,0,MEM_RELEASE);
+    testOriginal.store(nullptr);codeHookFreeNearPage(relay.bytes);VirtualFree(target,0,MEM_RELEASE);
     return failures;
 }
 #endif

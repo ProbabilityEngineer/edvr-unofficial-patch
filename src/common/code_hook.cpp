@@ -323,6 +323,15 @@ void codeHookReserveNear(void* anchor) {
     ReleaseSRWLockExclusive(&g_poolLock);
 }
 
+uint8_t* codeHookNearPage(const void* target) {
+    if (!target) return nullptr;
+    return poolTake(reinterpret_cast<uintptr_t>(target));
+}
+
+void codeHookFreeNearPage(void* p) {
+    freeTrampoline(static_cast<uint8_t*>(p));
+}
+
 CodeHookPoolStats codeHookPoolStats() {
     CodeHookPoolStats out;
     AcquireSRWLockShared(&g_poolLock);

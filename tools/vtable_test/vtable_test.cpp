@@ -1201,6 +1201,54 @@ int main() {
                 for (int i = 0; i < kRipFns; ++i) runs = runs && reinterpret_cast<Fn>(rip[i])() == 9;
                 check(runs, "...and every rip-relative function is restored", "a rip-relative function did not survive being unhooked");
             }
+            // The relay and data pages the hook sites place beside the game's code (codeHookNearPage): each a page of the
+            // same pool, within rel32 of its target, made execute-read on its own page without touching its neighbours,
+            // and given back by codeHookFreeNearPage. Twenty-four of them used to take twenty-four 64 KB regions.
+            {
+                const CodeHookPoolStats before = codeHookPoolStats();
+                constexpr int kPages = 24;
+                uint8_t* pages[kPages] = {};
+                bool all = true, reach = true, inPool = true, distinct = true;
+                for (int i = 0; i < kPages; ++i) {
+                    pages[i] = codeHookNearPage(region);
+                    all = all && pages[i];
+                    if (!pages[i]) continue;
+                    const intptr_t d = reinterpret_cast<intptr_t>(pages[i]) - reinterpret_cast<intptr_t>(region);
+                    reach = reach && d > -intptr_t(0x7FFF0000) && d < intptr_t(0x7FFF0000);
+                    inPool = inPool && codeHookInPool(pages[i]);
+                    for (int k = 0; k < i; ++k) distinct = distinct && pages[k] != pages[i];
+                }
+                check(all && reach && inPool && distinct, "codeHookNearPage: twenty-four distinct pool pages within rel32 of the target",
+                      "a near page was missing, out of reach, outside the pool or handed out twice");
+                const CodeHookPoolStats during = codeHookPoolStats();
+                check(during.regions <= before.regions + 2, "...in at most two new regions, not twenty-four",
+                      "near pages did not share regions");
+                // Relay-style use: write code, make its page execute-read, run it; the other pages stay read-write.
+                bool runs = all, ownPage = all;
+                if (all) {
+                    static const uint8_t kRet9[] = {0xB8, 9, 0, 0, 0, 0xC3};   // mov eax,9; ret
+                    std::memcpy(pages[0], kRet9, sizeof(kRet9));
+                    DWORD old = 0;
+                    runs = VirtualProtect(pages[0], 4096, PAGE_EXECUTE_READ, &old) &&
+                           FlushInstructionCache(GetCurrentProcess(), pages[0], sizeof(kRet9)) &&
+                           reinterpret_cast<int (*)()>(pages[0])() == 9;
+                    MEMORY_BASIC_INFORMATION mi{};
+                    for (int i = 1; i < kPages && ownPage; ++i)
+                        ownPage = VirtualQuery(pages[i], &mi, sizeof(mi)) && mi.Protect == PAGE_READWRITE;
+                    if (ownPage) pages[1][0] = 0xCC;   // still writable
+                }
+                check(runs, "...a page made execute-read runs as a relay", "a near page could not be made executable and run");
+                check(ownPage, "...and its protection change leaves the other pages read-write", "protecting one near page changed another");
+                for (int i = 0; i < kPages; ++i) codeHookFreeNearPage(pages[i]);
+                check(codeHookPoolStats().used == before.used, "codeHookFreeNearPage gives every page back to the pool",
+                      "near pages leaked on free");
+                uint8_t* outside = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                codeHookFreeNearPage(outside);
+                MEMORY_BASIC_INFORMATION mi{};
+                check(outside && VirtualQuery(outside, &mi, sizeof(mi)) && mi.State == MEM_FREE,
+                      "...and releases a pointer from outside the pool as VirtualFree would",
+                      "codeHookFreeNearPage did not release a non-pool allocation");
+            }
             VirtualFree(region, 0, MEM_RELEASE);
         }
     }

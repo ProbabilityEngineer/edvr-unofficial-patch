@@ -154,14 +154,8 @@ State* ensureState() noexcept {
 }
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
-    constexpr uintptr_t granularity = 64 * 1024, span = 0x7FFF0000ull;
-    const uintptr_t begin = (target - span) & ~(granularity - 1);
-    for (uintptr_t candidate = target; candidate >= begin; candidate -= granularity) {
-        auto* p = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 4096,
-                                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (p) return p;
-    }
-    return nullptr;
+    // From CodeHook's near pool: a page of a shared 64 KB region, not a region of its own (code_hook.h, codeHookNearPage).
+    return codeHookNearPage(reinterpret_cast<const void*>(target));
 }
 void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
     // Gate-first relay; the callback is a normal function entry, unlike the
@@ -341,7 +335,7 @@ bool install(State& s) noexcept {
     buildRelay(s.relay, &s.gate, reinterpret_cast<void*>(&rendererDetour));
     if (!s.hook.install(reinterpret_cast<void*>(base + rendererRva), s.relay, nullptr,
                         "flat-stationary-camera", &prepareRelay, &s)) {
-        VirtualFree(s.relay, 0, MEM_RELEASE);
+        codeHookFreeNearPage(s.relay);
         s.relay = nullptr;
         s.waitReason = "CodeHook-refused"; return false;
     }

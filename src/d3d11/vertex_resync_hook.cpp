@@ -26,33 +26,8 @@ namespace {
 constexpr size_t kRelayBytes = 44, kOriginalLiteral = 36;
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
-    SYSTEM_INFO info{}; GetSystemInfo(&info);
-    const uintptr_t granularity = info.dwAllocationGranularity;
-    const uintptr_t floor = reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
-    const uintptr_t ceiling = reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
-    const uintptr_t distance = uintptr_t(INT32_MAX) - 0x10000u;
-    uintptr_t at = target > distance ? target - distance : floor;
-    if (at < floor) at = floor;
-    const uintptr_t limit = target > ceiling - distance ? ceiling : target + distance;
-    while (at < limit) {
-        MEMORY_BASIC_INFORMATION region{};
-        if (!VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region))) break;
-        const uintptr_t start = reinterpret_cast<uintptr_t>(region.BaseAddress);
-        if (region.RegionSize > UINTPTR_MAX - start) break;
-        const uintptr_t end = start + region.RegionSize;
-        if (region.State == MEM_FREE) {
-            uintptr_t candidate = at > start ? at : start;
-            if (candidate > UINTPTR_MAX - (granularity - 1)) break;
-            candidate = (candidate + granularity - 1) & ~(granularity - 1);
-            if (candidate < limit && candidate < end && end - candidate >= 4096) {
-                auto* p = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-                if (p) return p;
-            }
-        }
-        if (end <= at) break;
-        at = end;
-    }
-    return nullptr;
+    // From CodeHook's near pool: a page of a shared 64 KB region, not a region of its own (code_hook.h, codeHookNearPage).
+    return codeHookNearPage(reinterpret_cast<const void*>(target));
 }
 
 void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
@@ -241,7 +216,7 @@ void vertexResyncInstall() {
     }
     buildRelay(g_relay, &g_relayGate, reinterpret_cast<void*>(&flushIaObserved));
     if (!g_hook.install(reinterpret_cast<void*>(target), g_relay, nullptr, "vertex-resync-flush-ia", &prepareRelay, nullptr)) {
-        VirtualFree(g_relay, 0, MEM_RELEASE);
+        codeHookFreeNearPage(g_relay);
         g_relay = nullptr;
         say("vertex resync: NOT installed -- CodeHook refused it (its own line above, tagged vertex-resync-flush-ia, names why). The game's flush runs as it always did.");
         return;

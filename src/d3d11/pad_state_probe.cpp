@@ -125,34 +125,8 @@ const char* const kReaderNames[pad::kReaders] = {"state-reader-FUN_12C4CC0", "st
 // ---- relays (the store hook's layout: mov rax,&gate; cmp qword ptr[rax],0; je original; jmp [callback]; original: jmp [trampoline]) ----------
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
-    SYSTEM_INFO info{};
-    GetSystemInfo(&info);
-    const uintptr_t granularity = info.dwAllocationGranularity;
-    const uintptr_t floor = reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
-    const uintptr_t ceiling = reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
-    const uintptr_t distance = uintptr_t(INT32_MAX) - 0x10000u;
-    uintptr_t at = target > distance ? target - distance : floor;
-    if (at < floor) at = floor;
-    const uintptr_t limit = target > ceiling - distance ? ceiling : target + distance;
-    while (at < limit) {
-        MEMORY_BASIC_INFORMATION region{};
-        if (!VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region))) break;
-        const uintptr_t start = reinterpret_cast<uintptr_t>(region.BaseAddress);
-        if (region.RegionSize > UINTPTR_MAX - start) break;
-        const uintptr_t end = start + region.RegionSize;
-        if (region.State == MEM_FREE) {
-            uintptr_t candidate = at > start ? at : start;
-            if (candidate > UINTPTR_MAX - (granularity - 1)) break;
-            candidate = (candidate + granularity - 1) & ~(granularity - 1);
-            if (candidate < limit && candidate < end && end - candidate >= 4096) {
-                auto* p = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-                if (p) return p;
-            }
-        }
-        if (end <= at) break;
-        at = end;
-    }
-    return nullptr;
+    // From CodeHook's near pool: a page of a shared 64 KB region, not a region of its own (code_hook.h, codeHookNearPage).
+    return codeHookNearPage(reinterpret_cast<const void*>(target));
 }
 
 void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
@@ -225,7 +199,7 @@ void installReaders(uintptr_t base) {
         }
         buildRelay(r.relay, &g_padGate, kObservers[i]);
         if (!r.hook.install(reinterpret_cast<void*>(target), r.relay, nullptr, r.name, &prepareRelay, &r)) {
-            VirtualFree(r.relay, 0, MEM_RELEASE);
+            codeHookFreeNearPage(r.relay);
             r.relay = nullptr;
             r.refused.store(true, std::memory_order_release);
             r.status = "CodeHook refused (its own line says why)";

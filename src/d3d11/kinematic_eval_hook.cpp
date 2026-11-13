@@ -122,6 +122,7 @@ struct HookEntry {
     // so a plain bool could observe a half-installed entry (finding 5).
     std::atomic<bool> ready{false};
     bool noted=false;   // an unknown build: its found / not found line is written (under g_installMutex)
+    bool relayNoted=false;   // its "no relay page" line is written (under g_installMutex); once, as installs are retried
 };
 
 // Job bodies behind the run thunks (recovered from the hash-verified exe,
@@ -198,33 +199,8 @@ bool readQueueNodes(uintptr_t descriptor,uint32_t entry,uint32_t exit,
 constexpr size_t kRelayBytes=44,kOriginalLiteral=36;
 
 uint8_t* allocateRelay(uintptr_t target) noexcept {
-    SYSTEM_INFO info{};GetSystemInfo(&info);
-    const uintptr_t granularity=info.dwAllocationGranularity;
-    const uintptr_t floor=reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
-    const uintptr_t ceiling=reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
-    const uintptr_t distance=uintptr_t(INT32_MAX)-0x10000u;
-    uintptr_t at=target>distance?target-distance:floor;
-    if(at<floor)at=floor;
-    const uintptr_t limit=target>ceiling-distance?ceiling:target+distance;
-    while(at<limit) {
-        MEMORY_BASIC_INFORMATION region{};
-        if(!VirtualQuery(reinterpret_cast<void*>(at),&region,sizeof(region)))break;
-        const uintptr_t start=reinterpret_cast<uintptr_t>(region.BaseAddress);
-        if(region.RegionSize>UINTPTR_MAX-start)break;
-        const uintptr_t end=start+region.RegionSize;
-        if(region.State==MEM_FREE) {
-            uintptr_t candidate=at>start?at:start;
-            if(candidate>UINTPTR_MAX-(granularity-1))break;
-            candidate=(candidate+granularity-1)&~(granularity-1);
-            if(candidate<limit && candidate<end && end-candidate>=4096) {
-                auto* p=static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate),4096,
-                                                         MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
-                if(p)return p;
-            }
-        }
-        if(end<=at)break;at=end;
-    }
-    return nullptr;
+    // From CodeHook's near pool: a page of a shared 64 KB region, not a region of its own (code_hook.h, codeHookNearPage).
+    return codeHookNearPage(reinterpret_cast<const void*>(target));
 }
 
 void buildRelay(uint8_t* code,const void* gate,void* callback) noexcept {
@@ -939,11 +915,22 @@ bool installOne(HookEntry& entry,uintptr_t base) noexcept {
     // An unknown build's line comes after the outcome, so "found" never precedes a refusal (nothing is logged on build 334925).
     if(!rva){noteUnknownBuild(entry,0,nullptr);return false;}
     entry.relay=allocateRelay(base+rva);
-    if(!entry.relay){noteUnknownBuild(entry,rva,"no relay page could be reserved near it");return false;}
+    if(!entry.relay){
+        // Said on every build, once a hook: CodeHook never saw this hook, so without this line the stand-down names no reason
+        // (2026-11-13, log 010839: only kinematic-eval placed, no line for the others).
+        if(!entry.relayNoted) {
+            entry.relayNoted=true;
+            const CodeHookPoolStats pool=codeHookPoolStats();
+            Log::get().note("kinematic hooks: %s: no relay page within reach of %p (near pool: %u region(s), %u of %u pages in use); "
+                            "it stands down.",entry.name,reinterpret_cast<void*>(base+rva),pool.regions,pool.used,pool.pages);
+        }
+        noteUnknownBuild(entry,rva,"no relay page could be reserved near it");
+        return false;
+    }
     buildRelay(entry.relay,entry.gate?entry.gate:static_cast<const void*>(&evalGate),entry.callback);
     if(!entry.hook.install(reinterpret_cast<void*>(base+rva),entry.relay,nullptr,
                            entry.name,&prepareRelay,&entry)) {
-        VirtualFree(entry.relay,0,MEM_RELEASE);
+        codeHookFreeNearPage(entry.relay);
         entry.relay=nullptr;
         noteUnknownBuild(entry,rva,"CodeHook refused it (its own line names why)");
         return false;
